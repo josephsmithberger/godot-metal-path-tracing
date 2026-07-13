@@ -129,3 +129,65 @@ jobs:
           ${{ matrix.bin }} --version
           ${{ matrix.bin }} --help
           ${{ matrix.bin }} --test --force-colors
+
+  # Metal-only lane: proves the arm64 editor builds, boots, and passes unit
+  # tests with the Metal rendering driver as the only native backend, i.e.
+  # without the Vulkan/MoltenVK, ANGLE, or AccessKit fallbacks the main lane
+  # installs opportunistically. See docs/rt_metal_port/build_lane.md.
+  build-macos-metal-only:
+    runs-on: macos-26
+    name: Editor Metal-only (target=editor, arch=arm64, vulkan=no, angle=no)
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Restore Godot build cache
+        uses: ./.github/actions/godot-cache-restore
+        with:
+          cache-name: macos-editor-metal-only
+        continue-on-error: true
+
+      - name: Setup Python and SCons
+        uses: ./.github/actions/godot-deps
+
+      - name: Compilation (arm64, Metal only)
+        uses: ./.github/actions/godot-build
+        with:
+          scons-flags: ${{ env.SCONS_FLAGS }} arch=arm64 metal=yes vulkan=no angle=no accesskit=no
+          platform: macos
+          target: editor
+
+      - name: Save Godot build cache
+        uses: ./.github/actions/godot-cache-save
+        with:
+          cache-name: macos-editor-metal-only
+        continue-on-error: true
+
+      - name: Prepare artifact
+        run: |
+          rm -rf ./bin/build_deps
+          strip bin/godot.*
+          chmod +x bin/godot.*
+
+      - name: Upload artifact
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: macos-editor-metal-only
+
+      - name: Smoke and unit tests
+        run: |
+          set -o pipefail
+          mkdir -p metal-only-logs
+          ./bin/godot.macos.editor.arm64 --version 2>&1 | tee metal-only-logs/01-version.log
+          ./bin/godot.macos.editor.arm64 --help 2>&1 | tee metal-only-logs/02-help.log
+          ./bin/godot.macos.editor.arm64 --test --force-colors 2>&1 | tee metal-only-logs/03-unit-tests.log
+
+      - name: Upload test logs
+        if: always()
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: macos-editor-metal-only-logs
+          path: metal-only-logs/*
