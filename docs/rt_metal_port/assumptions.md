@@ -188,6 +188,14 @@ tracer later, but no chunk C1-C12 depends on it.
 
 *Falsify/re-verify:* scope change from the project owner.
 
+## Resolved implementation decisions
+
+- **RT backend layer (resolved in C4).** The acceleration-structure and
+  pipeline skeletons live in the shared `RenderingDeviceDriverMetal` base.
+  Core Metal RT descriptors and size queries are available at the macOS 11
+  build floor and do not depend on Metal 3 residency sets or newer encoders;
+  keeping them in the base also replaces the 14 stubs at their owning layer.
+
 ## Open questions (tracked, not assumed)
 
 1. **Trace recursion depth.** `raytracing_pipeline_create` receives
@@ -198,13 +206,7 @@ tracer later, but no chunk C1-C12 depends on it.
 2. **64-bit image atomics.** Whether the path tracer's accumulation targets
    need `supports_image_atomic_64_bit` (apple9-or-apple8+mac2 only) is unknown
    until the C7 shader audit. If yes, it fragments the apple7/apple8 lane.
-3. **Where the RT implementation lives.** The instantiated driver is
-   `MTL3::RenderingDeviceDriverMetal`
-   (`rendering_context_driver_metal.cpp:90-91`), a subclass of the base class
-   holding the 14 stubs. C4 must decide whether RT lands in the base class
-   (shared) or the Metal3 subclass (access to residency sets and newer
-   encoders).
-4. **Family scan staleness.** The engine's highest-family scan stops at
+3. **Family scan staleness.** The engine's highest-family scan stops at
    apple9; M5 reports apple10. Nothing RT-critical keys off the exact family
    today, but any future family-based tiering (A2) must use `>=` comparisons,
    not equality, and the scan ceiling should be raised opportunistically.

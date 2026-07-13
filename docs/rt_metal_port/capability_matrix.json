@@ -69,7 +69,7 @@
       "introduced_macos": "11.0",
       "expected_min_family": "apple6",
       "port_tier": "required",
-      "engine_detection": "missing (add in C4/C11)",
+      "engine_detection": "MetalFeatures.supports_raytracing (queried in drivers/metal/metal_device_properties.cpp)",
       "measured_apple_m5": true
     },
     {
@@ -85,7 +85,7 @@
       "introduced_macos": "11.0",
       "expected_min_family": "apple6",
       "port_tier": "required",
-      "engine_detection": "missing (add in C4/C11)",
+      "engine_detection": "MetalFeatures.supports_raytracing (queried in drivers/metal/metal_device_properties.cpp)",
       "measured_apple_m5": true
     },
     {
@@ -96,7 +96,7 @@
       "introduced_macos": "11.0",
       "expected_min_family": "apple6",
       "port_tier": "required",
-      "engine_detection": "missing (add in C4/C11)",
+      "engine_detection": "MetalFeatures.supports_raytracing (queried in drivers/metal/metal_device_properties.cpp)",
       "measured_apple_m5": true
     },
     {
@@ -110,7 +110,7 @@
       "introduced_macos": "11.0",
       "expected_min_family": "apple6",
       "port_tier": "optional",
-      "engine_detection": "missing",
+      "engine_detection": "MetalFeatures.supports_raytracing (queried in drivers/metal/metal_device_properties.cpp)",
       "measured_apple_m5": true
     },
     {
@@ -121,7 +121,7 @@
       "introduced_macos": "11.0",
       "expected_min_family": "apple6",
       "port_tier": "required",
-      "engine_detection": "missing (add in C4/C11)",
+      "engine_detection": "MetalFeatures.supports_raytracing (queried in drivers/metal/metal_device_properties.cpp)",
       "measured_apple_m5": true
     },
     {
@@ -136,7 +136,7 @@
       "introduced_macos": "11.0",
       "expected_min_family": "apple6",
       "port_tier": "required",
-      "engine_detection": "missing (add in C4/C11)",
+      "engine_detection": "MetalFeatures.supports_function_pointers (queried in drivers/metal/metal_device_properties.cpp)",
       "measured_apple_m5": true
     },
     {
@@ -150,7 +150,7 @@
       "introduced_macos": "11.0",
       "expected_min_family": "apple6",
       "port_tier": "required-for-procedural-geometry",
-      "engine_detection": "missing",
+      "engine_detection": "MetalFeatures.supports_raytracing and MetalFeatures.supports_function_pointers",
       "measured_apple_m5": true
     },
     {

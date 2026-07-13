@@ -178,6 +178,13 @@ void MetalDeviceProperties::init_features(MTL::Device *p_device) {
 		features.use_argument_buffers = false;
 	}
 
+	// Per-device runtime queries are the gating authority for ray tracing; GPU
+	// families are only used for expectations (docs/rt_metal_port/assumptions.md, A2).
+	if (__builtin_available(macOS 11.0, iOS 14.0, tvOS 16.0, *)) {
+		features.supports_raytracing = p_device->supportsRaytracing();
+		features.supports_function_pointers = p_device->supportsFunctionPointers();
+	}
+
 	if (__builtin_available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
 		features.metal_fx_spatial = MTLFX::SpatialScalerDescriptor::supportsDevice(p_device);
 #ifdef METAL_MFXTEMPORAL_ENABLED

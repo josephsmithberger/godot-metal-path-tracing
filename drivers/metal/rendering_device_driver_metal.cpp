@@ -2272,64 +2272,184 @@ RDD::PipelineID RenderingDeviceDriverMetal::compute_pipeline_create(ShaderID p_s
 
 // ----- ACCELERATION STRUCTURE -----
 
+RDD::AccelerationStructureID RenderingDeviceDriverMetal::_acceleration_structure_create(MDAccelerationStructure::Type p_type, MTL::AccelerationStructureDescriptor *p_desc, BitField<AccelerationStructureFlagBits> p_flags, uint32_t p_max_instance_count) {
+	// ALLOW_COMPACTION affects later command encoding. PREFER_FAST_TRACE and
+	// LOW_MEMORY have no equivalent at the macOS 11 API floor, so they remain
+	// recorded on the handle without changing descriptor usage.
+	p_desc->setUsage(MDAccelerationStructure::usage_from_flags(p_flags));
+
+	MTL::AccelerationStructureSizes sizes = device->accelerationStructureSizes(p_desc);
+	uint64_t scratch_size = MDAccelerationStructure::required_scratch_size(sizes, p_flags);
+	ERR_FAIL_COND_V_MSG(scratch_size > UINT32_MAX, AccelerationStructureID(), "Acceleration structure scratch size exceeds the RenderingDevice limit.");
+
+	MDAccelerationStructure *accel_info = memnew(MDAccelerationStructure(p_type, NS::RetainPtr(p_desc), sizes, p_flags, p_max_instance_count));
+
+	return AccelerationStructureID(accel_info);
+}
+
 RDD::AccelerationStructureID RenderingDeviceDriverMetal::blas_create(VectorView<AccelerationStructureGeometry> p_geometries, BitField<AccelerationStructureFlagBits> p_flags) {
-	ERR_FAIL_V_MSG(AccelerationStructureID(), "Ray tracing is not currently supported by the Metal driver.");
+	ERR_FAIL_COND_V_MSG(!device_properties->features.supports_raytracing, AccelerationStructureID(), "Acceleration structures are not supported by this device.");
+
+	thread_local LocalVector<NS::Object *> geometry_descriptors;
+	geometry_descriptors.clear();
+	NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+
+	for (uint32_t i = 0; i < p_geometries.size(); i++) {
+		const AccelerationStructureGeometry &geometry = p_geometries[i];
+
+		MTL::AccelerationStructureGeometryDescriptor *geom_desc = nullptr;
+		switch (geometry.type) {
+			case AccelerationStructureGeometry::TYPE_TRIANGLES: {
+				const AccelerationStructureGeometry::Triangles &t = geometry.geometry.triangles;
+				MTL::AccelerationStructureTriangleGeometryDescriptor *tri_desc = MTL::AccelerationStructureTriangleGeometryDescriptor::descriptor();
+
+				const BufferInfo *vertex_buffer = (const BufferInfo *)t.vertex_buffer.id;
+				tri_desc->setVertexBuffer(vertex_buffer->metal_buffer.get());
+				tri_desc->setVertexBufferOffset(t.vertex_offset);
+				tri_desc->setVertexStride(t.vertex_stride);
+
+				MTL::AttributeFormat vertex_format = MTL::AttributeFormatInvalid;
+				switch (t.vertex_format) {
+					case DATA_FORMAT_R32G32B32_SFLOAT:
+						vertex_format = MTL::AttributeFormatFloat3;
+						break;
+					case DATA_FORMAT_R32G32_SFLOAT:
+						vertex_format = MTL::AttributeFormatFloat2;
+						break;
+					case DATA_FORMAT_R16G16B16A16_UNORM:
+						vertex_format = MTL::AttributeFormatUShort4Normalized;
+						break;
+					default:
+						ERR_FAIL_V_MSG(AccelerationStructureID(), "Unsupported acceleration structure vertex format.");
+				}
+
+				if (vertex_format != MTL::AttributeFormatFloat3) {
+					// Float3 is Metal's default. Selecting another format requires
+					// the vertexFormat property (macOS 13.0 / iOS 16.0).
+					if (__builtin_available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
+						tri_desc->setVertexFormat(vertex_format);
+					} else {
+						ERR_FAIL_V_MSG(AccelerationStructureID(), "Acceleration structure vertex formats other than R32G32B32_SFLOAT require macOS 13.0 / iOS 16.0.");
+					}
+				}
+
+				if (t.index_buffer != BufferID()) {
+					const BufferInfo *index_buffer = (const BufferInfo *)t.index_buffer.id;
+					tri_desc->setIndexBuffer(index_buffer->metal_buffer.get());
+					tri_desc->setIndexBufferOffset(t.index_offset);
+					tri_desc->setIndexType(t.index_format == INDEX_BUFFER_FORMAT_UINT16 ? MTL::IndexTypeUInt16 : MTL::IndexTypeUInt32);
+					tri_desc->setTriangleCount(t.index_count / 3);
+				} else {
+					tri_desc->setTriangleCount(t.vertex_count / 3);
+				}
+
+				geom_desc = tri_desc;
+			} break;
+
+			case AccelerationStructureGeometry::TYPE_AABBS: {
+				const AccelerationStructureGeometry::Aabbs &a = geometry.geometry.aabbs;
+				ERR_FAIL_COND_V_MSG(a.stride < 24 || (a.stride % 4) != 0, AccelerationStructureID(), "AABB stride must be at least 24 bytes and a multiple of 4.");
+				MTL::AccelerationStructureBoundingBoxGeometryDescriptor *aabb_desc = MTL::AccelerationStructureBoundingBoxGeometryDescriptor::descriptor();
+
+				const BufferInfo *aabb_buffer = (const BufferInfo *)a.buffer.id;
+				aabb_desc->setBoundingBoxBuffer(aabb_buffer->metal_buffer.get());
+				aabb_desc->setBoundingBoxBufferOffset(a.offset);
+				aabb_desc->setBoundingBoxStride(a.stride);
+				aabb_desc->setBoundingBoxCount(a.count);
+
+				geom_desc = aabb_desc;
+			} break;
+		}
+
+		// Preserve Godot's explicit geometry flags. Metal permits duplicate
+		// intersection-function invocations by default, so the no-duplicate bit
+		// must invert that property.
+		geom_desc->setOpaque(geometry.flags.has_flag(ACCELERATION_STRUCTURE_GEOMETRY_OPAQUE_BIT));
+		geom_desc->setAllowDuplicateIntersectionFunctionInvocation(!geometry.flags.has_flag(ACCELERATION_STRUCTURE_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT));
+
+		geometry_descriptors.push_back(geom_desc);
+	}
+
+	MTL::PrimitiveAccelerationStructureDescriptor *desc = MTL::PrimitiveAccelerationStructureDescriptor::descriptor();
+	NS::SharedPtr<NS::Array> geom_array = NS::TransferPtr(NS::Array::array(geometry_descriptors.ptr(), geometry_descriptors.size())->retain());
+	desc->setGeometryDescriptors(geom_array.get());
+
+	return _acceleration_structure_create(MDAccelerationStructure::Type::BLAS, desc, p_flags);
 }
 
 RDD::AccelerationStructureID RenderingDeviceDriverMetal::tlas_create(uint32_t p_max_instance_count, BitField<AccelerationStructureFlagBits> p_flags) {
-	ERR_FAIL_V_MSG(AccelerationStructureID(), "Ray tracing is not currently supported by the Metal driver.");
+	ERR_FAIL_COND_V_MSG(!device_properties->features.supports_raytracing, AccelerationStructureID(), "Acceleration structures are not supported by this device.");
+
+	NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+
+	// The instance descriptor buffer and the BLAS array are provided at build
+	// time (command_build_tlas, chunk C6); sizes depend only on the count.
+	MTL::InstanceAccelerationStructureDescriptor *desc = MTL::InstanceAccelerationStructureDescriptor::descriptor();
+	desc->setInstanceCount(p_max_instance_count);
+
+	return _acceleration_structure_create(MDAccelerationStructure::Type::TLAS, desc, p_flags, p_max_instance_count);
 }
 
 void RenderingDeviceDriverMetal::acceleration_structure_instance_write(uint8_t *r_driver_instance, const AccelerationStructureInstance &p_instance) {
-	ERR_FAIL_MSG("Ray tracing is not currently supported by the Metal driver.");
+	ERR_FAIL_MSG("TLAS instance writes are not implemented yet by the Metal driver.");
 }
 
 void RenderingDeviceDriverMetal::acceleration_structure_free(RDD::AccelerationStructureID p_acceleration_structure) {
-	ERR_FAIL_MSG("Ray tracing is not currently supported by the Metal driver.");
+	MDAccelerationStructure *accel_info = (MDAccelerationStructure *)p_acceleration_structure.id;
+	ERR_FAIL_NULL_MSG(accel_info, "Metal acceleration structure input parameter is not valid.");
+	if (accel_info->accel) {
+		_untrack_resource(accel_info->accel.get());
+	}
+	memdelete(accel_info);
 }
 
 uint32_t RenderingDeviceDriverMetal::acceleration_structure_get_scratch_size_bytes(AccelerationStructureID p_acceleration_structure) {
-	ERR_FAIL_V_MSG(0, "Ray tracing is not currently supported by the Metal driver.");
+	const MDAccelerationStructure *accel_info = (const MDAccelerationStructure *)p_acceleration_structure.id;
+	ERR_FAIL_NULL_V_MSG(accel_info, 0, "Metal acceleration structure input parameter is not valid.");
+	ERR_FAIL_COND_V_MSG(accel_info->scratch_size > UINT32_MAX, 0, "Acceleration structure scratch size exceeds the RenderingDevice limit.");
+	return (uint32_t)accel_info->scratch_size;
 }
 
 // ----- PIPELINE -----
 
 RDD::RaytracingPipelineID RenderingDeviceDriverMetal::raytracing_pipeline_create(VectorView<PipelineShader> p_shaders, VectorView<uint32_t> p_raygen_shader_indices, VectorView<uint32_t> p_miss_shader_indices, VectorView<HitGroup> p_hit_groups, uint32_t p_max_trace_recursion_depth, ShaderID p_layout_defining_shader) {
-	ERR_FAIL_V_MSG(RaytracingPipelineID(), "Ray tracing is not currently supported by the Metal driver.");
+	ERR_FAIL_V_MSG(RaytracingPipelineID(), "Ray tracing pipelines are not implemented yet by the Metal driver.");
 }
 
 void RenderingDeviceDriverMetal::raytracing_pipeline_free(RDD::RaytracingPipelineID p_pipeline) {
-	ERR_FAIL_MSG("Ray tracing is not currently supported by the Metal driver.");
+	MDRaytracingPipeline *pipeline = (MDRaytracingPipeline *)p_pipeline.id;
+	ERR_FAIL_NULL_MSG(pipeline, "Metal raytracing pipeline input parameter is not valid.");
+	delete pipeline;
 }
 
 bool RenderingDeviceDriverMetal::raytracing_pipeline_get_shader_group_handles(RaytracingPipelineID p_pipeline, uint32_t p_group_index_offset, VectorView<uint32_t> p_group_indices, uint8_t *r_data, uint32_t p_data_stride_bytes) {
-	ERR_FAIL_V_MSG(false, "Ray tracing is not currently supported by the Metal driver.");
+	ERR_FAIL_V_MSG(false, "Ray tracing shader group handles are not implemented yet by the Metal driver.");
 }
 
 // ----- COMMANDS -----
 
 void RenderingDeviceDriverMetal::command_build_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer) {
-	ERR_FAIL_MSG("Ray tracing is not currently supported by the Metal driver.");
+	ERR_FAIL_MSG("BLAS builds are not implemented yet by the Metal driver.");
 }
 
 void RenderingDeviceDriverMetal::command_update_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer) {
-	ERR_FAIL_MSG("Ray tracing is not currently supported by the Metal driver.");
+	ERR_FAIL_MSG("BLAS refits are not implemented yet by the Metal driver.");
 }
 
 void RenderingDeviceDriverMetal::command_build_tlas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, BufferID p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count) {
-	ERR_FAIL_MSG("Ray tracing is not currently supported by the Metal driver.");
+	ERR_FAIL_MSG("TLAS builds are not implemented yet by the Metal driver.");
 }
 
 void RenderingDeviceDriverMetal::command_bind_raytracing_pipeline(CommandBufferID p_cmd_buffer, RaytracingPipelineID p_pipeline) {
-	ERR_FAIL_MSG("Ray tracing is not currently supported by the Metal driver.");
+	ERR_FAIL_MSG("Ray tracing pipelines are not implemented yet by the Metal driver.");
 }
 
 void RenderingDeviceDriverMetal::command_bind_raytracing_uniform_set(CommandBufferID p_cmd_buffer, UniformSetID p_uniform_set, ShaderID p_shader, uint32_t p_set_index) {
-	ERR_FAIL_MSG("Ray tracing is not currently supported by the Metal driver.");
+	ERR_FAIL_MSG("Ray tracing pipelines are not implemented yet by the Metal driver.");
 }
 
 void RenderingDeviceDriverMetal::command_trace_rays(CommandBufferID p_cmd_buffer, const ShaderBindingTable &p_raygen_sbt, const ShaderBindingTable &p_miss_sbt, const ShaderBindingTable &p_hit_sbt, uint32_t p_width, uint32_t p_height, uint32_t p_depth) {
-	ERR_FAIL_MSG("Ray tracing is not currently supported by the Metal driver.");
+	ERR_FAIL_MSG("Ray tracing dispatch is not implemented yet by the Metal driver.");
 }
 
 #pragma mark - Queries
@@ -2422,6 +2542,15 @@ void RenderingDeviceDriverMetal::set_object_name(ObjectType p_type, ID p_driver_
 		} break;
 		case OBJECT_TYPE_PIPELINE: {
 			// Can't set label after creation.
+		} break;
+		case OBJECT_TYPE_ACCELERATION_STRUCTURE: {
+			const MDAccelerationStructure *accel_info = (const MDAccelerationStructure *)p_driver_id.id;
+			if (accel_info->accel) {
+				accel_info->accel->setLabel(label);
+			}
+		} break;
+		case OBJECT_TYPE_RAYTRACING_PIPELINE: {
+			// Compute pipeline labels are fixed when their descriptors are created.
 		} break;
 		default: {
 			DEV_ASSERT(false);

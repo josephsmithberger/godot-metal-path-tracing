@@ -462,6 +462,10 @@ public:
 
 	// ----- ACCELERATION STRUCTURE -----
 
+private:
+	AccelerationStructureID _acceleration_structure_create(MDAccelerationStructure::Type p_type, MTL::AccelerationStructureDescriptor *p_desc, BitField<AccelerationStructureFlagBits> p_flags, uint32_t p_max_instance_count = 0);
+
+public:
 	virtual AccelerationStructureID blas_create(VectorView<AccelerationStructureGeometry> p_geometries, BitField<AccelerationStructureFlagBits> p_flags) override final;
 	virtual AccelerationStructureID tlas_create(uint32_t p_max_instance_count, BitField<AccelerationStructureFlagBits> p_flags) override final;
 	virtual void acceleration_structure_instance_write(uint8_t *r_driver_instance, const AccelerationStructureInstance &p_instance) override final;
