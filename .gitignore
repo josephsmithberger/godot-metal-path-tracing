@@ -400,3 +400,4 @@ $RECYCLE.BIN/
 *.msp
 *.lnk
 *.generated.props
+/mac-rt-planning
