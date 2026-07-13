@@ -2300,8 +2300,7 @@ RDD::AccelerationStructureID RenderingDeviceDriverMetal::_acceleration_structure
 RDD::AccelerationStructureID RenderingDeviceDriverMetal::blas_create(VectorView<AccelerationStructureGeometry> p_geometries, BitField<AccelerationStructureFlagBits> p_flags) {
 	ERR_FAIL_COND_V_MSG(!device_properties->features.supports_raytracing, AccelerationStructureID(), "Acceleration structures are not supported by this device.");
 
-	thread_local LocalVector<NS::Object *> geometry_descriptors;
-	geometry_descriptors.clear();
+	LocalVector<NS::Object *> geometry_descriptors;
 	NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
 
 	for (uint32_t i = 0; i < p_geometries.size(); i++) {
@@ -2450,7 +2449,7 @@ void RenderingDeviceDriverMetal::command_build_blas(CommandBufferID p_cmd_buffer
 	ERR_FAIL_COND_MSG(accel_info->type != MDAccelerationStructure::Type::BLAS, "Only BLAS resources can be passed to command_build_blas().");
 	ERR_FAIL_NULL_MSG(accel_info->accel.get(), "Metal BLAS resource has not been allocated.");
 	ERR_FAIL_NULL_MSG(scratch_buffer, "Metal BLAS scratch buffer input parameter is not valid.");
-	ERR_FAIL_COND_MSG(scratch_buffer->metal_buffer->allocatedSize() < accel_info->build_scratch_size, "Metal BLAS scratch buffer is too small for a build.");
+	ERR_FAIL_COND_MSG(scratch_buffer->metal_buffer->length() < accel_info->build_scratch_size, "Metal BLAS scratch buffer is too small for a build.");
 
 	cmd_buffer->acceleration_structure_build(accel_info, scratch_buffer->metal_buffer.get());
 }
@@ -2465,7 +2464,7 @@ void RenderingDeviceDriverMetal::command_update_blas(CommandBufferID p_cmd_buffe
 	ERR_FAIL_COND_MSG(!accel_info->flags.has_flag(ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT), "Metal BLAS was not created with ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT.");
 	ERR_FAIL_COND_MSG(!accel_info->build_encoded, "Metal BLAS must be built before it can be refit.");
 	ERR_FAIL_NULL_MSG(scratch_buffer, "Metal BLAS scratch buffer input parameter is not valid.");
-	ERR_FAIL_COND_MSG(scratch_buffer->metal_buffer->allocatedSize() < accel_info->refit_scratch_size, "Metal BLAS scratch buffer is too small for a refit.");
+	ERR_FAIL_COND_MSG(scratch_buffer->metal_buffer->length() < accel_info->refit_scratch_size, "Metal BLAS scratch buffer is too small for a refit.");
 
 	cmd_buffer->acceleration_structure_refit(accel_info, scratch_buffer->metal_buffer.get());
 }
