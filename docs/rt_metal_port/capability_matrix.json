@@ -1,0 +1,316 @@
+{
+  "record_type": "metal_rt_capability_matrix",
+  "schema_version": 1,
+  "chunk": "C2",
+  "status": "available",
+  "generated": "2026-07-13",
+  "companion_documents": {
+    "assumptions": "docs/rt_metal_port/assumptions.md",
+    "baseline": "docs/rt_metal_port/baseline.md",
+    "probe": "docs/rt_metal_port/capability_probe.mm"
+  },
+  "how_to_verify": [
+    "python3 mac-rt-planning/scripts/run_mac_rt_tests.py --stage caps",
+    "The probe exits 0 only when every family-expectation check in this matrix passes on the host device; the capability record is written next to the run summary."
+  ],
+  "sources": {
+    "apple_feature_set_tables": "https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf",
+    "apple_metal_rt_docs": "https://developer.apple.com/documentation/metal/metal_sample_code_library/accelerating_ray_tracing_using_metal",
+    "engine_capability_layer": "drivers/metal/metal_device_properties.cpp (init_features)",
+    "engine_build_gating": "platform/macos/detect.py",
+    "note": "Family expectations are transcribed from Apple's documentation and must be re-checked against the current Feature Set Tables PDF when a check fails on new hardware. Runtime device queries, not families, are the gating authority (assumption A2)."
+  },
+  "build_time_gates": {
+    "metal_driver_arch": {
+      "value": "arm64 only",
+      "evidence": "platform/macos/detect.py:309-311 disables metal on any other arch with a warning."
+    },
+    "arm64_deployment_target": {
+      "value": "macOS 11.0",
+      "evidence": "platform/macos/detect.py:109-111 (-mmacosx-version-min=11.0)."
+    },
+    "x86_64_deployment_target": {
+      "value": "macOS 10.13, Metal driver excluded",
+      "evidence": "platform/macos/detect.py:114-116; Intel Macs are build/Vulkan lanes only."
+    },
+    "driver_entry_point": {
+      "value": "MTL3::RenderingDeviceDriverMetal (subclass of RenderingDeviceDriverMetal, where the 14 RT stubs live)",
+      "evidence": "drivers/metal/rendering_context_driver_metal.cpp:90-91; stub locations in docs/rt_metal_port/baseline.md section 3."
+    }
+  },
+  "runtime_gates_current": {
+    "has_feature": {
+      "value": "SUPPORTS_RAY_QUERY and SUPPORTS_RAYTRACING_PIPELINE both report false on Metal",
+      "evidence": "drivers/metal/rendering_device_driver_metal.cpp:2678-2701 (default: return false).",
+      "planned_replacement": "C11: report SUPPORTS_RAYTRACING_PIPELINE when supportsRaytracing && supportsFunctionPointers and the implemented path's OS floor is met (see rt_gating_expression below)."
+    },
+    "rt_gating_expression": "device.supportsRaytracing && device.supportsFunctionPointers && argument_buffers_supported() [pending C7 audit, assumption A4]"
+  },
+  "gpu_family_expectations": {
+    "apple6": "A13 Bionic. First family listing ray tracing (compute + render) and function pointers in Apple's feature tables. Baseline RT lane.",
+    "apple7": "M1 / A14. Adds simdReduction, border colors, multisample layered rendering (engine already gates these).",
+    "apple8": "M2 / A15-A16. 64-bit image atomics only in combination with mac2.",
+    "apple9": "M3 / A17 Pro and later. Dedicated hardware ray-tracing acceleration; 'RT advanced' lane in the testing standard.",
+    "apple10_and_later": "Reported by M5 hardware (raw family value 1010). Newer than the engine's family scan, which caps at apple9 (drivers/metal/metal_device_properties.cpp:110); superset of apple9 for RT purposes.",
+    "mac2": "Intel-era Mac family. Some AMD GPUs report supportsRaytracing, but the engine never builds the Metal driver for x86_64, so mac2-only devices are out of scope (assumption A1)."
+  },
+  "capabilities": [
+    {
+      "id": "rt_acceleration_structures",
+      "description": "Create and size BLAS/TLAS objects.",
+      "metal_api": [
+        "MTLAccelerationStructure",
+        "MTLPrimitiveAccelerationStructureDescriptor",
+        "MTLInstanceAccelerationStructureDescriptor",
+        "-[MTLDevice accelerationStructureSizesWithDescriptor:]",
+        "-[MTLDevice newAccelerationStructureWithSize:]"
+      ],
+      "runtime_query": "MTLDevice.supportsRaytracing",
+      "introduced_macos": "11.0",
+      "expected_min_family": "apple6",
+      "port_tier": "required",
+      "engine_detection": "missing (add in C4/C11)",
+      "measured_apple_m5": true
+    },
+    {
+      "id": "rt_as_command_encoder",
+      "description": "Encode BLAS/TLAS builds, refits, and copies on the GPU timeline.",
+      "metal_api": [
+        "MTLAccelerationStructureCommandEncoder",
+        "buildAccelerationStructure:descriptor:scratchBuffer:scratchBufferOffset:",
+        "refitAccelerationStructure:descriptor:destination:scratchBuffer:scratchBufferOffset:",
+        "copyAndCompactAccelerationStructure:toAccelerationStructure:"
+      ],
+      "runtime_query": "MTLDevice.supportsRaytracing",
+      "introduced_macos": "11.0",
+      "expected_min_family": "apple6",
+      "port_tier": "required",
+      "engine_detection": "missing (add in C4/C11)",
+      "measured_apple_m5": true
+    },
+    {
+      "id": "rt_refit",
+      "description": "BLAS refit for deformable geometry (command_update_blas).",
+      "metal_api": ["MTLAccelerationStructureUsageRefit"],
+      "runtime_query": "MTLDevice.supportsRaytracing",
+      "introduced_macos": "11.0",
+      "expected_min_family": "apple6",
+      "port_tier": "required",
+      "engine_detection": "missing (add in C4/C11)",
+      "measured_apple_m5": true
+    },
+    {
+      "id": "rt_compaction",
+      "description": "AS compaction to reclaim memory after builds.",
+      "metal_api": [
+        "MTLAccelerationStructureUsageAllowCompaction (implied by copyAndCompact)",
+        "writeCompactedAccelerationStructureSize:toBuffer:offset:"
+      ],
+      "runtime_query": "MTLDevice.supportsRaytracing",
+      "introduced_macos": "11.0",
+      "expected_min_family": "apple6",
+      "port_tier": "optional",
+      "engine_detection": "missing",
+      "measured_apple_m5": true
+    },
+    {
+      "id": "rt_intersector_compute",
+      "description": "Trace rays from compute kernels (metal::raytracing::intersector / intersection_query, MSL 2.3+). This is the execution model for command_trace_rays; Metal has no standalone ray-tracing pipeline object.",
+      "metal_api": ["MSL metal::raytracing::intersector<>", "MSL intersection_query<>"],
+      "runtime_query": "MTLDevice.supportsRaytracing",
+      "introduced_macos": "11.0",
+      "expected_min_family": "apple6",
+      "port_tier": "required",
+      "engine_detection": "missing (add in C4/C11)",
+      "measured_apple_m5": true
+    },
+    {
+      "id": "function_pointers_compute",
+      "description": "Visible function tables from compute pipelines; the substrate for emulating Vulkan shader groups / SBT records.",
+      "metal_api": [
+        "MTLVisibleFunctionTable",
+        "MTLComputePipelineDescriptor.linkedFunctions",
+        "-[MTLComputePipelineState newVisibleFunctionTableWithDescriptor:]"
+      ],
+      "runtime_query": "MTLDevice.supportsFunctionPointers",
+      "introduced_macos": "11.0",
+      "expected_min_family": "apple6",
+      "port_tier": "required",
+      "engine_detection": "missing (add in C4/C11)",
+      "measured_apple_m5": true
+    },
+    {
+      "id": "intersection_function_tables",
+      "description": "Custom intersection functions for procedural (bounding-box) geometry, needed by RTProceduralInstance3D-style scenes. Triangle-only scenes can ship without it.",
+      "metal_api": [
+        "MTLIntersectionFunctionTable",
+        "-[MTLComputePipelineState newIntersectionFunctionTableWithDescriptor:]"
+      ],
+      "runtime_query": "MTLDevice.supportsFunctionPointers (plus supportsRaytracing)",
+      "introduced_macos": "11.0",
+      "expected_min_family": "apple6",
+      "port_tier": "required-for-procedural-geometry",
+      "engine_detection": "missing",
+      "measured_apple_m5": true
+    },
+    {
+      "id": "rt_from_render",
+      "description": "Ray tracing from vertex/fragment/tile stages. Not needed for the compute-based first scope (assumption A5).",
+      "metal_api": ["MTLDevice.supportsRaytracingFromRender"],
+      "runtime_query": "MTLDevice.supportsRaytracingFromRender",
+      "introduced_macos": "12.0",
+      "expected_min_family": "apple6",
+      "port_tier": "optional",
+      "engine_detection": "missing",
+      "measured_apple_m5": true
+    },
+    {
+      "id": "function_pointers_render",
+      "description": "Visible function tables from render pipelines. Only relevant if rt_from_render is ever used.",
+      "metal_api": ["MTLDevice.supportsFunctionPointersFromRender"],
+      "runtime_query": "MTLDevice.supportsFunctionPointersFromRender",
+      "introduced_macos": "12.0",
+      "expected_min_family": "apple6",
+      "port_tier": "optional",
+      "engine_detection": "missing",
+      "measured_apple_m5": true
+    },
+    {
+      "id": "primitive_motion_blur",
+      "description": "Keyframed primitive motion in acceleration structures. The fork's path tracer does not use motion blur.",
+      "metal_api": ["MTLDevice.supportsPrimitiveMotionBlur"],
+      "runtime_query": "MTLDevice.supportsPrimitiveMotionBlur",
+      "introduced_macos": "11.0",
+      "expected_min_family": "apple6",
+      "port_tier": "out-of-scope",
+      "engine_detection": "missing",
+      "measured_apple_m5": true
+    },
+    {
+      "id": "indirect_as_builds",
+      "description": "GPU-driven instance descriptors referencing BLASes by MTLResourceID instead of descriptor-array index; enables writing TLAS instances from the GPU. The macOS 11 path (instancedAccelerationStructures array) works without it.",
+      "metal_api": [
+        "MTLAccelerationStructureInstanceDescriptorTypeIndirect",
+        "MTLAccelerationStructure.gpuResourceID"
+      ],
+      "runtime_query": "OS version >= 13.0 (plus supportsRaytracing)",
+      "introduced_macos": "13.0",
+      "expected_min_family": "apple6",
+      "port_tier": "optional",
+      "engine_detection": "missing",
+      "measured_apple_m5": true
+    },
+    {
+      "id": "gpu_address",
+      "description": "Raw GPU virtual addresses for buffers; used by the Metal backend's bindless plumbing and likely by RT mesh/material access (audit in C7).",
+      "metal_api": ["-[MTLBuffer gpuAddress]"],
+      "runtime_query": "OS version >= 13.0",
+      "introduced_macos": "13.0",
+      "expected_min_family": "any",
+      "port_tier": "audit-C7",
+      "engine_detection": "drivers/metal/metal_device_properties.cpp:132-134 (supports_gpu_address)",
+      "measured_apple_m5": true
+    },
+    {
+      "id": "argument_buffers_tier2_no_encoders",
+      "description": "Tier-2 argument buffers usable without MTLArgumentEncoder. The engine only clears needs_arg_encoders on macOS 13+ with the Metal3 family, so the bindless path the path tracer depends on effectively requires macOS 13 (assumption A4).",
+      "metal_api": ["MTLDevice.argumentBuffersSupport", "MTLGPUFamilyMetal3"],
+      "runtime_query": "argumentBuffersSupport == Tier2 && supportsFamily(Metal3) && OS >= 13.0",
+      "introduced_macos": "13.0",
+      "expected_min_family": "apple6 (tier2); metal3 family for encoder-free path",
+      "port_tier": "audit-C7",
+      "engine_detection": "drivers/metal/metal_device_properties.cpp:152,173-175 (argument_buffers_tier, needs_arg_encoders)",
+      "measured_apple_m5": true
+    },
+    {
+      "id": "residency_sets",
+      "description": "MTLResidencySet for bulk residency of bindless/RT resources; replaces per-encoder useResource calls.",
+      "metal_api": ["MTLResidencySet"],
+      "runtime_query": "OS version >= 15.0 && supportsFamily(apple6)",
+      "introduced_macos": "15.0",
+      "expected_min_family": "apple6",
+      "port_tier": "optional",
+      "engine_detection": "drivers/metal/metal_device_properties.cpp:167-171 (supports_residency_sets)",
+      "measured_apple_m5": true
+    },
+    {
+      "id": "image_atomic_64_bit",
+      "description": "64-bit image atomics; audit in C7 whether the path tracer's accumulation targets need them.",
+      "metal_api": ["MSL 64-bit image atomics"],
+      "runtime_query": "supportsFamily(apple9) || (supportsFamily(apple8) && supportsFamily(mac2))",
+      "introduced_macos": "11.0 (family-dependent)",
+      "expected_min_family": "apple9",
+      "port_tier": "audit-C7",
+      "engine_detection": "drivers/metal/metal_device_properties.cpp:154 (supports_image_atomic_64_bit)",
+      "measured_apple_m5": true
+    },
+    {
+      "id": "hardware_rt_acceleration",
+      "description": "Dedicated ray-tracing hardware. No direct API query exists; the apple9 family bit is the proxy. Performance tiering only - correctness must not depend on it.",
+      "metal_api": ["supportsFamily(MTLGPUFamilyApple9) as proxy"],
+      "runtime_query": "supportsFamily(apple9)",
+      "introduced_macos": "14.0 (first apple9 hardware)",
+      "expected_min_family": "apple9",
+      "port_tier": "performance",
+      "engine_detection": "family scan in drivers/metal/metal_device_properties.cpp:109-115",
+      "measured_apple_m5": true
+    },
+    {
+      "id": "unified_memory",
+      "description": "Unified memory; informs storage-mode choices for scratch, instance, and readback buffers (assumption A8).",
+      "metal_api": ["MTLDevice.hasUnifiedMemory"],
+      "runtime_query": "MTLDevice.hasUnifiedMemory",
+      "introduced_macos": "10.15",
+      "expected_min_family": "apple6",
+      "port_tier": "assumed",
+      "engine_detection": "not tracked in MetalFeatures",
+      "measured_apple_m5": true
+    },
+    {
+      "id": "msl_23_rt_baseline",
+      "description": "MSL 2.3 is the first shading-language version with ray-tracing intrinsics; the engine's minimum supported MSL is already 2.3 and the target version is device-derived.",
+      "metal_api": ["MTLCompileOptions.languageVersion"],
+      "runtime_query": "msl_target_version >= 2.3 (engine: metal_utils.h MSL_VERSION_23)",
+      "introduced_macos": "11.0",
+      "expected_min_family": "any",
+      "port_tier": "required",
+      "engine_detection": "drivers/metal/metal_device_properties.cpp:85-107 (msl_max/target_version)",
+      "measured_apple_m5": "4.0"
+    }
+  ],
+  "driver_method_requirements": {
+    "_note": "The 14 stub methods from docs/rt_metal_port/baseline.md section 3, mapped to the capability ids above.",
+    "blas_create": ["rt_acceleration_structures"],
+    "tlas_create": ["rt_acceleration_structures"],
+    "acceleration_structure_instance_write": ["rt_acceleration_structures", "indirect_as_builds (optional GPU-driven path)"],
+    "acceleration_structure_free": ["rt_acceleration_structures"],
+    "acceleration_structure_get_scratch_size_bytes": ["rt_acceleration_structures"],
+    "raytracing_pipeline_create": ["function_pointers_compute", "intersection_function_tables", "msl_23_rt_baseline"],
+    "raytracing_pipeline_free": ["function_pointers_compute"],
+    "raytracing_pipeline_get_shader_group_handles": ["function_pointers_compute (handles become function-table indices, assumption A6)"],
+    "command_build_blas": ["rt_as_command_encoder"],
+    "command_update_blas": ["rt_as_command_encoder", "rt_refit"],
+    "command_build_tlas": ["rt_as_command_encoder"],
+    "command_bind_raytracing_pipeline": ["function_pointers_compute"],
+    "command_bind_raytracing_uniform_set": ["argument_buffers_tier2_no_encoders"],
+    "command_trace_rays": ["rt_intersector_compute", "function_pointers_compute"]
+  },
+  "verified_devices": [
+    {
+      "device": "Apple M5",
+      "model_identifier": "Mac17,2",
+      "macos": "26.5.2 (25F84)",
+      "probed": "2026-07-13",
+      "highest_apple_family_raw": 1010,
+      "engine_view_highest_family": "apple9 (engine scan caps at 1009)",
+      "families": "apple1-apple10, mac2, common1-3, metal3, metal4 all true; apple11+ false",
+      "raytracing": "supportsRaytracing, supportsRaytracingFromRender, supportsFunctionPointers, supportsFunctionPointersFromRender, supportsPrimitiveMotionBlur all true",
+      "argument_buffers": "tier2, needs_arg_encoders=false, argument_buffers_supported=true",
+      "msl_max_version": "4.0",
+      "unified_memory": true,
+      "checks": "5/5 family-expectation checks passed",
+      "artifact": "mac-rt-planning/artifacts/20260713T172454Z-arm64-caps/capability_record.json (untracked; regenerate with the caps stage)",
+      "lane_coverage": "Covers 'RT baseline' (apple6+) and 'RT advanced' (apple9+) lanes from the testing standard. No apple7 (M1) or apple8 (M2) coverage yet."
+    }
+  ]
+}
