@@ -983,6 +983,7 @@ enum class MDPipelineType {
 	None,
 	Render,
 	Compute,
+	Raytracing,
 };
 
 class API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0), visionos(2.0)) MDPipeline {
@@ -1087,4 +1088,80 @@ public:
 	explicit MDComputePipeline(NS::SharedPtr<MTL::ComputePipelineState> p_state) :
 			MDPipeline(MDPipelineType::Compute), state(std::move(p_state)) {}
 	~MDComputePipeline() final = default;
+};
+
+/*! A ray-tracing pipeline placeholder.
+ *
+ * Metal has no dedicated ray-tracing pipeline object; tracing runs as a compute
+ * dispatch whose kernel uses the MSL intersector. This class establishes the
+ * backend object boundary without committing to shader-group storage before the
+ * shader-lowering strategy (chunk C7) and pipeline mapping (chunk C9) are known.
+ */
+class API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0), visionos(2.0)) MDRaytracingPipeline final : public MDPipeline {
+public:
+	/// Compute pipeline that hosts the trace kernel (raygen equivalent).
+	NS::SharedPtr<MTL::ComputePipelineState> state;
+
+	MDRaytracingPipeline() :
+			MDPipeline(MDPipelineType::Raytracing) {}
+	~MDRaytracingPipeline() final = default;
+};
+
+#pragma mark - Acceleration Structures
+
+/*! Backend state for one Godot acceleration structure (BLAS or TLAS).
+ *
+ * C4 populates and retains the Metal descriptor and queries its allocation and
+ * scratch sizes. Native `MTLAccelerationStructure` allocation and build/refit
+ * encoding are separate GPU-functional steps in C5/C6.
+ */
+class API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0), visionos(2.0)) MDAccelerationStructure {
+public:
+	enum class Type : uint8_t {
+		BLAS,
+		TLAS,
+	};
+
+	Type type;
+	/// A `PrimitiveAccelerationStructureDescriptor` for a BLAS or an
+	/// `InstanceAccelerationStructureDescriptor` for a TLAS. Retains any geometry
+	/// buffers it references.
+	NS::SharedPtr<MTL::AccelerationStructureDescriptor> descriptor;
+	/// Native acceleration structure, allocated by the later BLAS/TLAS build chunks.
+	NS::SharedPtr<MTL::AccelerationStructure> accel;
+	/// Bytes required for the native acceleration-structure allocation.
+	uint64_t acceleration_structure_size = 0;
+	/// Scratch bytes required to build (and refit, when allowed) this structure.
+	uint64_t scratch_size = 0;
+	BitField<RDD::AccelerationStructureFlagBits> flags = {};
+
+	// TLAS only.
+	uint32_t max_instance_count = 0;
+
+	static MTL::AccelerationStructureUsage usage_from_flags(BitField<RDD::AccelerationStructureFlagBits> p_flags) {
+		MTL::AccelerationStructureUsage usage = MTL::AccelerationStructureUsageNone;
+		if (p_flags.has_flag(RDD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT)) {
+			usage |= MTL::AccelerationStructureUsageRefit;
+		}
+		if (p_flags.has_flag(RDD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT)) {
+			usage |= MTL::AccelerationStructureUsagePreferFastBuild;
+		}
+		return usage;
+	}
+
+	static uint64_t required_scratch_size(const MTL::AccelerationStructureSizes &p_sizes, BitField<RDD::AccelerationStructureFlagBits> p_flags) {
+		uint64_t size = p_sizes.buildScratchBufferSize;
+		if (p_flags.has_flag(RDD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT)) {
+			size = MAX(size, p_sizes.refitScratchBufferSize);
+		}
+		return size;
+	}
+
+	MDAccelerationStructure(Type p_type, NS::SharedPtr<MTL::AccelerationStructureDescriptor> p_descriptor, const MTL::AccelerationStructureSizes &p_sizes, BitField<RDD::AccelerationStructureFlagBits> p_flags, uint32_t p_max_instance_count = 0) :
+			type(p_type),
+			descriptor(std::move(p_descriptor)),
+			acceleration_structure_size(p_sizes.accelerationStructureSize),
+			scratch_size(required_scratch_size(p_sizes, p_flags)),
+			flags(p_flags),
+			max_instance_count(p_max_instance_count) {}
 };
