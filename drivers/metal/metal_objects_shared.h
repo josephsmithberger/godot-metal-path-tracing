@@ -41,6 +41,7 @@
 #include <optional>
 
 class RenderingDeviceDriverMetal;
+class MDAccelerationStructure;
 
 using RDC = RenderingDeviceCommons;
 
@@ -726,6 +727,11 @@ public:
 	virtual void compute_dispatch(uint32_t p_x_groups, uint32_t p_y_groups, uint32_t p_z_groups) = 0;
 	virtual void compute_dispatch_indirect(RDD::BufferID p_indirect_buffer, uint64_t p_offset) = 0;
 
+#pragma mark - Acceleration Structure Commands
+
+	virtual void acceleration_structure_build(MDAccelerationStructure *p_acceleration_structure, MTL::Buffer *p_scratch_buffer) = 0;
+	virtual void acceleration_structure_refit(MDAccelerationStructure *p_acceleration_structure, MTL::Buffer *p_scratch_buffer) = 0;
+
 #pragma mark - Transfer
 
 	virtual void resolve_texture(RDD::TextureID p_src_texture, RDD::TextureLayout p_src_texture_layout, uint32_t p_src_layer, uint32_t p_src_mipmap, RDD::TextureID p_dst_texture, RDD::TextureLayout p_dst_texture_layout, uint32_t p_dst_layer, uint32_t p_dst_mipmap) = 0;
@@ -1109,12 +1115,7 @@ public:
 
 #pragma mark - Acceleration Structures
 
-/*! Backend state for one Godot acceleration structure (BLAS or TLAS).
- *
- * C4 populates and retains the Metal descriptor and queries its allocation and
- * scratch sizes. Native `MTLAccelerationStructure` allocation and build/refit
- * encoding are separate GPU-functional steps in C5/C6.
- */
+/*! Backend state for one Godot acceleration structure (BLAS or TLAS). */
 class API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0), visionos(2.0)) MDAccelerationStructure {
 public:
 	enum class Type : uint8_t {
@@ -1127,13 +1128,21 @@ public:
 	/// `InstanceAccelerationStructureDescriptor` for a TLAS. Retains any geometry
 	/// buffers it references.
 	NS::SharedPtr<MTL::AccelerationStructureDescriptor> descriptor;
-	/// Native acceleration structure, allocated by the later BLAS/TLAS build chunks.
+	/// Native acceleration structure. C5 allocates BLAS resources; TLAS follows in C6.
 	NS::SharedPtr<MTL::AccelerationStructure> accel;
 	/// Bytes required for the native acceleration-structure allocation.
 	uint64_t acceleration_structure_size = 0;
+	/// Scratch bytes required for a clean build.
+	uint64_t build_scratch_size = 0;
+	/// Scratch bytes required for an in-place refit.
+	uint64_t refit_scratch_size = 0;
 	/// Scratch bytes required to build (and refit, when allowed) this structure.
 	uint64_t scratch_size = 0;
+	/// Shared result buffer populated after builds that request compaction.
+	NS::SharedPtr<MTL::Buffer> compacted_size_buffer;
 	BitField<RDD::AccelerationStructureFlagBits> flags = {};
+	/// True after a build has been encoded, allowing a later in-place refit.
+	bool build_encoded = false;
 
 	// TLAS only.
 	uint32_t max_instance_count = 0;
@@ -1157,10 +1166,50 @@ public:
 		return size;
 	}
 
+	bool allocate(MTL::Device *p_device) {
+		accel = NS::TransferPtr(p_device->newAccelerationStructure(acceleration_structure_size));
+		if (!accel) {
+			return false;
+		}
+
+		if (flags.has_flag(RDD::ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT)) {
+			compacted_size_buffer = NS::TransferPtr(p_device->newBuffer(sizeof(uint64_t), MTL::ResourceStorageModeShared));
+			if (!compacted_size_buffer) {
+				accel.reset();
+				return false;
+			}
+			*static_cast<uint64_t *>(compacted_size_buffer->contents()) = 0;
+		}
+
+		return true;
+	}
+
+	void encode_build(MTL::AccelerationStructureCommandEncoder *p_encoder, MTL::Buffer *p_scratch_buffer) {
+		p_encoder->buildAccelerationStructure(accel.get(), descriptor.get(), p_scratch_buffer, 0);
+		if (compacted_size_buffer) {
+			p_encoder->writeCompactedAccelerationStructureSize(accel.get(), compacted_size_buffer.get(), 0);
+		}
+		build_encoded = true;
+	}
+
+	void encode_refit(MTL::AccelerationStructureCommandEncoder *p_encoder, MTL::Buffer *p_scratch_buffer) {
+		p_encoder->refitAccelerationStructure(accel.get(), descriptor.get(), accel.get(), p_scratch_buffer, 0);
+	}
+
+	/// Returns zero until a compaction-size-enabled build has completed.
+	uint64_t get_compacted_size() const {
+		if (!compacted_size_buffer || !compacted_size_buffer->contents()) {
+			return 0;
+		}
+		return *static_cast<const uint64_t *>(compacted_size_buffer->contents());
+	}
+
 	MDAccelerationStructure(Type p_type, NS::SharedPtr<MTL::AccelerationStructureDescriptor> p_descriptor, const MTL::AccelerationStructureSizes &p_sizes, BitField<RDD::AccelerationStructureFlagBits> p_flags, uint32_t p_max_instance_count = 0) :
 			type(p_type),
 			descriptor(std::move(p_descriptor)),
 			acceleration_structure_size(p_sizes.accelerationStructureSize),
+			build_scratch_size(p_sizes.buildScratchBufferSize),
+			refit_scratch_size(p_sizes.refitScratchBufferSize),
 			scratch_size(required_scratch_size(p_sizes, p_flags)),
 			flags(p_flags),
 			max_instance_count(p_max_instance_count) {}

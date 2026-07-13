@@ -1497,6 +1497,37 @@ void MDCommandBuffer::compute_dispatch_indirect(RDD::BufferID p_indirect_buffer,
 	enc->dispatchThreadgroups(indirectBuffer->metal_buffer.get(), p_offset, compute.pipeline->compute_state.local);
 }
 
+#pragma mark - Acceleration Structure Commands
+
+void MDCommandBuffer::acceleration_structure_build(MDAccelerationStructure *p_acceleration_structure, MTL::Buffer *p_scratch_buffer) {
+	DEV_ASSERT(command_buffer() != nullptr);
+	end();
+
+	NS::SharedPtr<MTL::AccelerationStructureCommandEncoder> encoder = NS::RetainPtr(command_buffer()->accelerationStructureCommandEncoder());
+	p_acceleration_structure->encode_build(encoder.get(), p_scratch_buffer);
+	encoder->endEncoding();
+
+	retain_resource(reinterpret_cast<CFTypeRef>(p_acceleration_structure->descriptor.get()));
+	retain_resource(reinterpret_cast<CFTypeRef>(p_acceleration_structure->accel.get()));
+	retain_resource(reinterpret_cast<CFTypeRef>(p_scratch_buffer));
+	if (p_acceleration_structure->compacted_size_buffer) {
+		retain_resource(reinterpret_cast<CFTypeRef>(p_acceleration_structure->compacted_size_buffer.get()));
+	}
+}
+
+void MDCommandBuffer::acceleration_structure_refit(MDAccelerationStructure *p_acceleration_structure, MTL::Buffer *p_scratch_buffer) {
+	DEV_ASSERT(command_buffer() != nullptr);
+	end();
+
+	NS::SharedPtr<MTL::AccelerationStructureCommandEncoder> encoder = NS::RetainPtr(command_buffer()->accelerationStructureCommandEncoder());
+	p_acceleration_structure->encode_refit(encoder.get(), p_scratch_buffer);
+	encoder->endEncoding();
+
+	retain_resource(reinterpret_cast<CFTypeRef>(p_acceleration_structure->descriptor.get()));
+	retain_resource(reinterpret_cast<CFTypeRef>(p_acceleration_structure->accel.get()));
+	retain_resource(reinterpret_cast<CFTypeRef>(p_scratch_buffer));
+}
+
 void MDCommandBuffer::reset() {
 	push_constant_binding = UINT32_MAX;
 	push_constant_data_len = 0;
