@@ -25,6 +25,30 @@ Actual compaction into a second allocation is intentionally not performed in
 C5. The queried size is bookkeeping for a later memory-policy decision; the
 original acceleration structure remains valid and is used for refits.
 
+## Supported geometry inputs
+
+Triangle geometry accepts these Godot vertex formats; anything else fails
+`blas_create()` with an explicit error rather than encoding a bad descriptor:
+
+| Godot format | Metal attribute format | Minimum OS |
+|---|---|---|
+| `DATA_FORMAT_R32G32B32_SFLOAT` | `MTLAttributeFormatFloat3` (Metal's default) | macOS 11.0 / iOS 14.0 |
+| `DATA_FORMAT_R32G32_SFLOAT` | `MTLAttributeFormatFloat2` | macOS 13.0 / iOS 16.0 |
+| `DATA_FORMAT_R16G16B16A16_UNORM` | `MTLAttributeFormatUShort4Normalized` | macOS 13.0 / iOS 16.0 |
+
+Non-default formats require the descriptor's `vertexFormat` property, which is
+gated at runtime with an explicit failure below macOS 13 (assumption A4 in
+`assumptions.md` expects macOS 13 as the effective RT floor anyway). The C7
+shader audit should confirm which formats the path tracer actually emits and
+extend this table if needed.
+
+AABB geometry requires a stride of at least 24 bytes and a multiple of 4.
+
+Device-reported scratch sizes are validated against the scratch buffer's
+`length()` before builds and refits are encoded. Apple silicon may legitimately
+report a `refitScratchBufferSize` of zero (measured on Apple M5 for a
+single-triangle BLAS); nothing may assume the refit requirement is nonzero.
+
 ## Focused GPU smoke
 
 Run the canonical C5 test with:
