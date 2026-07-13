@@ -544,6 +544,11 @@ public:
 	void compute_dispatch(uint32_t p_x_groups, uint32_t p_y_groups, uint32_t p_z_groups) override;
 	void compute_dispatch_indirect(RDD::BufferID p_indirect_buffer, uint64_t p_offset) override;
 
+#pragma mark - Acceleration Structure Commands
+
+	void acceleration_structure_build(MDAccelerationStructure *p_acceleration_structure, MTL::Buffer *p_scratch_buffer) override;
+	void acceleration_structure_refit(MDAccelerationStructure *p_acceleration_structure, MTL::Buffer *p_scratch_buffer) override;
+
 #pragma mark - Transfer
 
 private:
