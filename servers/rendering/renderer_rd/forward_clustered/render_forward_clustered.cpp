@@ -2158,6 +2158,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				: nullptr;
 		const bool fog_enabled = p_render_data && p_render_data->environment.is_valid() && environment_get_fog_enabled(p_render_data->environment);
 		rt_flags = SceneShaderRaytracing::compute_rt_flags(env_params, fog_enabled);
+		rt_flags = raytracing->get_shader()->sanitize_rt_flags(rt_flags);
 
 		const bool dlss_rr_enabled = (rt_flags & SceneShaderRaytracing::RT_FLAG_DLSS_RR_ENABLED) != 0;
 		if (dlss_rr_enabled) {
@@ -2567,6 +2568,16 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		Size2i rt_size = rb->get_internal_size();
 		RD::get_singleton()->raytracing_list_trace_rays(raytracing_list, 0, raytracing->get_shader()->get_hit_sbt(rt_flags), rt_size.width, rt_size.height, 1);
 		RD::get_singleton()->raytracing_list_end();
+		if (raytracing->get_shader()->uses_compute_scene_lane()) {
+			static bool c13_markers_printed = false;
+			if (!c13_markers_printed) {
+				print_line("METAL_RT_EDITOR_ROUTE=compute_ray_query");
+				print_line("METAL_RT_DENOISER=none");
+				print_line("METAL_RT_C13_EDITOR_HG0=passed");
+				c13_markers_printed = true;
+			}
+			WARN_PRINT_ONCE("Metal path tracing C13 supports opaque StandardMaterial3D on static triangle meshes only. Alpha/custom spatial shaders, deformed meshes, MultiMesh, procedural geometry, native denoising, and SER remain disabled.");
+		}
 
 		RD::get_singleton()->draw_command_end_label();
 
@@ -5609,7 +5620,9 @@ void RenderForwardClustered::_update_shader_quality_settings() {
 // Raytracing methods
 
 bool RenderForwardClustered::_setup_rt() {
-	if (!RD::get_singleton()->has_feature(RD::SUPPORTS_RAYTRACING_PIPELINE)) {
+	const bool supports_pipeline = RD::get_singleton()->has_feature(RD::SUPPORTS_RAYTRACING_PIPELINE);
+	const bool supports_query = RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY);
+	if (!supports_pipeline && !supports_query) {
 		WARN_PRINT_ONCE("Raytracing not supported on this device.");
 		return false;
 	}
@@ -5622,6 +5635,12 @@ bool RenderForwardClustered::_setup_rt() {
 		rt_defines += "\n#define RT 1\n";
 		rt_defines += "\n#define MAX_ROUGHNESS_LOD " + itos(get_roughness_layers() - 1) + ".0\n";
 		raytracing->shader->init(rt_defines);
+	}
+	SceneShaderRaytracing::SceneRoute route = SceneShaderRaytracing::select_scene_route(
+			supports_pipeline, supports_query, raytracing->shader->is_scene_shader_ready());
+	if (route == SceneShaderRaytracing::SceneRoute::UNAVAILABLE) {
+		WARN_PRINT_ONCE("Raytracing scene shader is not ready; keeping the Forward+ raster route.");
+		return false;
 	}
 
 	return true;

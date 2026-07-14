@@ -1,0 +1,346 @@
+#[compute]
+
+#version 460
+
+#extension GL_EXT_control_flow_attributes : enable
+
+#VERSION_DEFINES
+
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_ARB_gpu_shader_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+#define GLSL 1
+#define RT_STAGE_COMPUTE 1
+#define RT_COMPUTE_LANE 1
+
+// clang-format off
+#include "raytracing_inc.glsl"
+#include "../scene_data_inc.glsl"
+#include "brdf_inc.glsl"
+#include "raytracing_common_inc.glsl"
+#include "raytracing_hit_inc.glsl"
+// clang-format on
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// The binding layout intentionally matches the Vulkan scene bundle. This lets
+// RenderRaytracing share camera/environment data, TLAS, geometry/material
+// tables, bindless textures, samplers, and output resources across both routes.
+layout(set = 0, binding = 0, rgba32f) uniform image2D image;
+layout(set = 0, binding = 1) uniform accelerationStructureEXT tlas;
+
+layout(set = 0, binding = 3, std430) readonly buffer GeometryBuffer {
+	GeometryData geometries[];
+};
+
+layout(set = 0, binding = 4, std430) readonly buffer MotionIndexBuffer {
+	int motion_indices[];
+};
+
+layout(set = 0, binding = 5, std430) readonly buffer MaterialBuffer {
+	MaterialData materials[];
+};
+
+layout(set = 0, binding = 32, std430) readonly buffer MotionTransforms {
+	InstanceMotionData motion_transforms[];
+};
+
+layout(set = 0, binding = 7) uniform texture2D radiance_octmap;
+layout(set = 0, binding = 8) uniform sampler radiance_sampler;
+
+layout(set = 1, binding = 0) uniform texture2D bindless_textures[];
+
+// clang-format off
+#include "raytracing_samplers_inc.glsl"
+#include "raytracing_material_eval_inc.glsl"
+#include "raytracing_lights_inc.glsl"
+// clang-format on
+
+struct ComputeHit {
+	float t;
+	uint geometry_idx;
+	uint primitive_idx;
+	vec2 barycentrics;
+	mat4 object_to_world;
+	mat4 world_to_object;
+	bool front_face;
+};
+
+struct ComputeHitData {
+	vec3 hit_pos;
+	vec3 geometry_normal;
+	vec3 tangent;
+	vec3 bitangent;
+	vec2 uv;
+	uint geometry_idx;
+};
+
+// HG0 is deliberately opaque in C13. Alpha/custom/procedural candidate
+// handling is added by C15/C16; the CPU scene builder excludes those surfaces
+// from this bundle instead of silently treating them as HG0.
+bool trace_hg0(vec3 origin, vec3 direction, float max_distance, out ComputeHit hit) {
+	rayQueryEXT query;
+	rayQueryInitializeEXT(query, tlas, RT_RAY_FLAGS | gl_RayFlagsOpaqueEXT,
+			0xFF, origin, 0.001, direction, max_distance);
+	while (rayQueryProceedEXT(query)) {
+	}
+
+	if (rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+		return false;
+	}
+
+	hit.t = rayQueryGetIntersectionTEXT(query, true);
+	hit.geometry_idx = rayQueryGetIntersectionInstanceCustomIndexEXT(query, true);
+	hit.primitive_idx = rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
+	hit.barycentrics = rayQueryGetIntersectionBarycentricsEXT(query, true);
+	hit.object_to_world = mat4(rayQueryGetIntersectionObjectToWorldEXT(query, true));
+	hit.world_to_object = mat4(rayQueryGetIntersectionWorldToObjectEXT(query, true));
+	hit.front_face = rayQueryGetIntersectionFrontFaceEXT(query, true);
+	return true;
+}
+
+ComputeHitData compute_hit_data(ComputeHit hit, vec3 ray_origin, vec3 ray_direction) {
+	ComputeHitData result;
+	result.geometry_idx = hit.geometry_idx;
+	GeometryData geometry = geometries[hit.geometry_idx];
+
+	uint i0, i1, i2;
+	get_triangle_indices_ex(geometry, hit.primitive_idx, i0, i1, i2);
+	vec3 bary = vec3(1.0 - hit.barycentrics.x - hit.barycentrics.y,
+			hit.barycentrics.x, hit.barycentrics.y);
+	result.uv = fetch_uv(geometry, i0, i1, i2, bary);
+
+	TBNResult tbn = fetch_tbn(geometry, i0, i1, i2, bary);
+	mat3 model_rotation = mat3(hit.object_to_world);
+	mat3 normal_matrix = mat3(
+			normalize(model_rotation[0]),
+			normalize(model_rotation[1]),
+			normalize(model_rotation[2]));
+	result.geometry_normal = normalize(normal_matrix * tbn.normal);
+	result.tangent = normalize(normal_matrix * tbn.tangent);
+	result.bitangent = cross(result.geometry_normal, result.tangent) * tbn.bitangent_sign;
+	if (!hit.front_face) {
+		result.geometry_normal = -result.geometry_normal;
+	}
+
+	result.hit_pos = ray_origin + ray_direction * hit.t;
+	return result;
+}
+
+vec4 sample_bindless_texture(uint texture_index, vec2 uv) {
+	return texture(sampler2D(bindless_textures[nonuniformEXT(texture_index)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv);
+}
+
+vec4 sample_material_texture(uint texture_index, vec2 uv, uint material_flags) {
+	if ((material_flags & 4u) != 0u) {
+		return texture(sampler2D(bindless_textures[nonuniformEXT(texture_index)], SAMPLER_NEAREST_REPEAT), uv);
+	}
+	return sample_bindless_texture(texture_index, uv);
+}
+
+MaterialResult evaluate_hg0(ComputeHitData hit) {
+	MaterialData material = materials[hit.geometry_idx];
+	vec2 uv = hit.uv * material.uv1_scale + material.uv1_offset;
+
+	vec3 final_normal = hit.geometry_normal;
+	if ((material.flags & 1u) != 0u) {
+		vec3 tangent_normal;
+		tangent_normal.xy = sample_bindless_texture(material.normal_texture_idx, uv).xy * 2.0 - 1.0;
+		tangent_normal.z = sqrt(max(0.0, 1.0 - dot(tangent_normal.xy, tangent_normal.xy)));
+		vec3 mapped = hit.tangent * tangent_normal.x + hit.bitangent * tangent_normal.y + hit.geometry_normal * tangent_normal.z;
+		final_normal = normalize(mix(hit.geometry_normal, mapped, material.normal_map_depth));
+	}
+
+	vec4 albedo_texture = sample_material_texture(material.albedo_texture_idx, uv, material.flags);
+	vec3 orm = sample_material_texture(material.orm_texture_idx, uv, material.flags).rgb;
+
+	MaterialResult result;
+	result.albedo = albedo_texture.rgb * material.albedo_color.rgb;
+	result.alpha = 1.0;
+	result.roughness = saturate(orm.g * material.roughness);
+	result.metalness = saturate(orm.b * material.metallic);
+	result.specular = material.specular;
+	result.emissive = vec3(0.0);
+	if ((material.flags & 2u) != 0u) {
+		result.emissive = sample_material_texture(material.emission_texture_idx, uv, material.flags).rgb *
+				material.emission_color * material.emission_strength * scene_data_block.data.emissive_exposure_normalization;
+	}
+	result.normal = final_normal;
+	return result;
+}
+
+mat4 decode_prev_object_to_world(int motion_index) {
+	InstanceMotionData motion = motion_transforms[motion_index];
+	return transpose(mat4(
+			vec4(motion.prev_xform[0], motion.prev_xform[1], motion.prev_xform[2], motion.prev_xform[3]),
+			vec4(motion.prev_xform[4], motion.prev_xform[5], motion.prev_xform[6], motion.prev_xform[7]),
+			vec4(motion.prev_xform[8], motion.prev_xform[9], motion.prev_xform[10], motion.prev_xform[11]),
+			vec4(0.0, 0.0, 0.0, 1.0)));
+}
+
+void write_primary_hit_outputs(uvec2 pixel, ComputeHit hit, ComputeHitData hit_data) {
+	mat4 view_matrix = transpose(mat4(scene_data_block.data.view_matrix[0],
+			scene_data_block.data.view_matrix[1], scene_data_block.data.view_matrix[2],
+			vec4(0.0, 0.0, 0.0, 1.0)));
+	vec4 clip = scene_data_block.data.projection_matrix * (view_matrix * vec4(hit_data.hit_pos, 1.0));
+	imageStore(rt_depth_image, ivec2(pixel), vec4(clip.z / clip.w));
+
+	int motion_index = motion_indices[hit.geometry_idx];
+	mat4 previous_model = motion_index >= 0 ? decode_prev_object_to_world(motion_index) : hit.object_to_world;
+	vec3 object_position = (hit.world_to_object * vec4(hit_data.hit_pos, 1.0)).xyz;
+	vec3 previous_world_position = (previous_model * vec4(object_position, 1.0)).xyz;
+	vec2 current_uv = project_uv(hit_data.hit_pos, curr_vp_unjittered);
+	vec2 previous_uv = project_uv(previous_world_position, prev_vp_unjittered);
+	imageStore(rt_velocity_image, ivec2(pixel), vec4(previous_uv - current_uv, 0.0, 0.0));
+}
+
+vec3 sample_environment(vec3 ray_direction) {
+	mat3 camera_basis = mat3(scene_data_block.data.inv_view_matrix);
+	mat3 world_to_sky = scene_data_block.data.radiance_inverse_xform * camera_basis;
+	vec3 sky_direction = world_to_sky * ray_direction;
+	vec2 border = vec2(scene_data_block.data.radiance_border_size,
+			1.0 - scene_data_block.data.radiance_border_size * 2.0);
+	vec2 sky_uv = vec3_to_oct_with_border(sky_direction, border);
+	return textureLod(sampler2D(radiance_octmap, radiance_sampler), sky_uv, 0.0).rgb *
+			scene_data_block.data.IBL_exposure_normalization;
+}
+
+void main() {
+	uvec2 pixel = gl_GlobalInvocationID.xy;
+	uvec2 image_size = uvec2(imageSize(image));
+	if (any(greaterThanEqual(pixel, image_size))) {
+		return;
+	}
+
+	vec2 pixel_center = vec2(pixel) + vec2(0.5);
+	vec2 in_uv = pixel_center / vec2(image_size);
+	vec2 device_position = in_uv * 2.0 - 1.0;
+
+	mat4 inv_view = transpose(mat4(scene_data_block.data.inv_view_matrix[0],
+			scene_data_block.data.inv_view_matrix[1], scene_data_block.data.inv_view_matrix[2],
+			vec4(0.0, 0.0, 0.0, 1.0)));
+	vec4 target = scene_data_block.data.inv_projection_matrix * vec4(device_position, 1.0, 1.0);
+	vec3 primary_origin = (inv_view * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+	vec3 primary_direction = (inv_view * vec4(normalize(target.xyz), 0.0)).xyz;
+
+	uint samples_per_pixel = RT_GET_SAMPLE_COUNT();
+	uint max_bounces = RT_GET_MAX_BOUNCES();
+	uint frame_index = uint(get_rt_param(RT_PARAM_FRAME_INDEX));
+	int visualization_mode = int(get_rt_param(RT_PARAM_VIS_MODE));
+	vec3 total_radiance = vec3(0.0);
+
+	[[dont_unroll]] for (uint sample_index = 0u; sample_index < samples_per_pixel; sample_index++) {
+		vec3 radiance = vec3(0.0);
+		vec3 throughput = vec3(1.0);
+		uint rng_state = init_rng(pixel, frame_index, sample_index);
+		uint diffuse_bounces = 0u;
+		vec3 ray_origin = primary_origin;
+		vec3 ray_direction = primary_direction;
+
+		[[dont_unroll]] for (uint bounce = 0u; bounce <= max_bounces; bounce++) {
+			ComputeHit hit;
+			if (!trace_hg0(ray_origin, ray_direction, 10000.0, hit)) {
+				if (visualization_mode == 23) {
+					break;
+				}
+				if (sample_index == 0u && bounce == 0u) {
+					imageStore(rt_depth_image, ivec2(pixel), vec4(0.0));
+					vec3 far_world = ray_origin + ray_direction * 10000.0;
+					vec2 current_uv = project_uv(far_world, curr_vp_unjittered);
+					vec2 previous_uv = project_uv(far_world, prev_vp_unjittered);
+					imageStore(rt_velocity_image, ivec2(pixel), vec4(previous_uv - current_uv, 0.0, 0.0));
+				}
+				radiance += throughput * sample_environment(ray_direction);
+				break;
+			}
+
+			ComputeHitData hit_data = compute_hit_data(hit, ray_origin, ray_direction);
+			if (sample_index == 0u && bounce == 0u) {
+				write_primary_hit_outputs(pixel, hit, hit_data);
+			}
+			if (visualization_mode == 23) {
+				uint encoded_id = pcg_hash(hit.geometry_idx + 1u);
+				radiance = vec3(0.2) + vec3(
+						float(encoded_id & 0xFFu),
+						float((encoded_id >> 8u) & 0xFFu),
+						float((encoded_id >> 16u) & 0xFFu)) * (0.8 / 255.0);
+				break;
+			}
+
+			MaterialResult material = evaluate_hg0(hit_data);
+			vec3 view_direction = -ray_direction;
+			vec3 shading_normal = clampShadingNormal(material.normal, hit_data.geometry_normal,
+					view_direction, RT_SHADING_NORMAL_CLAMP_THRESHOLD);
+			radiance += throughput * material.emissive;
+
+			MaterialProperties brdf_material;
+			brdf_material.baseColor = material.albedo;
+			brdf_material.metalness = material.metalness;
+			brdf_material.roughness = material.roughness;
+			brdf_material.dielectricF0 = 0.16 * material.specular * material.specular;
+			brdf_material.emissive = material.emissive;
+			brdf_material.transmissivness = 0.0;
+			brdf_material.opacity = 1.0;
+
+			uint light_count = uint(get_rt_param(RT_PARAM_LIGHT_COUNT));
+			if (light_count > 0u) {
+				vec3 light_origin = offset_ray_origin(hit_data.hit_pos, hit_data.geometry_normal);
+				vec3 direct = lights_evaluate_direct_lighting(light_origin, shading_normal, view_direction,
+						brdf_material, rng_state, diffuse_bounces > 0u, light_count);
+				radiance += throughput * direct;
+			}
+
+			if (bounce >= max_bounces || diffuse_bounces >= MAX_DIFFUSE_BOUNCES) {
+				break;
+			}
+
+			vec3 specular_f0 = baseColorToSpecularF0(brdf_material.baseColor,
+					brdf_material.metalness, brdf_material.dielectricF0);
+			vec3 diffuse_reflectance = baseColorToDiffuseReflectance(brdf_material.baseColor,
+					brdf_material.metalness);
+			float specular_luminance = luminance(specular_f0);
+			float diffuse_luminance = luminance(diffuse_reflectance);
+			int brdf_type;
+			if (diffuse_luminance < 0.0001) {
+				brdf_type = SPECULAR_TYPE;
+			} else if (specular_luminance < 0.0001) {
+				brdf_type = DIFFUSE_TYPE;
+			} else {
+				float probability = clamp(specular_luminance / (specular_luminance + diffuse_luminance), 0.01, 0.99);
+				if (rand(rng_state) < probability) {
+					brdf_type = SPECULAR_TYPE;
+					throughput /= probability;
+				} else {
+					brdf_type = DIFFUSE_TYPE;
+					throughput /= 1.0 - probability;
+				}
+			}
+
+			vec3 next_direction;
+			vec3 brdf_weight;
+			if (!evalIndirectCombinedBRDF(rand2(rng_state), shading_normal, hit_data.geometry_normal,
+					view_direction, brdf_material, brdf_type, next_direction, brdf_weight, vec4(0.0))) {
+				vec3 recovered_direction;
+				if (luminance(brdf_weight) == 0.0 ||
+						!recoverBelowHemisphereSample(next_direction, hit_data.geometry_normal, recovered_direction)) {
+					break;
+				}
+				next_direction = recovered_direction;
+			}
+
+			throughput *= brdf_weight;
+			if (brdf_type == DIFFUSE_TYPE) {
+				diffuse_bounces++;
+			}
+			ray_origin = offset_ray_origin(hit_data.hit_pos, hit_data.geometry_normal);
+			ray_direction = next_direction;
+		}
+
+		total_radiance += radiance;
+	}
+
+	imageStore(image, ivec2(pixel), vec4(total_radiance / float(samples_per_pixel), 1.0));
+}

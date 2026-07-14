@@ -61,9 +61,11 @@ void get_triangle_indices_ex(in GeometryData geom, uint primitive_id, out uint i
 }
 
 /// Convenience wrapper using gl_PrimitiveID (hit shaders only).
+#ifndef RT_COMPUTE_LANE
 void get_triangle_indices(in GeometryData geom, out uint i0, out uint i1, out uint i2) {
 	get_triangle_indices_ex(geom, gl_PrimitiveID, i0, i1, i2);
 }
+#endif
 
 // ============================================================================
 // UV FETCHING

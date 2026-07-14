@@ -2191,6 +2191,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	// Builds bundle if needed; live_ready_mask drives TLAS inclusion below.
 	SceneShaderRaytracing *rt_shader_singleton = SceneShaderRaytracing::get_singleton();
 	rt_shader_singleton->ensure_pipeline_bundle(p_rt_flags);
+	const bool hg0_compute_lane = rt_shader_singleton->uses_compute_scene_lane();
 
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
@@ -2243,6 +2244,10 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 		// Handle procedural RT instances (intersection shaders).
 		if (inst->rt_procedural) {
+			if (hg0_compute_lane) {
+				WARN_PRINT_ONCE("Metal C13 HG0 excludes procedural ray-tracing geometry; the instance was omitted from the TLAS.");
+				continue;
+			}
 			SceneShaderRaytracing *rt_shader = SceneShaderRaytracing::get_singleton();
 			RTProceduralState *ps = inst->rt_procedural;
 
@@ -2316,6 +2321,10 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		// MultiMesh: resolve materials and warm data cache now.
 		// Compute dispatches and TLAS assembly are deferred to Phase 2.
 		if (inst->data->base_type == RSE::INSTANCE_MULTIMESH) {
+			if (hg0_compute_lane) {
+				WARN_PRINT_ONCE("Metal C13 HG0 excludes MultiMesh content; the instance was omitted from the TLAS.");
+				continue;
+			}
 			RID mm_rid = inst->data->base;
 
 			if (mesh_storage->multimesh_get_transform_format(mm_rid) != RSE::MULTIMESH_TRANSFORM_3D) {
@@ -2429,6 +2438,11 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 			void *mesh_surface = surf->surface;
 			uint32_t surface_counter = mesh_storage->mesh_surface_get_rt_invalidation_counter(mesh_surface);
+			if (hg0_compute_lane && surf->shader && surf->shader->rt_cull_mode() != RSE::CULL_MODE_BACK) {
+				WARN_PRINT_ONCE("Metal C13 HG0 supports back-face-culled opaque surfaces only; a double-sided/front-culled surface was omitted from the TLAS.");
+				surf = surf->next;
+				continue;
+			}
 
 #ifdef TOOLS_ENABLED
 			uint32_t pre_build_size = dirty_blas_list.size();
@@ -2440,6 +2454,11 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			if (inst->mesh_instance.is_valid()) {
 				RID curr_vb = mesh_storage->mesh_instance_get_vertex_buffer(inst->mesh_instance, surf->surface_index);
 				if (curr_vb.is_valid()) {
+					if (hg0_compute_lane) {
+						WARN_PRINT_ONCE("Metal C13 HG0 excludes skinned, blend-shape, and otherwise deformed meshes; the surface was omitted from the TLAS.");
+						surf = surf->next;
+						continue;
+					}
 					RTDeformedGeometrySource src;
 					src.current_vb = curr_vb;
 					src.prev_vb = mesh_storage->mesh_instance_get_prev_vertex_buffer(inst->mesh_instance, surf->surface_index);

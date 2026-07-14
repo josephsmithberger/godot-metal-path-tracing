@@ -352,6 +352,9 @@ SceneShaderRaytracing::~SceneShaderRaytracing() {
 	if (raygen_shader_version.is_valid()) {
 		raygen_shader.version_free(raygen_shader_version);
 	}
+	if (compute_shader_version.is_valid()) {
+		compute_shader.version_free(compute_shader_version);
+	}
 
 	singleton = nullptr;
 }
@@ -371,7 +374,7 @@ void SceneShaderRaytracing::invalidate_pipeline_bundles() {
 				RD::get_singleton()->free_rid(rid);
 			}
 		}
-		if (b.base_shader.is_valid()) {
+		if (!compute_scene_lane && b.base_shader.is_valid()) {
 			RD::get_singleton()->free_rid(b.base_shader);
 		}
 	}
@@ -597,6 +600,9 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 }
 
 void SceneShaderRaytracing::finalize_custom_shaders() {
+	if (compute_scene_lane) {
+		return;
+	}
 	async_compilation_enabled = GLOBAL_GET_CACHED(bool, "rendering/pathtracer/async_shader_compilation");
 
 	_kick_rebuild_if_idle(); // Async dispatch only; sync drains below.
@@ -801,10 +807,22 @@ void SceneShaderRaytracing::_bundle_resize_for_slots(PipelineBundle &r_bundle) {
 
 const SceneShaderRaytracing::PipelineBundle &SceneShaderRaytracing::ensure_pipeline_bundle(uint32_t p_rt_flags) {
 	static PipelineBundle EMPTY_BUNDLE;
+	p_rt_flags = sanitize_rt_flags(p_rt_flags);
 
 	HashMap<uint32_t, PipelineBundle>::Iterator it = pipeline_bundles.find(p_rt_flags);
 	if (it != pipeline_bundles.end() && it->value.initial_pipeline_built) {
 		return it->value;
+	}
+
+	if (compute_scene_lane) {
+		ERR_FAIL_COND_V(!compute_shader_version.is_valid(), EMPTY_BUNDLE);
+		PipelineBundle &bundle = pipeline_bundles[p_rt_flags];
+		bundle.base_shader = compute_shader.version_get_shader(compute_shader_version, 0);
+		if (!bundle.base_shader.is_valid() || !_build_compute_bundle(p_rt_flags, bundle)) {
+			return EMPTY_BUNDLE;
+		}
+		bundle.initial_pipeline_built = true;
+		return bundle;
 	}
 
 	if (!_ensure_variant_compile_context(p_rt_flags)) {
@@ -824,6 +842,57 @@ const SceneShaderRaytracing::PipelineBundle &SceneShaderRaytracing::ensure_pipel
 	}
 	bundle.initial_pipeline_built = true;
 	return bundle;
+}
+
+bool SceneShaderRaytracing::_build_compute_bundle(uint32_t p_rt_flags, PipelineBundle &r_bundle) {
+	Vector<RD::PipelineSpecializationConstant> spec_constants;
+	RD::PipelineSpecializationConstant sc;
+	sc.constant_id = 0;
+	sc.type = RD::PIPELINE_SPECIALIZATION_CONSTANT_TYPE_INT;
+	sc.int_value = (int)p_rt_flags;
+	spec_constants.push_back(sc);
+
+	RD::PipelineShader compute_raygen = { r_bundle.base_shader, spec_constants };
+	const RD::HitGroup empty_hit_group;
+	LocalVector<RD::HitGroup> hit_groups;
+	// Slot zero is the HG0 compatibility record; slot one is the sentinel used
+	// for unsupported/custom content. Hit execution is inlined in the kernel.
+	hit_groups.push_back(empty_hit_group);
+	hit_groups.push_back(empty_hit_group);
+
+	RID pipeline = RD::get_singleton()->raytracing_pipeline_create(
+			{ &compute_raygen, 1 }, {}, { hit_groups.ptr(), (uint64_t)hit_groups.size() }, 1);
+	if (!pipeline.is_valid()) {
+		WARN_PRINT(vformat("RT: Metal HG0 compute pipeline creation failed for variant 0x%x.", p_rt_flags));
+		return false;
+	}
+	RD::get_singleton()->set_resource_name(pipeline, String("RT Metal HG0 Compute [flags=") + itos(p_rt_flags) + "]");
+
+	static constexpr uint32_t HIT_SBT_CAPACITY = 4096;
+	RID hit_sbt = RD::get_singleton()->hit_sbt_create(pipeline, HIT_SBT_CAPACITY);
+	if (!hit_sbt.is_valid()) {
+		RD::get_singleton()->free_rid(pipeline);
+		return false;
+	}
+	RD::HitShaderBindingTableRange range = RD::get_singleton()->hit_sbt_range_alloc(hit_sbt, HIT_SBT_CAPACITY);
+	if (!range) {
+		RD::get_singleton()->free_rid(hit_sbt);
+		RD::get_singleton()->free_rid(pipeline);
+		return false;
+	}
+	LocalVector<uint32_t> indices;
+	indices.resize(HIT_SBT_CAPACITY);
+	for (uint32_t i = 0; i < HIT_SBT_CAPACITY; i++) {
+		indices[i] = 0;
+	}
+	RD::get_singleton()->hit_sbt_range_update(hit_sbt, range, 0, indices);
+
+	r_bundle.pipeline = pipeline;
+	r_bundle.hit_sbt = hit_sbt;
+	r_bundle.live_hg_count = 1;
+	r_bundle.live_ready_mask.clear();
+	r_bundle.live_ready_mask.push_back(true);
+	return true;
 }
 
 // Minimal HG0 + empty sentinel pipeline/SBT for first use of a variant.
@@ -1347,6 +1416,9 @@ void SceneShaderRaytracing::_kick_rebuild_if_idle() {
 }
 
 void SceneShaderRaytracing::drain_completed_compiles() {
+	if (compute_scene_lane) {
+		return;
+	}
 	while (true) {
 		PipelineBuildTask *finished = nullptr;
 		{
@@ -1420,16 +1492,24 @@ void SceneShaderRaytracing::_join_lane_for_shutdown() {
 
 void SceneShaderRaytracing::init(const String p_defines) {
 	async_compilation_enabled = (bool)GLOBAL_GET("rendering/pathtracer/async_shader_compilation");
+	compute_scene_lane = !RD::get_singleton()->has_feature(RD::SUPPORTS_RAYTRACING_PIPELINE) &&
+			RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY);
 
-	// Raygen: one mode per bitmask of RAYGEN_SHADER_OPTIONS.
-	const uint32_t variant_count = 1u << RAYGEN_SHADER_OPTION_COUNT;
-	Vector<String> modes;
-	modes.resize((int)variant_count);
-	String *modes_ptr = modes.ptrw();
-	for (uint32_t mask = 0; mask < variant_count; mask++) {
-		modes_ptr[mask] = _raygen_variant_preamble(mask);
+	if (compute_scene_lane) {
+		Vector<String> compute_modes;
+		compute_modes.push_back("\n");
+		compute_shader.initialize(compute_modes, p_defines);
+	} else {
+		// Raygen: one mode per bitmask of RAYGEN_SHADER_OPTIONS.
+		const uint32_t variant_count = 1u << RAYGEN_SHADER_OPTION_COUNT;
+		Vector<String> modes;
+		modes.resize((int)variant_count);
+		String *modes_ptr = modes.ptrw();
+		for (uint32_t mask = 0; mask < variant_count; mask++) {
+			modes_ptr[mask] = _raygen_variant_preamble(mask);
+		}
+		raygen_shader.initialize(modes, p_defines);
 	}
-	raygen_shader.initialize(modes, p_defines);
 
 	// Slot 0: default HG (source_hash stays zero).
 	{
@@ -1438,15 +1518,24 @@ void SceneShaderRaytracing::init(const String p_defines) {
 		hit_group_slots.push_back(default_slot);
 	}
 
-	// Now create a version to access the embedded raytracing shader
-	raygen_shader_version = raygen_shader.version_create();
-	if (raygen_shader_version.is_valid()) {
-		const PipelineBundle &b = ensure_pipeline_bundle(RT_FLAG_NONE);
-		if (!b.pipeline.is_valid()) {
-			WARN_PRINT("Failed to create default raytracing pipeline bundle");
+	// Create and validate the route-specific scene bundle. This is the
+	// explicit readiness capability consumed by RenderForwardClustered: ray
+	// query support by itself never enables the editor path.
+	if (compute_scene_lane) {
+		compute_shader_version = compute_shader.version_create();
+		if (compute_shader_version.is_valid()) {
+			const PipelineBundle &bundle = ensure_pipeline_bundle(RT_FLAG_NONE);
+			scene_shader_ready = bundle.pipeline.is_valid() && bundle.base_shader.is_valid();
 		}
 	} else {
-		WARN_PRINT("Failed to create raytracing shader version");
+		raygen_shader_version = raygen_shader.version_create();
+		if (raygen_shader_version.is_valid()) {
+			const PipelineBundle &bundle = ensure_pipeline_bundle(RT_FLAG_NONE);
+			scene_shader_ready = bundle.pipeline.is_valid() && bundle.base_shader.is_valid();
+		}
+	}
+	if (!scene_shader_ready) {
+		WARN_PRINT("Failed to create the path-tracing scene shader bundle; editor path tracing remains disabled.");
 	}
 
 	{

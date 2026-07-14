@@ -33,6 +33,7 @@
 #include "core/templates/local_vector.h"
 #include "servers/rendering/renderer_rd/pipeline_hash_map_rd.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h" // IWYU pragma: keep
+#include "servers/rendering/renderer_rd/shaders/raytracing/scene_raytracing_compute.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/scene_raytracing_raygen.glsl.gen.h"
 
 namespace RendererSceneRenderImplementation {
@@ -43,6 +44,25 @@ private:
 	static Mutex singleton_mutex;
 
 public:
+	enum class SceneRoute : uint8_t {
+		UNAVAILABLE,
+		RAYTRACING_PIPELINE,
+		COMPUTE_RAY_QUERY,
+	};
+
+	static SceneRoute select_scene_route(bool p_supports_raytracing_pipeline, bool p_supports_ray_query, bool p_compute_scene_shader_ready) {
+		if (p_supports_raytracing_pipeline) {
+			return SceneRoute::RAYTRACING_PIPELINE;
+		}
+		if (p_supports_ray_query && p_compute_scene_shader_ready) {
+			return SceneRoute::COMPUTE_RAY_QUERY;
+		}
+		return SceneRoute::UNAVAILABLE;
+	}
+	static uint32_t sanitize_compute_rt_flags(uint32_t p_rt_flags) {
+		return p_rt_flags & ~(RT_FLAG_DEBUG_VIS_ENABLED | RT_FLAG_DLSS_RR_ENABLED | RT_FLAG_SER_ENABLED | RT_FLAG_FOG_ENABLED);
+	}
+
 	enum ShaderGroup {
 		SHADER_GROUP_BASE, // Always compiled at the beginning.
 		SHADER_GROUP_ADVANCED,
@@ -338,6 +358,7 @@ public:
 	}
 
 	SceneRaytracingRaygenShaderRD raygen_shader;
+	SceneRaytracingComputeShaderRD compute_shader;
 
 	struct TextureUniformInfo {
 		StringName name;
@@ -414,6 +435,9 @@ public:
 	};
 
 	HashMap<uint32_t, PipelineBundle> pipeline_bundles;
+	RID compute_shader_version;
+	bool compute_scene_lane = false;
+	bool scene_shader_ready = false;
 
 	// Single-lane async bundle rebuild (worker: SPIR-V + raytracing_pipeline_create; main: SBT + swap).
 	struct PipelineBuildTask;
@@ -452,6 +476,7 @@ private:
 	// Bundle build / rebuild.
 	void _bundle_resize_for_slots(PipelineBundle &r_bundle);
 	bool _build_initial_bundle(uint32_t p_rt_flags, PipelineBundle &r_bundle);
+	bool _build_compute_bundle(uint32_t p_rt_flags, PipelineBundle &r_bundle);
 	void _kick_rebuild_if_idle();
 
 	// Compile lane / worker.
@@ -483,6 +508,11 @@ private:
 
 public:
 	void invalidate_pipeline_bundles();
+	bool is_scene_shader_ready() const { return scene_shader_ready; }
+	bool uses_compute_scene_lane() const { return compute_scene_lane; }
+	uint32_t sanitize_rt_flags(uint32_t p_rt_flags) const {
+		return compute_scene_lane ? sanitize_compute_rt_flags(p_rt_flags) : p_rt_flags;
+	}
 
 	ShaderCompiler compiler;
 
