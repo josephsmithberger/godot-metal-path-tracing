@@ -117,6 +117,17 @@ MetalRTShaderLowering::Result MetalRTShaderLowering::lower_spirv(RenderingDevice
 				rb.desc_set = compiler.get_decoration(res.id, spv::DecorationDescriptorSet);
 				rb.binding = compiler.get_decoration(res.id, spv::DecorationBinding);
 				rb.count = 1;
+				// Runtime-sized (unbounded) arrays keep a count of 0 so SPIRV-Cross
+				// lowers them as spvDescriptorArray; that requires the argument
+				// buffer of the set to live in the device address space, matching
+				// the container configuration for bindless sets.
+				const SPIRType &type = compiler.get_type(res.type_id);
+				if (!type.array.empty() && type.array_size_literal.front() && type.array.front() == 0) {
+					rb.count = 0;
+					if (p_argument_buffers) {
+						compiler.set_argument_buffer_device_address_space(rb.desc_set, true);
+					}
+				}
 				rb.msl_buffer = rb.binding;
 				rb.msl_texture = rb.binding;
 				rb.msl_sampler = rb.binding;

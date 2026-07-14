@@ -806,6 +806,28 @@ struct API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0), visionos(2.0)) UniformS
 	LocalVector<UniformInfo> uniforms;
 	LocalVector<uint32_t> dynamic_uniforms;
 	uint32_t buffer_size = 0;
+	/// True when the set's trailing binding is an unbounded (runtime-sized)
+	/// array; the argument buffer is then sized per uniform set, from the
+	/// actual descriptor count, instead of `buffer_size` alone.
+	bool has_unbounded_array = false;
+
+	_FORCE_INLINE_ uint32_t argument_buffer_size(VectorView<RDD::BoundUniform> p_uniforms) const {
+		if (!has_unbounded_array) {
+			return buffer_size;
+		}
+
+		DEV_ASSERT(uniforms.size() == p_uniforms.size());
+		uint32_t size = buffer_size;
+		for (uint32_t i = 0; i < p_uniforms.size(); i++) {
+			const UniformInfo &uniform = uniforms[i];
+			if (uniform.arrayLength != UINT32_MAX) {
+				continue;
+			}
+			uint32_t descriptor_count = MAX(p_uniforms[i].ids.size(), 1u);
+			size = MAX(size, (uniform.arg_buffer.texture + descriptor_count) * (uint32_t)sizeof(uint64_t));
+		}
+		return size;
+	}
 };
 
 class API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0), visionos(2.0)) DynamicOffsetLayout {
