@@ -1,0 +1,472 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import os
+import platform
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+SCRIPT_PATH = Path(__file__).resolve()
+REPO_ROOT = SCRIPT_PATH.parents[2]
+DEFAULT_ARTIFACT_ROOT = REPO_ROOT / "mac-rt-planning" / "artifacts"
+VALID_STAGES = ("preflight", "caps", "build", "smoke", "unit", "gpu", "image", "fallback")
+CAPS_PROBE_SOURCE = REPO_ROOT / "docs" / "rt_metal_port" / "capability_probe.mm"
+RUNTIME_GATE_PROJECT = REPO_ROOT / "tests" / "metal_rt"
+IMAGE_DIFF_SCRIPT = RUNTIME_GATE_PROJECT / "image_diff.py"
+IMAGE_REFERENCE = RUNTIME_GATE_PROJECT / "references" / "c10_pathtracer_launch_v1.png"
+IMAGE_REFERENCE_MANIFEST = IMAGE_REFERENCE.with_suffix(".json")
+CAPS_SKIP_EXIT_CODE = 3  # Probe exit code for a machine-readable skip (see capability_probe.mm).
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build and test the macOS Metal ray tracing development baseline.",
+    )
+    parser.add_argument(
+        "--stage",
+        action="append",
+        choices=(*VALID_STAGES, "all"),
+        help="Stage to run; repeat for multiple stages (default: all).",
+    )
+    parser.add_argument("--arch", choices=("arm64", "x86_64"), default="arm64")
+    parser.add_argument(
+        "--binary",
+        type=Path,
+        help="Editor binary to test (default: bin/godot.macos.editor.<arch>).",
+    )
+    parser.add_argument(
+        "--artifact-dir",
+        type=Path,
+        help="Directory for this run (default: a timestamped directory under mac-rt-planning/artifacts).",
+    )
+    parser.add_argument("--jobs", type=positive_int, help="Parallel SCons job count.")
+    parser.add_argument(
+        "--scons-flag",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Append a SCons option after the standardized defaults; repeat as needed.",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Record and print commands without executing them.")
+    parser.add_argument("--keep-going", action="store_true", help="Run later stages after a command fails.")
+    parser.add_argument(
+        "--fail-on-skip",
+        action="store_true",
+        help="Treat a capability or test skip as failure (intended for configured GPU runners).",
+    )
+    return parser.parse_args()
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def resolve_stages(requested: list[str] | None) -> list[str]:
+    if not requested or "all" in requested:
+        return list(VALID_STAGES)
+    return list(dict.fromkeys(requested))
+
+
+def repo_path(value: Path) -> Path:
+    return value if value.is_absolute() else REPO_ROOT / value
+
+
+def git_output(*args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else "unavailable"
+
+
+def shell_join(command: list[str]) -> str:
+    return shlex.join(command)
+
+
+def command_record(
+    name: str,
+    command: list[str],
+    skip_exit_codes: tuple[int, ...] = (),
+    requires_passed: str | None = None,
+    preset_skip_reason: str | None = None,
+    detect_log_skip: bool = False,
+    environment: dict[str, str] | None = None,
+    required_log_patterns: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    environment = environment or {}
+    displayed_command = ["env", *(f"{key}={value}" for key, value in sorted(environment.items())), *command]
+    return {
+        "name": name,
+        "command": command,
+        "command_string": shell_join(displayed_command if environment else command),
+        "environment": environment,
+        "exit_code": None,
+        "duration_seconds": 0.0,
+        "log": None,
+        "status": "pending",
+        "skip_exit_codes": list(skip_exit_codes),
+        "requires_passed": requires_passed,
+        "preset_skip_reason": preset_skip_reason,
+        "detect_log_skip": detect_log_skip,
+        "required_log_patterns": list(required_log_patterns),
+    }
+
+
+def make_commands(
+    args: argparse.Namespace,
+    stages: list[str],
+    binary: Path,
+    artifact_dir: Path,
+) -> list[dict[str, Any]]:
+    commands: list[dict[str, Any]] = []
+
+    if "preflight" in stages:
+        commands.extend([
+            command_record("preflight-macos", ["uname", "-s"]),
+            command_record("preflight-architecture", ["uname", "-m"]),
+            command_record("preflight-sdk", ["xcrun", "--show-sdk-version"]),
+            command_record("preflight-metal-compiler", ["xcrun", "--find", "metal"]),
+            command_record("preflight-scons", ["scons", "--version"]),
+        ])
+
+    if "caps" in stages or (("gpu" in stages or "image" in stages or "fallback" in stages) and args.arch == "arm64"):
+        probe_binary = artifact_dir / "capability_probe"
+        commands.extend([
+            command_record(
+                "caps-compile",
+                [
+                    "xcrun",
+                    "clang++",
+                    "-std=c++17",
+                    "-fobjc-arc",
+                    "-mmacosx-version-min=11.0",
+                    "-framework",
+                    "Foundation",
+                    "-framework",
+                    "Metal",
+                    str(CAPS_PROBE_SOURCE),
+                    "-o",
+                    str(probe_binary),
+                ],
+            ),
+            command_record(
+                "caps-probe",
+                [str(probe_binary), "--output", str(artifact_dir / "capability_record.json")],
+                skip_exit_codes=(CAPS_SKIP_EXIT_CODE,),
+            ),
+        ])
+
+    if "build" in stages:
+        metal_enabled = "yes" if args.arch == "arm64" else "no"
+        build = [
+            "scons",
+            "platform=macos",
+            "target=editor",
+            f"arch={args.arch}",
+            "dev_mode=yes",
+            f"metal={metal_enabled}",
+            "vulkan=no",
+            "angle=no",
+            "accesskit=no",
+            *args.scons_flag,
+        ]
+        if args.jobs:
+            build.extend(["-j", str(args.jobs)])
+        commands.append(command_record("build-editor", build))
+
+    if "smoke" in stages:
+        commands.extend([
+            command_record("smoke-version", [str(binary), "--version"]),
+            command_record("smoke-help", [str(binary), "--help"]),
+        ])
+
+    if "unit" in stages:
+        commands.append(command_record("unit-tests", [str(binary), "--test", "--force-colors"]))
+
+    if "gpu" in stages:
+        commands.append(
+            command_record(
+                "gpu-acceleration-structures",
+                [
+                    str(binary),
+                    "--test",
+                    "--test-case=*[MetalRT][GPU]*",
+                    "--no-skip",
+                    "--force-colors",
+                ],
+                requires_passed="caps-probe" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                detect_log_skip=True,
+            )
+        )
+
+    if "image" in stages:
+        image_render_name = "gpu-acceleration-structures" if "gpu" in stages else "image-render"
+        if "gpu" not in stages:
+            commands.append(
+                command_record(
+                    image_render_name,
+                    [
+                        str(binary),
+                        "--test",
+                        "--test-case=*[MetalRT][GPU] C10*",
+                        "--no-skip",
+                        "--force-colors",
+                    ],
+                    requires_passed="caps-probe" if args.arch == "arm64" else None,
+                    preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                    detect_log_skip=True,
+                )
+            )
+        commands.append(
+            command_record(
+                "image-compare",
+                [
+                    sys.executable,
+                    str(IMAGE_DIFF_SCRIPT),
+                    str(artifact_dir / "c10_pathtracer_launch_gpu.png"),
+                    str(IMAGE_REFERENCE),
+                    "--manifest",
+                    str(IMAGE_REFERENCE_MANIFEST),
+                    "--diff",
+                    str(artifact_dir / "c10_pathtracer_launch_diff.png"),
+                    "--metrics",
+                    str(artifact_dir / "c10_pathtracer_launch_metrics.json"),
+                ],
+                requires_passed=image_render_name,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                required_log_patterns=("MetalRT C12 image diff:", "status=passed"),
+            )
+        )
+
+    if "fallback" in stages:
+        gate_command = [
+            str(binary),
+            "--path",
+            str(RUNTIME_GATE_PROJECT),
+            "--quit-after",
+            "1",
+            "--rendering-driver",
+            "metal",
+        ]
+        commands.extend([
+            command_record(
+                "runtime-gate-supported",
+                gate_command,
+                requires_passed="caps-probe" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                required_log_patterns=("C11_GATE=enabled",),
+            ),
+            command_record(
+                "runtime-gate-forced-fallback",
+                gate_command,
+                requires_passed="runtime-gate-supported" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                environment={"GODOT_MTL_DISABLE_RAYTRACING": "1"},
+                required_log_patterns=("using non-RT rendering fallback", "C11_GATE=disabled:forced_disabled"),
+            ),
+        ])
+
+    return commands
+
+
+def write_summary(path: Path, summary: dict[str, Any]) -> None:
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("w", encoding="utf-8", newline="\n") as file:
+        json.dump(summary, file, indent=2, sort_keys=True)
+        file.write("\n")
+    temporary.replace(path)
+
+
+def run_command(command: dict[str, Any], index: int, artifact_dir: Path, dry_run: bool) -> int:
+    print(f"[{index:02d}] {command['name']}: {command['command_string']}", flush=True)
+    if dry_run:
+        command["status"] = "dry-run"
+        return 0
+
+    executable = command["command"][0]
+    if shutil.which(executable) is None and not Path(executable).is_file():
+        message = f"ERROR: executable not found: {executable}\n"
+        print(message, end="", file=sys.stderr)
+        log_path = artifact_dir / f"{index:02d}-{command['name']}.log"
+        log_path.write_text(message, encoding="utf-8")
+        command["log"] = log_path.name
+        command["exit_code"] = 127
+        command["status"] = "failed"
+        return 127
+
+    log_path = artifact_dir / f"{index:02d}-{command['name']}.log"
+    command["log"] = log_path.name
+    started = time.monotonic()
+    with log_path.open("w", encoding="utf-8", newline="\n") as log:
+        # Tests that produce image evidence (for example the C10 controlled
+        # scene) write it into the stage artifact directory via this variable.
+        command_env = {
+            **os.environ,
+            "GODOT_MRT_ARTIFACT_DIR": str(artifact_dir),
+            **command["environment"],
+        }
+        process = subprocess.Popen(
+            command["command"],
+            cwd=REPO_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            env=command_env,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            print(line, end="", flush=True)
+            log.write(line)
+        exit_code = process.wait()
+
+    command["duration_seconds"] = round(time.monotonic() - started, 3)
+    command["exit_code"] = exit_code
+    if exit_code == 0:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+        missing_patterns = [pattern for pattern in command["required_log_patterns"] if pattern not in log_text]
+        if missing_patterns:
+            message = f"ERROR: required log pattern(s) not found: {', '.join(missing_patterns)}\n"
+            print(message, end="", file=sys.stderr)
+            with log_path.open("a", encoding="utf-8", newline="\n") as log:
+                log.write(message)
+            command["exit_code"] = 1
+            command["status"] = "failed"
+            return 1
+        command["status"] = "passed"
+        # A test may exit zero after declining to exercise the GPU (for example
+        # when the caps probe passed but the device lacks a required feature).
+        # The skip contract requires such runs to be recorded as skips.
+        if command.get("detect_log_skip"):
+            skip_match = re.search(r"SKIP_REASON=([a-z_]+)", log_text)
+            if skip_match:
+                command["status"] = "skipped"
+                command["skip_reason"] = skip_match.group(1)
+    elif exit_code in command["skip_exit_codes"]:
+        command["status"] = "skipped"
+    else:
+        command["status"] = "failed"
+    return exit_code
+
+
+def skip_command(command: dict[str, Any], index: int, artifact_dir: Path, reason: str) -> None:
+    message = f"SKIP_REASON={reason}\n"
+    print(f"[{index:02d}] {command['name']}: {message}", end="", flush=True)
+    log_path = artifact_dir / f"{index:02d}-{command['name']}.log"
+    log_path.write_text(message, encoding="utf-8")
+    command["log"] = log_path.name
+    command["status"] = "skipped"
+    command["skip_reason"] = reason
+
+
+def main() -> int:
+    args = parse_args()
+    stages = resolve_stages(args.stage)
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stage_slug = "all" if stages == list(VALID_STAGES) else "+".join(stages)
+    artifact_dir = (
+        repo_path(args.artifact_dir)
+        if args.artifact_dir
+        else DEFAULT_ARTIFACT_ROOT / f"{timestamp}-{args.arch}-{stage_slug}"
+    )
+    binary = repo_path(args.binary) if args.binary else REPO_ROOT / "bin" / f"godot.macos.editor.{args.arch}"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    commands = make_commands(args, stages, binary, artifact_dir)
+    summary: dict[str, Any] = {
+        "schema_version": 1,
+        "started_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "finished_at_utc": None,
+        "status": "running",
+        "dry_run": args.dry_run,
+        "fail_on_skip": args.fail_on_skip,
+        "repository": str(REPO_ROOT),
+        "git_commit": git_output("rev-parse", "HEAD"),
+        "git_branch": git_output("branch", "--show-current"),
+        "git_dirty": bool(git_output("status", "--porcelain")),
+        "host": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+            "python": platform.python_version(),
+        },
+        "requested_arch": args.arch,
+        "binary": str(binary),
+        "stages": stages,
+        "commands": commands,
+        "artifacts": [],
+    }
+    summary_path = artifact_dir / "summary.json"
+    write_summary(summary_path, summary)
+
+    failed = False
+    commands_by_name = {command["name"]: command for command in commands}
+    for index, command in enumerate(commands, start=1):
+        if not args.dry_run and command["preset_skip_reason"]:
+            skip_command(command, index, artifact_dir, command["preset_skip_reason"])
+            write_summary(summary_path, summary)
+            if args.fail_on_skip:
+                failed = True
+                if not args.keep_going:
+                    break
+            continue
+
+        required_name = command["requires_passed"]
+        if not args.dry_run and required_name:
+            required = commands_by_name[required_name]
+            if required["status"] != "passed":
+                reason = "missing_metal_rt_feature" if required["status"] == "skipped" else "runner_not_configured"
+                skip_command(command, index, artifact_dir, reason)
+                write_summary(summary_path, summary)
+                if args.fail_on_skip:
+                    failed = True
+                    if not args.keep_going:
+                        break
+                continue
+
+        exit_code = run_command(command, index, artifact_dir, args.dry_run)
+        write_summary(summary_path, summary)
+        if exit_code != 0 and command["status"] != "skipped":
+            failed = True
+            if not args.keep_going:
+                break
+        elif command["status"] == "skipped" and args.fail_on_skip:
+            failed = True
+            if not args.keep_going:
+                break
+
+    for command in commands:
+        if command["status"] == "pending":
+            command["status"] = "not-run"
+
+    summary["finished_at_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    summary["status"] = "failed" if failed else ("dry-run" if args.dry_run else "passed")
+    summary["artifacts"] = sorted(
+        path.name
+        for path in artifact_dir.iterdir()
+        if path.is_file() and path.name not in {"capability_probe", "summary.tmp"}
+    )
+    write_summary(summary_path, summary)
+    print(f"Summary: {summary_path}")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

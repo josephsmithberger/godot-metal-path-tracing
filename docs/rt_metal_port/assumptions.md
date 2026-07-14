@@ -12,7 +12,7 @@ Verification evidence for this chunk comes from the standalone capability
 probe:
 
 ```bash
-python3 mac-rt-planning/scripts/run_mac_rt_tests.py --stage caps
+python3 tests/metal_rt/run_mac_rt_tests.py --stage caps
 ```
 
 The probe (`capability_probe.mm`) compiles with only Foundation and Metal,

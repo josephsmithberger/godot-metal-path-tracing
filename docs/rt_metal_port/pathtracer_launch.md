@@ -123,7 +123,7 @@ Run the CPU mapping cases:
 Run the GPU launch with the canonical runner (writes the PNG artifacts):
 
 ```bash
-python3 mac-rt-planning/scripts/run_mac_rt_tests.py \
+python3 tests/metal_rt/run_mac_rt_tests.py \
   --stage gpu --binary bin/godot.macos.editor.arm64
 ```
 
@@ -132,6 +132,11 @@ Its log contains a line beginning:
 ```text
 MetalRT C10 path-tracer launch: device="..." image=8x8 spp=2 bounces=2 instances=2 max_diff=...
 ```
+
+C12 promotes this output to a reviewed image regression with a committed PNG,
+manifest, visual diff, numeric metrics, and self-hosted CI lane. See
+[`ci_validation.md`](ci_validation.md), or run only that stage with
+`--stage image`.
 
 ## Remaining work toward full scene integration
 

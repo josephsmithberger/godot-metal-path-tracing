@@ -72,7 +72,7 @@ minimal mesh project and requires the supported marker, then relaunches with
 the environment override and requires the fallback marker:
 
 ```bash
-python3 mac-rt-planning/scripts/run_mac_rt_tests.py \
+python3 tests/metal_rt/run_mac_rt_tests.py \
   --stage fallback --binary bin/godot.macos.editor.arm64
 ```
 

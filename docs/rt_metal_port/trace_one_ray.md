@@ -61,7 +61,7 @@ MetalRT C8 trace smoke: device="..." iteration=... image=4x4 ift_entries=1 golde
 Run it with the capability-gated GPU suite:
 
 ```bash
-python3 mac-rt-planning/scripts/run_mac_rt_tests.py \
+python3 tests/metal_rt/run_mac_rt_tests.py \
   --stage gpu \
   --binary bin/godot.macos.editor.arm64
 ```
@@ -80,8 +80,8 @@ Or isolate C8 after building the editor:
   software recursion budget, but the C8 kernel does not consume them.
 - Exact buffer output only; C10 adds the controlled path-traced scene with
   PNG artifacts and a CPU-reference comparison
-  ([`pathtracer_launch.md`](pathtracer_launch.md)); the reviewed L5 reference
-  image remains later work.
+  ([`pathtracer_launch.md`](pathtracer_launch.md)); C12 adds its reviewed L5
+  reference, diff, and CI gate ([`ci_validation.md`](ci_validation.md)).
 - ~~The custom Godot instance ID retained in the C6 record is not
   shader-visible at the macOS 11 descriptor floor.~~ Resolved by C10: the
   instance record now uses Metal's UserID descriptor prefix and `tlas_create`

@@ -56,7 +56,7 @@ single-triangle BLAS); nothing may assume the refit requirement is nonzero.
 Run the canonical C5 test with:
 
 ```bash
-python3 mac-rt-planning/scripts/run_mac_rt_tests.py \
+python3 tests/metal_rt/run_mac_rt_tests.py \
   --stage gpu \
   --binary bin/godot.macos.editor.arm64
 ```

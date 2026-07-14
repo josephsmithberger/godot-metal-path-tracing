@@ -68,7 +68,7 @@ MetalRT C6 TLAS smoke: device="..." iteration=... blas_size=... tlas_size=... tl
 Run it through the canonical capability-gated runner:
 
 ```bash
-python3 mac-rt-planning/scripts/run_mac_rt_tests.py \
+python3 tests/metal_rt/run_mac_rt_tests.py \
   --stage gpu \
   --binary bin/godot.macos.editor.arm64
 ```

@@ -44,7 +44,7 @@
 //   ./capability_probe [-o output.json]
 //
 // The canonical wrapper is the `caps` stage of
-// mac-rt-planning/scripts/run_mac_rt_tests.py.
+// tests/metal_rt/run_mac_rt_tests.py.
 //
 // Exit codes:
 //   0: record written, all family-expectation checks passed.

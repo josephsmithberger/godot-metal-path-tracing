@@ -10,7 +10,7 @@
     "probe": "docs/rt_metal_port/capability_probe.mm"
   },
   "how_to_verify": [
-    "python3 mac-rt-planning/scripts/run_mac_rt_tests.py --stage caps",
+    "python3 tests/metal_rt/run_mac_rt_tests.py --stage caps",
     "The probe exits 0 only when every family-expectation check in this matrix passes on the host device; the capability record is written next to the run summary."
   ],
   "sources": {

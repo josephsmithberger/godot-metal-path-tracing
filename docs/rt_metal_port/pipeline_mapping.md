@@ -123,7 +123,7 @@ two-entry Metal intersection-function table (opaque triangle plus one reserved
 procedural slot):
 
 ```bash
-python3 mac-rt-planning/scripts/run_mac_rt_tests.py \
+python3 tests/metal_rt/run_mac_rt_tests.py \
   --stage gpu --binary bin/godot.macos.editor.arm64
 ```
 

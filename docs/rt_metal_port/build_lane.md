@@ -52,8 +52,9 @@ Artifacts uploaded per run:
   even when a step fails.
 
 The hosted job proves compile health and CPU-side unit behavior only. It is
-not evidence of GPU-side Metal RT correctness (test layers L4+); that requires
-the self-hosted Apple Silicon lane planned in chunk C12.
+not evidence of GPU-side Metal RT correctness (test layers L4+). Chunk C12's
+self-hosted Apple Silicon lane provides that coverage; see
+[`ci_validation.md`](ci_validation.md).
 
 ### Local
 
@@ -61,7 +62,7 @@ The local runner mirrors the same flags in its `build` stage and adds the
 capability probe:
 
 ```bash
-python3 mac-rt-planning/scripts/run_mac_rt_tests.py --stage preflight --stage build --stage smoke --stage unit
+python3 tests/metal_rt/run_mac_rt_tests.py --stage preflight --stage build --stage smoke --stage unit
 ```
 
 Local runs write `summary.json` plus per-command logs under
