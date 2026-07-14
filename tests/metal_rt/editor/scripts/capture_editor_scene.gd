@@ -21,9 +21,10 @@ func _ready() -> void:
 	if (
 		Engine.is_editor_hint()
 		and OS.get_environment("GODOT_MRT_EDITOR_CAPTURE") == "1"
-		and OS.get_environment("GODOT_MRT_FIXTURE") == "e1_geometry"
+		and OS.get_environment("GODOT_MRT_FIXTURE") in ["e1_geometry", "e2_materials"]
 	):
-		EditorInterface.call_deferred("open_scene_from_path", "res://fixtures/e1_geometry.tscn")
+		var fixture := OS.get_environment("GODOT_MRT_FIXTURE")
+		EditorInterface.call_deferred("open_scene_from_path", "res://fixtures/%s.tscn" % fixture)
 		return
 	camera.look_at_from_position(Vector3(5.2, 3.8, 6.8), Vector3(0.0, 0.65, 0.0))
 	camera.make_current()

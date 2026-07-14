@@ -324,6 +324,7 @@ void main() {
 	MaterialResult m;
 	m.albedo = albedo;
 	m.alpha = alpha;
+	m.alpha_scissor_threshold = alpha_scissor_threshold;
 	m.roughness = roughness;
 	m.metalness = metallic;
 	m.specular = specular;
@@ -384,6 +385,7 @@ void main() {
 	MaterialResult m;
 	m.albedo = albedo;
 	m.alpha = albedo_tex.a * mat.albedo_color.a;
+	m.alpha_scissor_threshold = mat.alpha_scissor_threshold;
 	m.roughness = roughness;
 	m.metalness = metalness;
 	m.specular = mat.specular;

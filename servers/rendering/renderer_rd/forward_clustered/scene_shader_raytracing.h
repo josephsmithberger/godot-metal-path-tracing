@@ -62,6 +62,17 @@ public:
 	static uint32_t sanitize_compute_rt_flags(uint32_t p_rt_flags) {
 		return p_rt_flags & ~(RT_FLAG_DEBUG_VIS_ENABLED | RT_FLAG_DLSS_RR_ENABLED | RT_FLAG_SER_ENABLED | RT_FLAG_FOG_ENABLED);
 	}
+	struct ComputeMaterialVariantKey {
+		uint32_t rt_flags = 0;
+		uint32_t material_generation = 0;
+
+		bool operator==(const ComputeMaterialVariantKey &p_other) const {
+			return rt_flags == p_other.rt_flags && material_generation == p_other.material_generation;
+		}
+	};
+	static ComputeMaterialVariantKey make_compute_material_variant_key(uint32_t p_rt_flags, uint32_t p_material_generation) {
+		return { sanitize_compute_rt_flags(p_rt_flags), p_material_generation };
+	}
 
 	enum ShaderGroup {
 		SHADER_GROUP_BASE, // Always compiled at the beginning.
@@ -421,6 +432,7 @@ public:
 		RID pipeline; // RD::free_rid on swap (deferred internally).
 		RID hit_sbt; // RD::free_rid on swap.
 		RID base_shader; // Immutable for variant lifetime; uniform_set is bound to this.
+		bool owns_base_shader = false; // Generated Metal material variants are owned here.
 
 		// Parallel to hit_group_slots.
 		LocalVector<RID> per_hg_shaders;
@@ -432,12 +444,17 @@ public:
 
 		bool dirty = false;
 		bool initial_pipeline_built = false;
+		uint32_t material_generation = 0;
 	};
 
 	HashMap<uint32_t, PipelineBundle> pipeline_bundles;
 	RID compute_shader_version;
 	bool compute_scene_lane = false;
 	bool scene_shader_ready = false;
+	uint32_t material_generation = 0;
+	uint32_t compute_variant_compile_count = 0;
+	uint32_t compute_variant_cache_hit_count = 0;
+	uint32_t compute_variant_failure_count = 0;
 
 	// Single-lane async bundle rebuild (worker: SPIR-V + raytracing_pipeline_create; main: SBT + swap).
 	struct PipelineBuildTask;
@@ -477,6 +494,10 @@ private:
 	void _bundle_resize_for_slots(PipelineBundle &r_bundle);
 	bool _build_initial_bundle(uint32_t p_rt_flags, PipelineBundle &r_bundle);
 	bool _build_compute_bundle(uint32_t p_rt_flags, PipelineBundle &r_bundle);
+	RID _compile_compute_material_variant(const LocalVector<uint8_t> &p_active_slots, String &r_error);
+	String _build_compute_material_source(const LocalVector<uint8_t> &p_active_slots);
+	String _build_compute_material_function(uint32_t p_slot_index, const CustomShaderEntry &p_entry) const;
+	static void _replace_identifier(String &r_source, const String &p_identifier, const String &p_replacement);
 	void _kick_rebuild_if_idle();
 
 	// Compile lane / worker.
@@ -510,6 +531,10 @@ public:
 	void invalidate_pipeline_bundles();
 	bool is_scene_shader_ready() const { return scene_shader_ready; }
 	bool uses_compute_scene_lane() const { return compute_scene_lane; }
+	uint32_t get_material_generation() const { return material_generation; }
+	uint32_t get_compute_variant_compile_count() const { return compute_variant_compile_count; }
+	uint32_t get_compute_variant_cache_hit_count() const { return compute_variant_cache_hit_count; }
+	uint32_t get_compute_variant_failure_count() const { return compute_variant_failure_count; }
 	uint32_t sanitize_rt_flags(uint32_t p_rt_flags) const {
 		return compute_scene_lane ? sanitize_compute_rt_flags(p_rt_flags) : p_rt_flags;
 	}
