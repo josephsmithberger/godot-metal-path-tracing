@@ -18,6 +18,13 @@ var capture_camera: Camera3D
 
 
 func _ready() -> void:
+	if (
+		Engine.is_editor_hint()
+		and OS.get_environment("GODOT_MRT_EDITOR_CAPTURE") == "1"
+		and OS.get_environment("GODOT_MRT_FIXTURE") == "e1_geometry"
+	):
+		EditorInterface.call_deferred("open_scene_from_path", "res://fixtures/e1_geometry.tscn")
+		return
 	camera.look_at_from_position(Vector3(5.2, 3.8, 6.8), Vector3(0.0, 0.65, 0.0))
 	camera.make_current()
 	capture_viewport = get_viewport()
@@ -26,7 +33,10 @@ func _ready() -> void:
 		capture_viewport = EditorInterface.get_editor_viewport_3d(0)
 		capture_camera = capture_viewport.get_camera_3d()
 	_configure_capture_camera()
-	capture_enabled = OS.get_environment("GODOT_MRT_EDITOR_CAPTURE") == "1"
+	capture_enabled = (
+		OS.get_environment("GODOT_MRT_EDITOR_CAPTURE") == "1"
+		and OS.get_environment("GODOT_MRT_FIXTURE") == "e0_hg0"
+	)
 	artifact_dir = OS.get_environment("GODOT_MRT_ARTIFACT_DIR")
 	capture_label = OS.get_environment("GODOT_MRT_CAPTURE_LABEL")
 	if capture_label.is_empty():

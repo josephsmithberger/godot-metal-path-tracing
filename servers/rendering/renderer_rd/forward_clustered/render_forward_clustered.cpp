@@ -2576,7 +2576,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				print_line("METAL_RT_C13_EDITOR_HG0=passed");
 				c13_markers_printed = true;
 			}
-			WARN_PRINT_ONCE("Metal path tracing C13 supports opaque StandardMaterial3D on static triangle meshes only. Alpha/custom spatial shaders, deformed meshes, MultiMesh, procedural geometry, native denoising, and SER remain disabled.");
+			WARN_PRINT_ONCE("Metal path tracing C14 supports opaque StandardMaterial3D on static, deformed, and MultiMesh triangle geometry. Alpha/custom spatial shaders, procedural geometry, native denoising, and SER remain disabled.");
 		}
 
 		RD::get_singleton()->draw_command_end_label();

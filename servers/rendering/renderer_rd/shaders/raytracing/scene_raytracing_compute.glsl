@@ -243,7 +243,7 @@ void main() {
 		[[dont_unroll]] for (uint bounce = 0u; bounce <= max_bounces; bounce++) {
 			ComputeHit hit;
 			if (!trace_hg0(ray_origin, ray_direction, 10000.0, hit)) {
-				if (visualization_mode == 23) {
+				if (visualization_mode == 23 || visualization_mode == 24) {
 					break;
 				}
 				if (sample_index == 0u && bounce == 0u) {
@@ -263,6 +263,13 @@ void main() {
 			}
 			if (visualization_mode == 23) {
 				uint encoded_id = pcg_hash(hit.geometry_idx + 1u);
+				radiance = vec3(0.2) + vec3(
+						float(encoded_id & 0xFFu),
+						float((encoded_id >> 8u) & 0xFFu),
+						float((encoded_id >> 16u) & 0xFFu)) * (0.8 / 255.0);
+				break;
+			} else if (visualization_mode == 24) {
+				uint encoded_id = pcg_hash(hit.primitive_idx + 1u);
 				radiance = vec3(0.2) + vec3(
 						float(encoded_id & 0xFFu),
 						float((encoded_id >> 8u) & 0xFFu),
