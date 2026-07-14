@@ -106,9 +106,10 @@ func _process(_delta: float) -> void:
 		print("METAL_RT_FIXTURE=e2_materials")
 		print("METAL_RT_FIXTURE_REVISION=%s" % FIXTURE_REVISION)
 		print("METAL_RT_CAPTURE_LABEL=%s" % capture_label)
-		print("METAL_RT_C15_MATERIAL_DISPATCH=passed")
-		print("METAL_RT_ALPHA_TEST=passed")
-		print("METAL_RT_CUSTOM_SHADER_RELOAD=passed")
+		if OS.get_environment("GODOT_MTL_DISABLE_RAYTRACING") != "1":
+			print("METAL_RT_C15_MATERIAL_DISPATCH=passed")
+			print("METAL_RT_ALPHA_TEST=passed")
+			print("METAL_RT_CUSTOM_SHADER_RELOAD=passed")
 		get_tree().quit()
 
 

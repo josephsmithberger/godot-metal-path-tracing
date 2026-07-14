@@ -101,20 +101,21 @@ changes shader source, uniforms, and alpha threshold in-process; records
 beauty and Material ID views; and includes a helper-function shader that must
 be excluded.
 
-Run the focused unit tests and one E2 capture with:
+Run the focused unit tests and the automated E2 stage with:
 
 ```bash
 ./bin/godot.macos.editor.arm64 --test '--test-case=*[MetalRT]*' --force-colors
 
-GODOT_MRT_EDITOR_CAPTURE=1 GODOT_MRT_FIXTURE=e2_materials \
-GODOT_MRT_ARTIFACT_DIR=/tmp/godot-c15 GODOT_MRT_CAPTURE_LABEL=cold \
-MTL_DEBUG_LAYER=1 ./bin/godot.macos.editor.arm64 --editor \
---path tests/metal_rt/editor res://fixtures/e2_materials.tscn --quit-after 900
+python3 tests/metal_rt/run_mac_rt_tests.py --stage material-scene \
+  --binary bin/godot.macos.editor.arm64
 ```
 
-Repeat with `GODOT_MRT_CAPTURE_LABEL=reload`, then run
-`python3 tests/metal_rt/verify_material_scene.py /tmp/godot-c15`. The required
-engine/fixture markers are:
+The `material-scene` stage performs the cold and reload captures, runs
+`tests/metal_rt/verify_material_scene.py` against them, and repeats the
+capture under `GODOT_MTL_DISABLE_RAYTRACING=1` to prove the raster fallback.
+Like every RT-dispatching stage it runs under Metal shader validation and
+fails on any invalid device load or store (see `ci_validation.md`). The
+required engine/fixture markers are:
 
 ```text
 METAL_RT_C15_MATERIAL_DISPATCH=passed
