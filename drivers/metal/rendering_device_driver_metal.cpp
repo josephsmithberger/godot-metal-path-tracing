@@ -151,6 +151,7 @@ bool RenderingDeviceDriverMetal::buffer_set_texel_format(BufferID p_buffer, Data
 void RenderingDeviceDriverMetal::buffer_free(BufferID p_buffer) {
 	BufferInfo *buf_info = (BufferInfo *)p_buffer.id;
 
+	_bda_untrack_buffer(buf_info->metal_buffer.get());
 	_untrack_resource(buf_info->metal_buffer.get());
 
 	if (buf_info->is_dynamic()) {
@@ -205,12 +206,104 @@ uint64_t RenderingDeviceDriverMetal::buffer_get_dynamic_offsets(Span<BufferID> p
 uint64_t RenderingDeviceDriverMetal::buffer_get_device_address(BufferID p_buffer) {
 	if (__builtin_available(iOS 16.0, macOS 13.0, *)) {
 		const BufferInfo *buf_info = (const BufferInfo *)p_buffer.id;
+		_bda_track_buffer(buf_info->metal_buffer.get());
 		return buf_info->metal_buffer.get()->gpuAddress();
 	} else {
 #if DEV_ENABLED
 		WARN_PRINT_ONCE("buffer_get_device_address is not supported on this OS version.");
 #endif
 		return 0;
+	}
+}
+
+void RenderingDeviceDriverMetal::_bda_track_buffer(MTL::Buffer *p_buffer) {
+	if (use_barriers) {
+		// Every allocation is already in the main residency set.
+		return;
+	}
+
+	MutexLock lock(bda_residency_mutex);
+	if (bda_buffer_indices.has(p_buffer)) {
+		return;
+	}
+	bda_buffer_indices.insert(p_buffer, bda_buffers.size());
+	bda_buffers.push_back(p_buffer);
+
+	if (__builtin_available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 1.0, *)) {
+		if (device_properties->features.supports_residency_sets && !bda_residency_set_creation_failed) {
+			if (!bda_residency_set) {
+				MTL::ResidencySetDescriptor *rs_desc = MTL::ResidencySetDescriptor::alloc()->init();
+				rs_desc->setInitialCapacity(256);
+				rs_desc->setLabel(MTLSTR("Device Address Residency Set"));
+				NS::Error *error = nullptr;
+				bda_residency_set = NS::TransferPtr(device->newResidencySet(rs_desc, &error));
+				rs_desc->release();
+				if (bda_residency_set) {
+					add_residency_set_to_main_queue(bda_residency_set.get());
+				} else {
+					bda_residency_set_creation_failed = true;
+					WARN_PRINT_ONCE(vformat("Metal: failed to create the device-address residency set (%s); falling back to per-encoder residency.",
+							error ? String(error->localizedDescription()->utf8String()) : String("unknown error")));
+				}
+			}
+			if (bda_residency_set) {
+				bda_residency_set->addAllocation(p_buffer);
+				bda_residency_dirty = true;
+			}
+		}
+	}
+}
+
+void RenderingDeviceDriverMetal::_bda_untrack_buffer(MTL::Buffer *p_buffer) {
+	MutexLock lock(bda_residency_mutex);
+	HashMap<MTL::Buffer *, uint32_t>::Iterator it = bda_buffer_indices.find(p_buffer);
+	if (it == bda_buffer_indices.end()) {
+		return;
+	}
+	const uint32_t index = it->value;
+	bda_buffer_indices.remove(it);
+	const uint32_t last = bda_buffers.size() - 1;
+	if (index != last) {
+		bda_buffers[index] = bda_buffers[last];
+		bda_buffer_indices[static_cast<MTL::Buffer *>(bda_buffers[index])] = index;
+	}
+	bda_buffers.resize(last);
+
+	if (__builtin_available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 1.0, *)) {
+		if (bda_residency_set) {
+			bda_residency_set->removeAllocation(p_buffer);
+			bda_residency_dirty = true;
+		}
+	}
+}
+
+void RenderingDeviceDriverMetal::_bda_commit_residency() {
+	MutexLock lock(bda_residency_mutex);
+	if (!bda_residency_dirty) {
+		return;
+	}
+	bda_residency_dirty = false;
+	if (__builtin_available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 1.0, *)) {
+		if (bda_residency_set) {
+			bda_residency_set->commit();
+		}
+	}
+}
+
+void RenderingDeviceDriverMetal::encode_bda_residency(MTL::ComputeCommandEncoder *p_enc) {
+	if (use_barriers) {
+		return;
+	}
+	if (__builtin_available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 1.0, *)) {
+		if (bda_residency_set) {
+			// Queue-level residency already covers every address-taken buffer.
+			return;
+		}
+	}
+
+	MutexLock lock(bda_residency_mutex);
+	if (!bda_buffers.is_empty()) {
+		p_enc->useResources(bda_buffers.ptr(), bda_buffers.size(), MTL::ResourceUsageRead);
 	}
 }
 
