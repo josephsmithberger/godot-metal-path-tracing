@@ -78,8 +78,13 @@ Or isolate C8 after building the editor:
 - Triangle geometry only; procedural intersection functions are not populated.
 - One backend-owned native MSL kernel; C9 records user shader groups and a
   software recursion budget, but the C8 kernel does not consume them.
-- Exact buffer output only; the path-tracer scene and reviewed PNG reference
-  arrive in C10/L5.
-- The custom Godot instance ID retained in the C6 record is not shader-visible
-  at the macOS 11 descriptor floor. C9 carries group/table metadata explicitly;
-  C10 must expose instance metadata to the re-expressed compute shader.
+- Exact buffer output only; C10 adds the controlled path-traced scene with
+  PNG artifacts and a CPU-reference comparison
+  ([`pathtracer_launch.md`](pathtracer_launch.md)); the reviewed L5 reference
+  image remains later work.
+- ~~The custom Godot instance ID retained in the C6 record is not
+  shader-visible at the macOS 11 descriptor floor.~~ Resolved by C10: the
+  instance record now uses Metal's UserID descriptor prefix and `tlas_create`
+  selects the UserID descriptor type on macOS 12+, so the re-expressed compute
+  shader reads the custom index through
+  `rayQueryGetIntersectionInstanceCustomIndexEXT`.

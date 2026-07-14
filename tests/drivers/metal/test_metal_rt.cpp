@@ -106,7 +106,7 @@ TEST_CASE("[MetalRT] Packs and validates TLAS instance records") {
 	CHECK(metal_instance.intersection_function_table_offset == 37);
 	CHECK(metal_instance.acceleration_structure_index == 0);
 	CHECK(metal_instance.blas == &blas);
-	CHECK(metal_instance.instance_id == 0x12345678);
+	CHECK(metal_instance.user_id == 0x12345678);
 
 	instance.transform.origin.x = std::numeric_limits<real_t>::quiet_NaN();
 	CHECK_FALSE(metal_instance.write(instance));
@@ -351,13 +351,13 @@ TEST_CASE_PENDING("[MetalRT][GPU] Builds a one-instance TLAS referencing a trian
 		CHECK(round_trip.transformation_matrix[9] == doctest::Approx(float(instance.transform.origin.x)));
 		CHECK(round_trip.transformation_matrix[10] == doctest::Approx(float(instance.transform.origin.y)));
 		CHECK(round_trip.transformation_matrix[11] == doctest::Approx(float(instance.transform.origin.z)));
-		CHECK(round_trip.instance_id == instance.id);
+		CHECK(round_trip.user_id == instance.id);
 		CHECK(round_trip.requested_mask == instance.mask);
 		CHECK(round_trip.mask == instance.mask);
 		CHECK(round_trip.intersection_function_table_offset == instance.hit_sbt_offset);
 		CHECK(round_trip.blas == &blas);
 		CHECK(round_trip.acceleration_structure_index == 0);
-		print_line(vformat("MetalRT C6 TLAS smoke: device=\"%s\" iteration=%d blas_size=%d tlas_size=%d tlas_scratch_size=%d instance_id=%d mask=%d hit_sbt_offset=%d", device->name()->utf8String(), iteration + 1, blas.acceleration_structure_size, tlas.acceleration_structure_size, tlas.build_scratch_size, round_trip.instance_id, round_trip.requested_mask, round_trip.intersection_function_table_offset));
+		print_line(vformat("MetalRT C6 TLAS smoke: device=\"%s\" iteration=%d blas_size=%d tlas_size=%d tlas_scratch_size=%d instance_id=%d mask=%d hit_sbt_offset=%d", device->name()->utf8String(), iteration + 1, blas.acceleration_structure_size, tlas.acceleration_structure_size, tlas.build_scratch_size, round_trip.user_id, round_trip.requested_mask, round_trip.intersection_function_table_offset));
 	}
 }
 

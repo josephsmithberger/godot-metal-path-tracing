@@ -5223,6 +5223,11 @@ Error RenderingDevice::_raytracing_pipeline_create_sbt_buffer(RDD::RaytracingPip
 RID RenderingDevice::raytracing_pipeline_create(Span<PipelineShader> p_raygen_shaders, Span<PipelineShader> p_miss_shaders, Span<HitGroup> p_hit_groups, uint32_t p_max_trace_recursion_depth) {
 	ERR_FAIL_COND_V_MSG(!has_feature(SUPPORTS_RAYTRACING_PIPELINE) && !has_feature(SUPPORTS_RAY_QUERY), RID(), "The current rendering device has neither raytracing pipeline nor ray query support.");
 
+	// Without native RT-pipeline stages the driver runs the compute lane: the
+	// ray-generation entry is a re-expressed ray-query compute shader and the
+	// miss/hit logic is inlined into it (see docs/rt_metal_port/shader_strategy.md).
+	const bool raytracing_compute_lane = !has_feature(SUPPORTS_RAYTRACING_PIPELINE);
+
 	struct PipelineShaderKey : PipelineShader {
 		ShaderStage shader_stage = {};
 
@@ -5285,7 +5290,8 @@ RID RenderingDevice::raytracing_pipeline_create(Span<PipelineShader> p_raygen_sh
 			if (!index) {
 				Shader *shader = shader_owner.get_or_null(p_shader.shader);
 				ERR_FAIL_NULL_V(shader, UINT32_MAX);
-				ERR_FAIL_COND_V_MSG(shader->pipeline_type != PIPELINE_TYPE_RAYTRACING, UINT32_MAX, "Only raytracing shaders can be used in raytracing pipelines.");
+				const PipelineType expected_pipeline_type = p_shader_stage == SHADER_STAGE_COMPUTE ? PIPELINE_TYPE_COMPUTE : PIPELINE_TYPE_RAYTRACING;
+				ERR_FAIL_COND_V_MSG(shader->pipeline_type != expected_pipeline_type, UINT32_MAX, p_shader_stage == SHADER_STAGE_COMPUTE ? "The compute-lane ray-generation entry must be a compute shader." : "Only raytracing shaders can be used in raytracing pipelines.");
 				ERR_FAIL_COND_V_MSG(!(shader->stages_bits & (1 << p_shader_stage)), UINT32_MAX, "Shader does not contain the required stage.");
 
 				for (int i = 0; i < shader->specialization_constants.size(); i++) {
@@ -5334,7 +5340,7 @@ RID RenderingDevice::raytracing_pipeline_create(Span<PipelineShader> p_raygen_sh
 		};
 
 		for (uint32_t i = 0; i < p_raygen_shaders.size(); i++) {
-			uint32_t raygen_shader_index = _get_shader_index(p_raygen_shaders[i], SHADER_STAGE_RAYGEN);
+			uint32_t raygen_shader_index = _get_shader_index(p_raygen_shaders[i], raytracing_compute_lane ? SHADER_STAGE_COMPUTE : SHADER_STAGE_RAYGEN);
 			ERR_FAIL_COND_V(raygen_shader_index == UINT32_MAX, RID());
 			raygen_and_miss_shader_indices.push_back(raygen_shader_index);
 		}
@@ -6479,7 +6485,7 @@ void RenderingDevice::draw_list_end() {
 RenderingDevice::RaytracingListID RenderingDevice::raytracing_list_begin() {
 	ERR_RENDER_THREAD_GUARD_V(INVALID_ID);
 
-	ERR_FAIL_COND_V_MSG(!has_feature(SUPPORTS_RAYTRACING_PIPELINE), INVALID_ID, "The current rendering device has no raytracing pipeline support.");
+	ERR_FAIL_COND_V_MSG(!has_feature(SUPPORTS_RAYTRACING_PIPELINE) && !has_feature(SUPPORTS_RAY_QUERY), INVALID_ID, "The current rendering device has neither raytracing pipeline nor ray query support.");
 
 	ERR_FAIL_COND_V_MSG(draw_list.active, INVALID_ID, "Only one draw/raytracing list can be active at the same time.");
 	ERR_FAIL_COND_V_MSG(compute_list.active, INVALID_ID, "Only one compute/raytracing list can be active at the same time.");

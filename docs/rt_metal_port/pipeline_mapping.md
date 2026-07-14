@@ -45,8 +45,9 @@ The pipeline-specific `MTLIntersectionFunctionTable` uses these rules:
 
 Procedural slots are deliberately reserved but not filled with Vulkan
 intersection shaders. SPIRV-Cross cannot lower those execution models, as C7
-proved. C10 must supply their re-expressed compute logic before procedural
-scene dispatch is enabled.
+proved. The C10 compute lane rejects hit groups that reference shaders
+(including intersection shaders); procedural dispatch stays a documented limit
+of the lane ([`pathtracer_launch.md`](pathtracer_launch.md)).
 
 ## Bind order
 
@@ -59,12 +60,17 @@ pipeline and uniform-set bind commands onto the existing Metal compute state:
 4. bind backend trace constants and the pipeline-specific intersection table;
 5. dispatch the compute grid.
 
-C9 implements steps 1–3 behind the public driver hooks and retains the C8
-pipeline/table resources. The final public `command_trace_rays` conversion is
-intentionally still rejected: consuming raygen/miss/hit records in the
-path-tracer compute kernel is C10. The Metal feature flag remains disabled
-until the runtime/fallback gate in C11, so no caller can enter this incomplete
-dispatch path accidentally.
+C9 implements steps 1–3 behind the public driver hooks. C10 completes step 5
+for **compute-lane** pipelines: `command_trace_rays` dispatches the
+re-expressed ray-query kernel over the pixel grid
+([`pathtracer_launch.md`](pathtracer_launch.md)). Step 4 collapses on that
+lane — ray-query kernels bind no intersection-function table, and the
+compatibility SBT buffers are not consumed at trace time because hit logic is
+inlined. Pipelines that still carry the C8 backend-owned kernel remain
+rejected by the public dispatch. The Metal feature flags stay off by default
+until the runtime/fallback gate in C11; the C10 debug toggle
+(`rendering/pathtracer/metal_ray_query_backend`) is the only way to expose
+ray-query support early.
 
 ## Non-1:1 SBT semantics
 
@@ -77,7 +83,7 @@ dispatch path accidentally.
 | Empty hit-group sentinel | Record with no function-table slot |
 | SBT device address | Compatibility buffer and byte offset retained by `RenderingDevice`; not a Metal function pointer |
 | SBT stride | Record stride validated by the driver; padding is ignored by the Metal mapping |
-| Pipeline recursion depth | Stored software recursion budget; C10 must enforce it in the kernel loop |
+| Pipeline recursion depth | Stored software recursion budget; the compute-lane kernel enforces it as its bounce/segment budget (C10 controlled kernel does; the engine kernel must, when it lands) |
 
 The fork currently requests recursion depth 2. Metal's intersector has no
 pipeline recursion-limit property, so accepting and storing the requested

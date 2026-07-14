@@ -217,7 +217,18 @@ tracer later, but no chunk C1-C12 depends on it.
 - **SBT and recursion mapping (resolved in C9).** Shader-group handles are
   stable 16-byte Metal index records, not native function pointers. The
   requested recursion depth is stored as a software budget because Metal has
-  no corresponding pipeline property; C10 enforces it in the compute loop.
+  no corresponding pipeline property; the compute-lane kernel enforces it as
+  its bounce budget (C10).
+- **Path-tracer launch path (resolved in C10).** Ray tracing dispatches as a
+  compute-lane pipeline whose raygen is a re-expressed ray-query compute
+  kernel; `command_trace_rays` performs the grid dispatch and the
+  compatibility SBT is not consumed at trace time. Instance custom indices are
+  shader-visible through Metal UserID instance descriptors (macOS 12+; within
+  the A4 floor). The backend stays behind the default-off
+  `rendering/pathtracer/metal_ray_query_backend` debug toggle until C11's
+  runtime gate. Full `SceneShaderRaytracing` scene integration is the tracked
+  remainder — see
+  [`pathtracer_launch.md`](pathtracer_launch.md).
 
 ## Open questions (tracked, not assumed)
 
