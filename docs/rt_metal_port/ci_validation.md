@@ -31,6 +31,26 @@ custom label are the scheduling capability check; the first step also rejects
 an unexpected runner architecture. The runner needs Xcode command-line tools
 and Python 3. It does not rebuild Godot or install dependencies.
 
+## Metal shader validation
+
+Every stage that dispatches real ray-tracing work runs with `MTL_DEBUG_LAYER`
+and `MTL_SHADER_VALIDATION` enabled, and fails if the log contains
+`Invalid device load` or `Invalid device store`.
+
+This exists because the RT compute lane reads geometry and material data
+through raw device addresses. The API debug layer cannot see those accesses,
+and an invalid one does not raise the process exit code: the kernel reads
+garbage, still produces an image, and still prints every acceptance marker. A
+run can therefore be green on every marker and every capture check while the
+GPU is faulting on each frame — this is exactly how the C15 residency defect
+reached a commit. Shader validation instruments the shader itself, so it is
+the only gate in this lane that observes those reads.
+
+Enabling validation is not free: it slows the editor capture stages and it
+zeroes invalid accesses rather than returning whatever the address happened to
+hold. That second property is a feature here — it makes a latent address bug
+render as an obvious black or missing surface rather than as plausible noise.
+
 ## Image regression
 
 The reviewed reference and its policy live together:

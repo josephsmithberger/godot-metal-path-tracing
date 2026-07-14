@@ -33,6 +33,28 @@ IMAGE_REFERENCE = RUNTIME_GATE_PROJECT / "references" / "c10_pathtracer_launch_v
 IMAGE_REFERENCE_MANIFEST = IMAGE_REFERENCE.with_suffix(".json")
 CAPS_SKIP_EXIT_CODE = 3  # Probe exit code for a machine-readable skip (see capability_probe.mm).
 
+# Metal shader validation instruments the shader itself, so it reports memory
+# the GPU touches but does not own. The RT compute lane reaches geometry and
+# material data through raw device addresses, and the API debug layer cannot
+# see those accesses: a non-resident or out-of-bounds read there returns
+# garbage instead of failing, which still renders an image and still prints
+# every acceptance marker. Every stage that dispatches real RT work therefore
+# runs with shader validation on.
+METAL_VALIDATION_ENVIRONMENT = {
+    "MTL_DEBUG_LAYER": "1",
+    "MTL_DEBUG_LAYER_ERROR_MODE": "nslog",
+    "MTL_SHADER_VALIDATION": "1",
+    "MTL_SHADER_VALIDATION_REPORT_TO_STDERR": "1",
+}
+
+# Shader validation prints these when a shader dereferences memory it does not
+# own. They are reported per offending dispatch rather than raising the exit
+# code, so the stage only fails if the log is inspected.
+METAL_VALIDATION_FORBIDDEN_PATTERNS = (
+    "Invalid device load",
+    "Invalid device store",
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -224,6 +246,8 @@ def make_commands(
                 requires_passed="caps-probe" if args.arch == "arm64" else None,
                 preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
                 detect_log_skip=True,
+                environment=METAL_VALIDATION_ENVIRONMENT,
+                forbidden_log_patterns=METAL_VALIDATION_FORBIDDEN_PATTERNS,
             )
         )
 
@@ -243,6 +267,8 @@ def make_commands(
                     requires_passed="caps-probe" if args.arch == "arm64" else None,
                     preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
                     detect_log_skip=True,
+                    environment=METAL_VALIDATION_ENVIRONMENT,
+                    forbidden_log_patterns=METAL_VALIDATION_FORBIDDEN_PATTERNS,
                 )
             )
         commands.append(
@@ -277,9 +303,9 @@ def make_commands(
             "600",
         ]
         editor_environment = {
+            **METAL_VALIDATION_ENVIRONMENT,
             "GODOT_MRT_EDITOR_CAPTURE": "1",
             "GODOT_MRT_FIXTURE": "e0_hg0",
-            "MTL_DEBUG_LAYER": "1",
         }
         scene_markers = (
             "METAL_RT_EDITOR_ROUTE=compute_ray_query",
@@ -295,6 +321,7 @@ def make_commands(
                 preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
                 environment={**editor_environment, "GODOT_MRT_CAPTURE_LABEL": "cold"},
                 required_log_patterns=scene_markers,
+                forbidden_log_patterns=METAL_VALIDATION_FORBIDDEN_PATTERNS,
             ),
             command_record(
                 "editor-scene-reload",
@@ -303,6 +330,7 @@ def make_commands(
                 preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
                 environment={**editor_environment, "GODOT_MRT_CAPTURE_LABEL": "reload"},
                 required_log_patterns=scene_markers,
+                forbidden_log_patterns=METAL_VALIDATION_FORBIDDEN_PATTERNS,
             ),
             command_record(
                 "editor-scene-verify",
@@ -341,9 +369,9 @@ def make_commands(
             "900",
         ]
         geometry_environment = {
+            **METAL_VALIDATION_ENVIRONMENT,
             "GODOT_MRT_EDITOR_CAPTURE": "1",
             "GODOT_MRT_FIXTURE": "e1_geometry",
-            "MTL_DEBUG_LAYER": "1",
         }
         geometry_markers = (
             "METAL_RT_EDITOR_ROUTE=compute_ray_query",
@@ -360,6 +388,7 @@ def make_commands(
                 preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
                 environment={**geometry_environment, "GODOT_MRT_CAPTURE_LABEL": "cold"},
                 required_log_patterns=geometry_markers,
+                forbidden_log_patterns=METAL_VALIDATION_FORBIDDEN_PATTERNS,
             ),
             command_record(
                 "geometry-scene-reload",
@@ -368,6 +397,7 @@ def make_commands(
                 preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
                 environment={**geometry_environment, "GODOT_MRT_CAPTURE_LABEL": "reload"},
                 required_log_patterns=geometry_markers,
+                forbidden_log_patterns=METAL_VALIDATION_FORBIDDEN_PATTERNS,
             ),
             command_record(
                 "geometry-scene-verify",
