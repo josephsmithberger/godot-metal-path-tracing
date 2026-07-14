@@ -28,6 +28,7 @@ EDITOR_SCENE_VERIFY_SCRIPT = RUNTIME_GATE_PROJECT / "verify_editor_scene.py"
 GEOMETRY_SCENE_FIXTURE = "res://fixtures/e1_geometry.tscn"
 GEOMETRY_SCENE_VERIFY_SCRIPT = RUNTIME_GATE_PROJECT / "verify_geometry_scene.py"
 IMAGE_DIFF_SCRIPT = RUNTIME_GATE_PROJECT / "image_diff.py"
+IMAGE_DIFF_TEST_SCRIPT = RUNTIME_GATE_PROJECT / "test_image_diff.py"
 IMAGE_REFERENCE = RUNTIME_GATE_PROJECT / "references" / "c10_pathtracer_launch_v1.png"
 IMAGE_REFERENCE_MANIFEST = IMAGE_REFERENCE.with_suffix(".json")
 CAPS_SKIP_EXIT_CODE = 3  # Probe exit code for a machine-readable skip (see capability_probe.mm).
@@ -150,6 +151,7 @@ def make_commands(
             command_record("preflight-sdk", ["xcrun", "--show-sdk-version"]),
             command_record("preflight-metal-compiler", ["xcrun", "--find", "metal"]),
             command_record("preflight-scons", ["scons", "--version"]),
+            command_record("preflight-image-diff-tests", [sys.executable, str(IMAGE_DIFF_TEST_SCRIPT)]),
         ])
 
     if "caps" in stages or (
