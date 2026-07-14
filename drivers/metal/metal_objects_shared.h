@@ -733,6 +733,13 @@ public:
 	virtual void acceleration_structure_build(MDAccelerationStructure *p_acceleration_structure, MTL::Buffer *p_scratch_buffer) = 0;
 	virtual void acceleration_structure_refit(MDAccelerationStructure *p_acceleration_structure, MTL::Buffer *p_scratch_buffer) = 0;
 
+#pragma mark - Raytracing Commands
+
+	/// Dispatches the bound compute-lane raytracing pipeline over a
+	/// `p_width` x `p_height` x `p_depth` pixel grid (C10). The kernel is
+	/// responsible for bounds-checking because threadgroups round up.
+	virtual void trace_rays(uint32_t p_width, uint32_t p_height, uint32_t p_depth) = 0;
+
 #pragma mark - Transfer
 
 	virtual void resolve_texture(RDD::TextureID p_src_texture, RDD::TextureLayout p_src_texture_layout, uint32_t p_src_layer, uint32_t p_src_mipmap, RDD::TextureID p_dst_texture, RDD::TextureLayout p_dst_texture_layout, uint32_t p_dst_layer, uint32_t p_dst_mipmap) = 0;
@@ -1176,8 +1183,11 @@ public:
 	uint32_t miss_group_count = 0;
 	uint32_t hit_group_count = 0;
 	// Metal has no pipeline recursion limit. This is the software recursion
-	// budget which the C10 compute lowering must enforce explicitly.
+	// budget which the compute-lane kernel must enforce explicitly.
 	uint32_t max_trace_recursion_depth = 0;
+	// True when the ray-generation group is a re-expressed ray-query compute
+	// kernel supplied by the engine (C10) rather than an RT-pipeline stage.
+	bool uses_compute_lane = false;
 	MDShader *shader = nullptr;
 	MTL::Size threads_per_threadgroup = MTL::Size(8, 8, 1);
 
@@ -1189,7 +1199,16 @@ public:
 	/// Encodes a 2D image dispatch. Each output pixel is four bytes (RGBA8).
 	bool encode_trace_one_ray(MTL::ComputeCommandEncoder *p_encoder, MTL::AccelerationStructure *p_tlas, MTL::Buffer *p_output_buffer, uint32_t p_width, uint32_t p_height) const;
 
+	/// Creates the compute pipeline state for a C10 compute-lane kernel. The
+	/// function is the engine's re-expressed ray-query compute entry point and
+	/// `p_local` its reflected workgroup size. Ray-query kernels use no
+	/// intersection-function table.
+	bool create_compute_lane(MTL::Device *p_device, MTL::Function *p_function, MTL::Size p_local, String *r_error = nullptr);
+
 	bool is_valid() const {
+		if (uses_compute_lane) {
+			return state.get() != nullptr;
+		}
 		return state && intersection_function_table && intersection_function_count > 0;
 	}
 
@@ -1237,6 +1256,11 @@ public:
 
 	// TLAS only.
 	uint32_t max_instance_count = 0;
+	/// TLAS only: unique primitive structures referenced by the last prepared
+	/// build. Metal requires them to be made resident (useResource) on any
+	/// encoder that intersects this TLAS; the descriptor's BLAS array retains
+	/// the objects these raw pointers reference.
+	LocalVector<MTL::AccelerationStructure *> resident_blases;
 
 	static MTL::AccelerationStructureUsage usage_from_flags(BitField<RDD::AccelerationStructureFlagBits> p_flags) {
 		MTL::AccelerationStructureUsage usage = MTL::AccelerationStructureUsageNone;
@@ -1317,26 +1341,33 @@ public:
  * Metal's macOS 11 instance descriptor identifies a BLAS by an index into an
  * NSArray supplied on the TLAS descriptor. Godot instead gives the instance
  * writer a backend BLAS handle before a particular TLAS is known. The native
- * descriptor therefore occupies the first 64 bytes and backend-only metadata
- * follows it. A 128-byte stride keeps every RenderingDevice suballocation
- * aligned to Metal's required 64-byte instanceDescriptorBufferOffset.
+ * descriptor occupies the leading bytes and backend-only metadata follows it.
+ * A 128-byte stride keeps every RenderingDevice suballocation aligned to
+ * Metal's required 64-byte instanceDescriptorBufferOffset.
  *
- * `instance_id` remains backend metadata at the macOS 11 API floor because the
- * native UserID descriptor requires macOS 12. C8/C9 can bind it through the
- * chosen shader-lowering path without raising the acceleration-structure floor.
+ * The record's native prefix is the 68-byte UserID descriptor
+ * (`MTL::AccelerationStructureUserIDInstanceDescriptor`), whose first 64 bytes
+ * are identical to the default descriptor. `user_id` carries Godot's instance
+ * custom index so the C10 ray-query compute lane can read it through
+ * `rayQueryGetIntersectionInstanceCustomIndexEXT` (SPIRV-Cross lowers it to
+ * MSL `user_instance_id`). Consuming the field requires the TLAS descriptor
+ * type to be UserID, which `tlas_create()` selects on macOS 12+; at the
+ * macOS 11 floor Metal reads only the default 64-byte prefix and the field
+ * stays inert metadata.
  */
 struct MDAccelerationStructureInstance {
-	// Binary-compatible prefix with MTL::AccelerationStructureInstanceDescriptor.
+	// Binary-compatible prefix with MTL::AccelerationStructureUserIDInstanceDescriptor
+	// (and, for the first 64 bytes, MTL::AccelerationStructureInstanceDescriptor).
 	float transformation_matrix[12] = {};
 	uint32_t options = 0;
 	uint32_t mask = 0;
 	uint32_t intersection_function_table_offset = 0;
 	uint32_t acceleration_structure_index = 0;
+	uint32_t user_id = 0;
 
 	// Godot-to-Metal build metadata, ignored by Metal because of the stride.
-	MDAccelerationStructure *blas = nullptr;
-	uint32_t instance_id = 0;
 	uint32_t requested_mask = 0;
+	MDAccelerationStructure *blas = nullptr;
 	uint32_t reserved[12] = {};
 
 	bool write(const RDD::AccelerationStructureInstance &p_instance) {
@@ -1383,18 +1414,20 @@ struct MDAccelerationStructureInstance {
 		options = instance_options;
 		mask = blas_info != nullptr ? p_instance.mask : 0;
 		intersection_function_table_offset = p_instance.hit_sbt_offset;
+		user_id = p_instance.id;
 		blas = blas_info;
-		instance_id = p_instance.id;
 		requested_mask = p_instance.mask;
 		return true;
 	}
 };
 
 static_assert(sizeof(MTL::AccelerationStructureInstanceDescriptor) == 64, "Unexpected native Metal instance descriptor size.");
-static_assert(offsetof(MDAccelerationStructureInstance, options) == offsetof(MTL::AccelerationStructureInstanceDescriptor, options));
-static_assert(offsetof(MDAccelerationStructureInstance, mask) == offsetof(MTL::AccelerationStructureInstanceDescriptor, mask));
-static_assert(offsetof(MDAccelerationStructureInstance, intersection_function_table_offset) == offsetof(MTL::AccelerationStructureInstanceDescriptor, intersectionFunctionTableOffset));
-static_assert(offsetof(MDAccelerationStructureInstance, acceleration_structure_index) == offsetof(MTL::AccelerationStructureInstanceDescriptor, accelerationStructureIndex));
+static_assert(sizeof(MTL::AccelerationStructureUserIDInstanceDescriptor) == 68, "Unexpected native Metal user-ID instance descriptor size.");
+static_assert(offsetof(MDAccelerationStructureInstance, options) == offsetof(MTL::AccelerationStructureUserIDInstanceDescriptor, options));
+static_assert(offsetof(MDAccelerationStructureInstance, mask) == offsetof(MTL::AccelerationStructureUserIDInstanceDescriptor, mask));
+static_assert(offsetof(MDAccelerationStructureInstance, intersection_function_table_offset) == offsetof(MTL::AccelerationStructureUserIDInstanceDescriptor, intersectionFunctionTableOffset));
+static_assert(offsetof(MDAccelerationStructureInstance, acceleration_structure_index) == offsetof(MTL::AccelerationStructureUserIDInstanceDescriptor, accelerationStructureIndex));
+static_assert(offsetof(MDAccelerationStructureInstance, user_id) == offsetof(MTL::AccelerationStructureUserIDInstanceDescriptor, userID));
 static_assert(sizeof(MDAccelerationStructureInstance) == 128, "Metal TLAS instance records must preserve 64-byte suballocation alignment.");
 
 inline bool MDAccelerationStructure::prepare_tlas_build(MTL::Buffer *p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count) {
@@ -1435,6 +1468,8 @@ inline bool MDAccelerationStructure::prepare_tlas_build(MTL::Buffer *p_instance_
 	tlas_descriptor->setInstanceDescriptorBufferOffset(p_instance_offset);
 	tlas_descriptor->setInstanceDescriptorStride(sizeof(MDAccelerationStructureInstance));
 
+	resident_blases.clear();
+
 	if (fallback_blas == nullptr) {
 		// A collection of null Godot instances is semantically an empty TLAS.
 		tlas_descriptor->setInstanceCount(0);
@@ -1451,6 +1486,9 @@ inline bool MDAccelerationStructure::prepare_tlas_build(MTL::Buffer *p_instance_
 		instance.acceleration_structure_index = i;
 		instance.mask = instance.blas != nullptr ? instance.requested_mask : 0;
 		instanced_acceleration_structures[i] = blas_info->accel.get();
+		if (!resident_blases.has(blas_info->accel.get())) {
+			resident_blases.push_back(blas_info->accel.get());
+		}
 		memcpy(writable_instance_bytes + (i * sizeof(MDAccelerationStructureInstance)), &instance, sizeof(MDAccelerationStructureInstance));
 	}
 

@@ -2407,6 +2407,13 @@ RDD::AccelerationStructureID RenderingDeviceDriverMetal::tlas_create(uint32_t p_
 	MTL::InstanceAccelerationStructureDescriptor *desc = MTL::InstanceAccelerationStructureDescriptor::descriptor();
 	desc->setInstanceCount(p_max_instance_count);
 	desc->setInstanceDescriptorStride(sizeof(MDAccelerationStructureInstance));
+	if (device_properties->features.supports_user_id_instances) {
+		// Godot's instance custom index rides in the UserID descriptor so the
+		// C10 ray-query compute lane can read it as MSL user_instance_id. The
+		// record layout is identical either way; at the macOS 11 floor Metal
+		// simply reads the default 64-byte prefix and user IDs stay CPU-side.
+		desc->setInstanceDescriptorType(MTL::AccelerationStructureInstanceDescriptorTypeUserID);
+	}
 
 	return _acceleration_structure_create(MDAccelerationStructure::Type::TLAS, desc, p_flags, p_max_instance_count);
 }
@@ -2450,6 +2457,28 @@ RDD::RaytracingPipelineID RenderingDeviceDriverMetal::raytracing_pipeline_create
 		ERR_FAIL_V_MSG(RaytracingPipelineID(), error);
 	}
 	pipeline->shader = (MDShader *)p_layout_defining_shader.id;
+
+	if (pipeline->uses_compute_lane) {
+		// C10: the ray-generation group is the engine's re-expressed ray-query
+		// compute kernel, compiled through the regular shader container. Build
+		// its pipeline state exactly like a compute pipeline, including
+		// specialization constants (RT_FLAGS et al.).
+		const RDD::PipelineShader &raygen = p_shaders[p_raygen_shader_indices[0]];
+		MDComputeShader *compute_shader = (MDComputeShader *)raygen.shader.id;
+		VectorView<PipelineSpecializationConstant> specialization_constants = raygen.specialization_constants;
+		Result<NS::SharedPtr<MTL::Function>> function_or_err = _create_function(compute_shader->kernel.get(), MTLSTR("main0"), specialization_constants);
+		if (std::holds_alternative<Error>(function_or_err)) {
+			delete pipeline;
+			ERR_FAIL_V_MSG(RaytracingPipelineID(), "Failed to specialize the Metal compute-lane raytracing kernel.");
+		}
+		NS::SharedPtr<MTL::Function> function = std::get<NS::SharedPtr<MTL::Function>>(function_or_err);
+		if (!pipeline->create_compute_lane(device, function.get(), compute_shader->local, &error)) {
+			delete pipeline;
+			ERR_FAIL_V_MSG(RaytracingPipelineID(), vformat("Failed to create the Metal compute-lane raytracing pipeline: %s", error));
+		}
+		return RaytracingPipelineID(pipeline);
+	}
+
 	if (!pipeline->create_trace_one_ray(device, &error)) {
 		delete pipeline;
 		ERR_FAIL_V_MSG(RaytracingPipelineID(), vformat("Failed to create the Metal raytracing control pipeline: %s", error));
@@ -2537,7 +2566,13 @@ void RenderingDeviceDriverMetal::command_bind_raytracing_uniform_set(CommandBuff
 }
 
 void RenderingDeviceDriverMetal::command_trace_rays(CommandBufferID p_cmd_buffer, const ShaderBindingTable &p_raygen_sbt, const ShaderBindingTable &p_miss_sbt, const ShaderBindingTable &p_hit_sbt, uint32_t p_width, uint32_t p_height, uint32_t p_depth) {
-	ERR_FAIL_MSG("Ray tracing dispatch is not implemented yet by the Metal driver.");
+	// The compute-lane kernel (C10) inlines raygen/miss/hit logic, so the
+	// compatibility SBT buffers are not consumed here; instances resolve their
+	// hit-group records engine-side. Pipeline and uniform sets were bound
+	// through the raytracing bind hooks onto the shared compute state.
+	MDCommandBufferBase *cmd_buffer = (MDCommandBufferBase *)p_cmd_buffer.id;
+	ERR_FAIL_NULL_MSG(cmd_buffer, "Metal command buffer input parameter is not valid.");
+	cmd_buffer->trace_rays(p_width, p_height, p_depth);
 }
 
 #pragma mark - Queries
@@ -2920,6 +2955,16 @@ bool RenderingDeviceDriverMetal::has_feature(Features p_feature) {
 			return true;
 		case SUPPORTS_POINT_SIZE:
 			return true;
+		case SUPPORTS_RAY_QUERY: {
+			// C10 debug toggle (restart required). Ray-query tracing needs the
+			// device intersector plus user-ID instance descriptors (macOS 12+)
+			// so the kernel can read Godot's instance custom index. The full
+			// runtime gate with graceful fallback is C11; until then the
+			// backend stays opt-in and SUPPORTS_RAYTRACING_PIPELINE stays
+			// false, which keeps the scene-side path tracer disabled.
+			static const bool ray_query_backend_enabled = ProjectSettings::get_singleton() != nullptr && GLOBAL_GET("rendering/pathtracer/metal_ray_query_backend");
+			return ray_query_backend_enabled && device_properties->features.supports_raytracing && device_properties->features.supports_user_id_instances;
+		}
 		default:
 			return false;
 	}

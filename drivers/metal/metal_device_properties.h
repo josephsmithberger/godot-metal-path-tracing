@@ -123,6 +123,7 @@ struct API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0)) MetalFeatures {
 	bool supports_residency_sets = false; /**< If true, residency sets (MTLResidencySet) are supported by the OS. */
 	bool supports_raytracing = false; /**< If true, the device supports acceleration structures and the MSL intersector intrinsics. */
 	bool supports_function_pointers = false; /**< If true, visible function tables and function pointers are supported in compute pipelines. */
+	bool supports_user_id_instances = false; /**< If true, TLAS instance descriptors can carry a shader-visible user ID (macOS 12+). */
 
 	/*!
 	 * Check if argument buffers are fully supported, which requires tier 2 support and no need for argument encoders.

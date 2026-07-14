@@ -1489,6 +1489,25 @@ void MDCommandBuffer::compute_dispatch(uint32_t p_x_groups, uint32_t p_y_groups,
 	enc->dispatchThreadgroups(size, compute.pipeline->get_threads_per_threadgroup());
 }
 
+void MDCommandBuffer::trace_rays(uint32_t p_width, uint32_t p_height, uint32_t p_depth) {
+	DEV_ASSERT(type == MDCommandBufferStateType::Compute);
+	ERR_FAIL_NULL_MSG(compute.pipeline, "No pipeline is bound for the Metal trace-rays dispatch.");
+	ERR_FAIL_COND_MSG(compute.pipeline->type != MDPipelineType::Raytracing, "The bound Metal pipeline is not a raytracing pipeline.");
+	MDRaytracingPipeline *pipeline = static_cast<MDRaytracingPipeline *>(compute.pipeline);
+	ERR_FAIL_COND_MSG(!pipeline->uses_compute_lane, "The bound Metal raytracing pipeline carries no re-expressed compute kernel; only C10 compute-lane pipelines can be dispatched.");
+	ERR_FAIL_COND_MSG(p_width == 0 || p_height == 0 || p_depth == 0, "The Metal trace-rays dimensions must be non-zero.");
+
+	_compute_set_dirty_state();
+
+	// Threadgroups round up to cover the pixel grid; the kernel bounds-checks.
+	const MTL::Size local = pipeline->get_threads_per_threadgroup();
+	MTL::Size groups = MTL::Size(
+			(p_width + local.width - 1) / local.width,
+			(p_height + local.height - 1) / local.height,
+			(p_depth + local.depth - 1) / local.depth);
+	compute.encoder->dispatchThreadgroups(groups, local);
+}
+
 void MDCommandBuffer::compute_dispatch_indirect(RDD::BufferID p_indirect_buffer, uint64_t p_offset) {
 	DEV_ASSERT(type == MDCommandBufferStateType::Compute);
 
@@ -1799,6 +1818,13 @@ void MDCommandBuffer::_bind_uniforms_direct(MDUniformSet *p_set, MDShader *p_sha
 				const MDAccelerationStructure *acceleration_structure = (const MDAccelerationStructure *)uniform.ids[0].id;
 				DEV_ASSERT(acceleration_structure != nullptr && acceleration_structure->accel);
 				p_enc.set(acceleration_structure->accel.get(), indexes.buffer);
+				// The direct bind makes only the TLAS itself resident; Metal
+				// requires the primitive structures it references to be marked
+				// explicitly before they can be intersected.
+				if (p_enc.mode == DirectEncoder::COMPUTE && !acceleration_structure->resident_blases.is_empty()) {
+					MTL::ComputeCommandEncoder *enc = static_cast<MTL::ComputeCommandEncoder *>(p_enc.encoder);
+					enc->useResources(reinterpret_cast<const MTL::Resource *const *>(acceleration_structure->resident_blases.ptr()), acceleration_structure->resident_blases.size(), MTL::ResourceUsageRead);
+				}
 			} break;
 			default: {
 				DEV_ASSERT(false);
@@ -1813,6 +1839,23 @@ void MDCommandBuffer::_bind_uniforms_argument_buffers_compute(MDUniformSet *p_se
 
 	MTL::ComputeCommandEncoder *enc = compute.encoder.get();
 	compute.resource_tracker.merge_from(p_set->usage_to_resources);
+
+	// TLAS uniforms: the argument buffer carries only the TLAS resource ID and
+	// the set's usage map covers the TLAS itself; the primitive structures it
+	// references change per build and must be made resident here. When
+	// barriers/residency sets are enabled, every acceleration structure is
+	// already tracked in the main residency set.
+	if (!use_barriers) {
+		for (const RDD::BoundUniform &uniform : p_set->uniforms) {
+			if (uniform.type != RDD::UNIFORM_TYPE_ACCELERATION_STRUCTURE) {
+				continue;
+			}
+			const MDAccelerationStructure *acceleration_structure = (const MDAccelerationStructure *)uniform.ids[0].id;
+			if (acceleration_structure != nullptr && !acceleration_structure->resident_blases.is_empty()) {
+				enc->useResources(reinterpret_cast<const MTL::Resource *const *>(acceleration_structure->resident_blases.ptr()), acceleration_structure->resident_blases.size(), MTL::ResourceUsageRead);
+			}
+		}
+	}
 
 	const UniformSet &shader_set = p_shader->sets[p_set_index];
 

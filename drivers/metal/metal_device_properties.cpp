@@ -184,6 +184,9 @@ void MetalDeviceProperties::init_features(MTL::Device *p_device) {
 		features.supports_raytracing = p_device->supportsRaytracing();
 		features.supports_function_pointers = p_device->supportsFunctionPointers();
 	}
+	if (__builtin_available(macOS 12.0, iOS 15.0, tvOS 16.0, *)) {
+		features.supports_user_id_instances = features.supports_raytracing;
+	}
 
 	if (__builtin_available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
 		features.metal_fx_spatial = MTLFX::SpatialScalerDescriptor::supportsDevice(p_device);

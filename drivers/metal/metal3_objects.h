@@ -561,6 +561,8 @@ public:
 	void acceleration_structure_build(MDAccelerationStructure *p_acceleration_structure, MTL::Buffer *p_scratch_buffer) override;
 	void acceleration_structure_refit(MDAccelerationStructure *p_acceleration_structure, MTL::Buffer *p_scratch_buffer) override;
 
+	void trace_rays(uint32_t p_width, uint32_t p_height, uint32_t p_depth) override;
+
 #pragma mark - Transfer
 
 private:

@@ -36,6 +36,7 @@ bool MDRaytracingPipeline::configure_shader_groups(VectorView<RDD::PipelineShade
 	miss_group_count = 0;
 	hit_group_count = 0;
 	max_trace_recursion_depth = 0;
+	uses_compute_lane = false;
 	if (r_error != nullptr) {
 		r_error->clear();
 	}
@@ -57,6 +58,27 @@ bool MDRaytracingPipeline::configure_shader_groups(VectorView<RDD::PipelineShade
 		return fail("The Metal raytracing software recursion budget must be greater than zero.");
 	}
 
+	// C10 compute lane: the ray-generation group may be a re-expressed
+	// ray-query compute kernel instead of an RT-pipeline stage. That kernel is
+	// monolithic — raygen, miss, and hit logic are inlined — so it must be the
+	// only shader in the pipeline; miss and hit groups are retained purely as
+	// stable SBT records.
+	const bool compute_lane = p_raygen_shader_indices[0] < p_shaders.size() && p_shaders[p_raygen_shader_indices[0]].shader_stage == RDD::SHADER_STAGE_COMPUTE;
+	if (compute_lane) {
+		if (p_raygen_shader_indices.size() != 1) {
+			return fail("A Metal compute-lane raytracing pipeline requires exactly one ray-generation group (the re-expressed kernel is monolithic).");
+		}
+		if (p_miss_shader_indices.size() != 0) {
+			return fail("A Metal compute-lane raytracing pipeline cannot reference miss shaders; miss logic is inlined in the re-expressed kernel.");
+		}
+		for (uint32_t i = 0; i < p_hit_groups.size(); i++) {
+			const RDD::HitGroup &input = p_hit_groups[i];
+			if (input.closest_hit_shader_index != UINT32_MAX || input.any_hit_shader_index != UINT32_MAX || input.intersection_shader_index != UINT32_MAX) {
+				return fail(vformat("Hit group %d references shader stages, but the Metal compute lane inlines hit logic; only empty (sentinel) hit groups are accepted.", i));
+			}
+		}
+	}
+
 	// Slot zero is Metal's system opaque-triangle intersection function. Every
 	// triangle hit group can share it because hit/any-hit logic is inlined by the
 	// compute lowering rather than represented by independent visible functions.
@@ -66,7 +88,7 @@ bool MDRaytracingPipeline::configure_shader_groups(VectorView<RDD::PipelineShade
 
 	for (uint32_t i = 0; i < p_raygen_shader_indices.size(); i++) {
 		const uint32_t shader_index = p_raygen_shader_indices[i];
-		if (!valid_stage(shader_index, RDD::SHADER_STAGE_RAYGEN)) {
+		if (!valid_stage(shader_index, compute_lane ? RDD::SHADER_STAGE_COMPUTE : RDD::SHADER_STAGE_RAYGEN)) {
 			return fail(vformat("Ray-generation group %d references an invalid shader stage index (%d).", i, shader_index));
 		}
 		ShaderGroup group;
@@ -87,6 +109,7 @@ bool MDRaytracingPipeline::configure_shader_groups(VectorView<RDD::PipelineShade
 		shader_groups.push_back(group);
 	}
 	miss_group_count = p_miss_shader_indices.size();
+	uses_compute_lane = compute_lane;
 
 	for (uint32_t i = 0; i < p_hit_groups.size(); i++) {
 		const RDD::HitGroup &input = p_hit_groups[i];
@@ -123,6 +146,48 @@ bool MDRaytracingPipeline::configure_shader_groups(VectorView<RDD::PipelineShade
 	}
 	hit_group_count = p_hit_groups.size();
 	max_trace_recursion_depth = p_max_trace_recursion_depth;
+	return true;
+}
+
+bool MDRaytracingPipeline::create_compute_lane(MTL::Device *p_device, MTL::Function *p_function, MTL::Size p_local, String *r_error) {
+	state.reset();
+	intersection_function_table.reset();
+	intersection_function_count = 0;
+	if (r_error != nullptr) {
+		r_error->clear();
+	}
+
+	auto fail = [r_error](const String &p_message) {
+		if (r_error != nullptr) {
+			*r_error = p_message;
+		}
+		return false;
+	};
+
+	if (!uses_compute_lane) {
+		return fail("The Metal raytracing pipeline groups were not configured for the compute lane.");
+	}
+	if (p_device == nullptr || !p_device->supportsRaytracing()) {
+		return fail("Metal ray tracing is not supported by this device.");
+	}
+	if (p_function == nullptr) {
+		return fail("The Metal compute-lane kernel function is not valid.");
+	}
+	if (p_local.width == 0 || p_local.height == 0 || p_local.depth == 0) {
+		return fail("The Metal compute-lane workgroup size must be non-zero in every dimension.");
+	}
+
+	NS::Error *error = nullptr;
+	state = NS::TransferPtr(p_device->newComputePipelineState(p_function, &error));
+	if (!state) {
+		return fail(error != nullptr ? String::utf8(error->localizedDescription()->utf8String()) : String("Unknown Metal compute-pipeline creation error."));
+	}
+	threads_per_threadgroup = p_local;
+
+	// Ray-query kernels step candidates through metal::raytracing::
+	// intersection_query; no intersection-function table is bound. Procedural
+	// hit groups therefore remain rejected on this lane until visible-function
+	// lowering exists (docs/rt_metal_port/pathtracer_launch.md).
 	return true;
 }
 
