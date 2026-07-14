@@ -29,10 +29,10 @@ ray-tracing capabilities present.
 | A1 | Shipping scope is Apple Silicon arm64 only | High | A product decision to support Intel Macs |
 | A2 | Runtime device queries, not GPU families, gate the RT path | High | Apple removing/deprecating the query surface |
 | A3 | Every required RT API exists at the arm64 build floor, macOS 11.0 | High | Compile error against an older SDK path in C4-C6 |
-| A4 | The effective runtime floor will be macOS 13.0 (encoder-free tier-2 argument buffers + gpuAddress) | Medium | C7 shader-strategy spike |
-| A5 | First scope is compute-pipeline ray tracing only | High | C7/C8 finding a hard dependency on render-stage RT |
+| A4 | The effective runtime floor will be macOS 13.0 (encoder-free tier-2 argument buffers + gpuAddress) | Medium (C7 found no lower requirement) | C8/C9 argument-buffer integration |
+| A5 | First scope is compute-pipeline ray tracing only | High (reinforced by C7: both proven lanes are compute) | C8 finding a hard dependency on render-stage RT |
 | A6 | Vulkan SBT handles map to function-table indices | Medium | C9 pipeline-mapping implementation |
-| A7 | The existing SPIRV-Cross lane cannot lower RT-stage SPIR-V; a Metal-specific lane is needed | Medium | C7 compile experiment |
+| A7 | ~~The existing SPIRV-Cross lane cannot lower RT-stage SPIR-V~~ **Resolved by C7 as split**: the lane lowers ray-query compute; RT-pipeline stages are confirmed impossible and get re-expressed as compute | Resolved | A vendored SPIRV-Cross update gaining RT execution models |
 | A8 | Unified memory holds on all target devices; shared storage mode is acceptable for bring-up | High | Probe reporting `has_unified_memory: false` on a target device |
 | A9 | One dev machine (Apple M5) covers both RT hardware lanes for bring-up; M1/M2 coverage is deferred | Medium | Family-dependent bug reports on apple7/apple8 |
 | A10 | DLSS/Streamline stays out of scope; no upscaler is part of this port | High | A scope change |
@@ -139,19 +139,32 @@ reserves the right data shapes.
 *Falsify/re-verify:* C9 unit test creating a pipeline from synthetic shader
 groups and validating stable indices and bind order.
 
-## A7: RT shader stages need a Metal-specific lowering lane
+## A7: RT shader stages need a Metal-specific lowering lane (resolved by C7)
 
 The existing shader container compiles SPIR-V to MSL via SPIRV-Cross
 (`rendering_shader_container_metal.cpp`), which is proven for raster and
-compute. It is assumed **insufficient** for the fork's RT-stage SPIR-V
+compute. It was assumed **insufficient** for the fork's RT-stage SPIR-V
 (raygen/miss/closest-hit from `scene_raytracing_raygen.glsl` and friends),
 because SPIRV-Cross's MSL backend does not translate Vulkan RT-pipeline
-execution models. The C7 spike decides between: extending the SPIRV-Cross
-lane, authoring the Metal RT kernels natively, or a hybrid (SPIR-V for
-material evaluation, native MSL for the trace skeleton).
+execution models.
 
-*Falsify/re-verify:* C7 attempts to run one tiny RT shader through the
-existing container and records exactly where it breaks (or does not).
+**C7 resolved this as a split** (see
+[`shader_strategy.md`](shader_strategy.md) for the full evidence table):
+
+- Ray-query compute SPIR-V lowers, compiles, and traces correctly through the
+  existing lane (verified on-device against the C5/C6 acceleration
+  structures), so the blanket form of A7 is falsified.
+- RT-pipeline stages are confirmed impossible: raygen fails in SPIRV-Cross
+  with "A memory declaration object must be used in TraceRayKHR." and
+  closest-hit with "PrimitiveId is not supported in this execution model."
+  They are re-expressed as ray-query compute kernels, not translated.
+- One real defect in the existing lane was measured: with
+  `pad_argument_buffer_resources` enabled (the container's configuration),
+  SPIRV-Cross rejects acceleration-structure bindings outright. C9 must patch
+  the vendored switch or disable padding for RT kernels.
+
+*Re-verify:* `--test-case="*[MetalRT] C7*"` pins every result above; the GPU
+half runs in the runner's `gpu` stage.
 
 ## A8: Unified memory and shared storage for bring-up
 
@@ -203,9 +216,11 @@ tracer later, but no chunk C1-C12 depends on it.
    recursion limit — recursion becomes an in-kernel loop. Where the engine
    relies on Vulkan's `maxRayRecursionDepth`, the Metal driver must pick and
    report an honest equivalent. Decide in C9.
-2. **64-bit image atomics.** Whether the path tracer's accumulation targets
+2. **64-bit image atomics.** ~~Whether the path tracer's accumulation targets
    need `supports_image_atomic_64_bit` (apple9-or-apple8+mac2 only) is unknown
-   until the C7 shader audit. If yes, it fragments the apple7/apple8 lane.
+   until the C7 shader audit.~~ Closed by the C7 audit: the RT shader tree
+   under `servers/rendering/renderer_rd/shaders/raytracing/` contains no image
+   atomics, so no lane fragmentation on apple7/apple8.
 3. **Family scan staleness.** The engine's highest-family scan stops at
    apple9; M5 reports apple10. Nothing RT-critical keys off the exact family
    today, but any future family-based tiering (A2) must use `>=` comparisons,

@@ -232,6 +232,14 @@ static spv::ExecutionModel SHADER_STAGE_REMAP[RDD::SHADER_STAGE_MAX] = {
 	spv::ExecutionModelTessellationControl, // RDD::SHADER_STAGE_TESSELATION_CONTROL
 	spv::ExecutionModelTessellationEvaluation, // RDD::SHADER_STAGE_TESSELATION_EVALUATION
 	spv::ExecutionModelGLCompute, // RDD::SHADER_STAGE_COMPUTE
+	// The MSL lane cannot lower the ray-tracing pipeline stages below (see
+	// docs/rt_metal_port/shader_strategy.md); they are mapped so that stage
+	// bookkeeping never aliases them to ExecutionModelVertex (0).
+	spv::ExecutionModelRayGenerationKHR, // RDD::SHADER_STAGE_RAYGEN
+	spv::ExecutionModelAnyHitKHR, // RDD::SHADER_STAGE_ANY_HIT
+	spv::ExecutionModelClosestHitKHR, // RDD::SHADER_STAGE_CLOSEST_HIT
+	spv::ExecutionModelMissKHR, // RDD::SHADER_STAGE_MISS
+	spv::ExecutionModelIntersectionKHR, // RDD::SHADER_STAGE_INTERSECTION
 };
 
 spv::ExecutionModel get_stage(uint32_t p_stages_mask, RDD::ShaderStage p_stage) {
