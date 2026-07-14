@@ -91,6 +91,11 @@ static_assert(ENUM_MEMBERS_EQUAL(RDD::COMPARE_OP_NOT_EQUAL, MTL::CompareFunction
 static_assert(ENUM_MEMBERS_EQUAL(RDD::COMPARE_OP_GREATER_OR_EQUAL, MTL::CompareFunctionGreaterEqual));
 static_assert(ENUM_MEMBERS_EQUAL(RDD::COMPARE_OP_ALWAYS, MTL::CompareFunctionAlways));
 
+static_assert(ENUM_MEMBERS_EQUAL(RDD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT, MTL::AccelerationStructureInstanceOptionDisableTriangleCulling));
+static_assert(ENUM_MEMBERS_EQUAL(RDD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT, MTL::AccelerationStructureInstanceOptionTriangleFrontFacingWindingCounterClockwise));
+static_assert(ENUM_MEMBERS_EQUAL(RDD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT, MTL::AccelerationStructureInstanceOptionOpaque));
+static_assert(ENUM_MEMBERS_EQUAL(RDD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_NO_OPAQUE_BIT, MTL::AccelerationStructureInstanceOptionNonOpaque));
+
 /*****************/
 /**** BUFFERS ****/
 /*****************/
@@ -2283,15 +2288,13 @@ RDD::AccelerationStructureID RenderingDeviceDriverMetal::_acceleration_structure
 	ERR_FAIL_COND_V_MSG(scratch_size > UINT32_MAX, AccelerationStructureID(), "Acceleration structure scratch size exceeds the RenderingDevice limit.");
 
 	MDAccelerationStructure *accel_info = memnew(MDAccelerationStructure(p_type, NS::RetainPtr(p_desc), sizes, p_flags, p_max_instance_count));
-	if (p_type == MDAccelerationStructure::Type::BLAS) {
-		if (!accel_info->allocate(device)) {
-			memdelete(accel_info);
-			ERR_FAIL_V_MSG(AccelerationStructureID(), "Failed to allocate Metal BLAS resources.");
-		}
-		_track_resource(accel_info->accel.get());
-		if (accel_info->compacted_size_buffer) {
-			_track_resource(accel_info->compacted_size_buffer.get());
-		}
+	if (!accel_info->allocate(device)) {
+		memdelete(accel_info);
+		ERR_FAIL_V_MSG(AccelerationStructureID(), "Failed to allocate Metal acceleration structure resources.");
+	}
+	_track_resource(accel_info->accel.get());
+	if (accel_info->compacted_size_buffer) {
+		_track_resource(accel_info->compacted_size_buffer.get());
 	}
 
 	return AccelerationStructureID(accel_info);
@@ -2392,15 +2395,19 @@ RDD::AccelerationStructureID RenderingDeviceDriverMetal::tlas_create(uint32_t p_
 	NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
 
 	// The instance descriptor buffer and the BLAS array are provided at build
-	// time (command_build_tlas, chunk C6); sizes depend only on the count.
+	// time; sizes depend only on the count and descriptor stride.
 	MTL::InstanceAccelerationStructureDescriptor *desc = MTL::InstanceAccelerationStructureDescriptor::descriptor();
 	desc->setInstanceCount(p_max_instance_count);
+	desc->setInstanceDescriptorStride(sizeof(MDAccelerationStructureInstance));
 
 	return _acceleration_structure_create(MDAccelerationStructure::Type::TLAS, desc, p_flags, p_max_instance_count);
 }
 
 void RenderingDeviceDriverMetal::acceleration_structure_instance_write(uint8_t *r_driver_instance, const AccelerationStructureInstance &p_instance) {
-	ERR_FAIL_MSG("TLAS instance writes are not implemented yet by the Metal driver.");
+	ERR_FAIL_NULL_MSG(r_driver_instance, "Metal acceleration structure instance output parameter is not valid.");
+	MDAccelerationStructureInstance driver_instance;
+	ERR_FAIL_COND_MSG(!driver_instance.write(p_instance), "Metal acceleration structure instance has a non-finite transform, invalid flags, or a non-BLAS acceleration structure handle.");
+	memcpy(r_driver_instance, &driver_instance, sizeof(driver_instance));
 }
 
 void RenderingDeviceDriverMetal::acceleration_structure_free(RDD::AccelerationStructureID p_acceleration_structure) {
@@ -2470,7 +2477,20 @@ void RenderingDeviceDriverMetal::command_update_blas(CommandBufferID p_cmd_buffe
 }
 
 void RenderingDeviceDriverMetal::command_build_tlas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, BufferID p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count) {
-	ERR_FAIL_MSG("TLAS builds are not implemented yet by the Metal driver.");
+	MDCommandBufferBase *cmd_buffer = (MDCommandBufferBase *)p_cmd_buffer.id;
+	MDAccelerationStructure *accel_info = (MDAccelerationStructure *)p_acceleration_structure.id;
+	const BufferInfo *scratch_buffer = (const BufferInfo *)p_scratch_buffer.id;
+	const BufferInfo *instance_buffer = (const BufferInfo *)p_instance_buffer.id;
+	ERR_FAIL_NULL_MSG(cmd_buffer, "Metal command buffer input parameter is not valid.");
+	ERR_FAIL_NULL_MSG(accel_info, "Metal acceleration structure input parameter is not valid.");
+	ERR_FAIL_COND_MSG(accel_info->type != MDAccelerationStructure::Type::TLAS, "Only TLAS resources can be passed to command_build_tlas().");
+	ERR_FAIL_NULL_MSG(accel_info->accel.get(), "Metal TLAS resource has not been allocated.");
+	ERR_FAIL_NULL_MSG(scratch_buffer, "Metal TLAS scratch buffer input parameter is not valid.");
+	ERR_FAIL_COND_MSG(scratch_buffer->metal_buffer->length() < accel_info->build_scratch_size, "Metal TLAS scratch buffer is too small for a build.");
+	ERR_FAIL_NULL_MSG(instance_buffer, "Metal TLAS instance buffer input parameter is not valid.");
+	ERR_FAIL_COND_MSG(!accel_info->prepare_tlas_build(instance_buffer->metal_buffer.get(), p_instance_offset, p_instance_count), "Metal TLAS instance records, range, or referenced BLAS are invalid.");
+
+	cmd_buffer->acceleration_structure_build(accel_info, scratch_buffer->metal_buffer.get());
 }
 
 void RenderingDeviceDriverMetal::command_bind_raytracing_pipeline(CommandBufferID p_cmd_buffer, RaytracingPipelineID p_pipeline) {
@@ -2832,6 +2852,8 @@ uint64_t RenderingDeviceDriverMetal::api_trait_get(ApiTrait p_trait) {
 			return use_barriers;
 		case API_TRAIT_CLEARS_WITH_COPY_ENGINE:
 			return false;
+		case API_TRAIT_ACCELERATION_STRUCTURE_INSTANCE_SIZE:
+			return sizeof(MDAccelerationStructureInstance);
 		default:
 			return RenderingDeviceDriver::api_trait_get(p_trait);
 	}

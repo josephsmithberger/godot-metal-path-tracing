@@ -42,6 +42,7 @@
 
 class RenderingDeviceDriverMetal;
 class MDAccelerationStructure;
+struct MDAccelerationStructureInstance;
 
 using RDC = RenderingDeviceCommons;
 
@@ -1128,7 +1129,7 @@ public:
 	/// `InstanceAccelerationStructureDescriptor` for a TLAS. Retains any geometry
 	/// buffers it references.
 	NS::SharedPtr<MTL::AccelerationStructureDescriptor> descriptor;
-	/// Native acceleration structure. C5 allocates BLAS resources; TLAS follows in C6.
+	/// Native acceleration structure.
 	NS::SharedPtr<MTL::AccelerationStructure> accel;
 	/// Bytes required for the native acceleration-structure allocation.
 	uint64_t acceleration_structure_size = 0;
@@ -1196,6 +1197,12 @@ public:
 		p_encoder->refitAccelerationStructure(accel.get(), descriptor.get(), accel.get(), p_scratch_buffer, 0);
 	}
 
+	/// Configures a TLAS descriptor from Godot's persistently mapped instance
+	/// records. The first 64 bytes of each record are consumed directly by Metal;
+	/// the remaining metadata resolves Godot BLAS handles to descriptor-array
+	/// indices. Returns false when the record range or a referenced BLAS is invalid.
+	bool prepare_tlas_build(MTL::Buffer *p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count);
+
 	/// Returns zero until a compaction-size-enabled build has completed.
 	uint64_t get_compacted_size() const {
 		if (!compacted_size_buffer || !compacted_size_buffer->contents()) {
@@ -1214,3 +1221,151 @@ public:
 			flags(p_flags),
 			max_instance_count(p_max_instance_count) {}
 };
+
+/*! CPU-written instance record used by the Metal TLAS build path.
+ *
+ * Metal's macOS 11 instance descriptor identifies a BLAS by an index into an
+ * NSArray supplied on the TLAS descriptor. Godot instead gives the instance
+ * writer a backend BLAS handle before a particular TLAS is known. The native
+ * descriptor therefore occupies the first 64 bytes and backend-only metadata
+ * follows it. A 128-byte stride keeps every RenderingDevice suballocation
+ * aligned to Metal's required 64-byte instanceDescriptorBufferOffset.
+ *
+ * `instance_id` remains backend metadata at the macOS 11 API floor because the
+ * native UserID descriptor requires macOS 12. C8/C9 can bind it through the
+ * chosen shader-lowering path without raising the acceleration-structure floor.
+ */
+struct MDAccelerationStructureInstance {
+	// Binary-compatible prefix with MTL::AccelerationStructureInstanceDescriptor.
+	float transformation_matrix[12] = {};
+	uint32_t options = 0;
+	uint32_t mask = 0;
+	uint32_t intersection_function_table_offset = 0;
+	uint32_t acceleration_structure_index = 0;
+
+	// Godot-to-Metal build metadata, ignored by Metal because of the stride.
+	MDAccelerationStructure *blas = nullptr;
+	uint32_t instance_id = 0;
+	uint32_t requested_mask = 0;
+	uint32_t reserved[12] = {};
+
+	bool write(const RDD::AccelerationStructureInstance &p_instance) {
+		constexpr uint32_t valid_options =
+				RDD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT |
+				RDD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT |
+				RDD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT |
+				RDD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_NO_OPAQUE_BIT;
+
+		const uint32_t instance_options = static_cast<uint32_t>(p_instance.flags);
+		if (!p_instance.transform.is_finite() || (instance_options & ~valid_options) != 0) {
+			return false;
+		}
+		if ((instance_options & RDD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT) != 0 &&
+				(instance_options & RDD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_NO_OPAQUE_BIT) != 0) {
+			return false;
+		}
+
+		MDAccelerationStructure *blas_info = reinterpret_cast<MDAccelerationStructure *>(p_instance.blas.id);
+		if (blas_info != nullptr && blas_info->type != MDAccelerationStructure::Type::BLAS) {
+			return false;
+		}
+
+		float packed_transform[12] = {};
+		for (uint32_t column = 0; column < 3; column++) {
+			for (uint32_t row = 0; row < 3; row++) {
+				const float component = p_instance.transform.basis.rows[row][column];
+				if (!Math::is_finite(component)) {
+					return false;
+				}
+				packed_transform[column * 3 + row] = component;
+			}
+		}
+		for (uint32_t row = 0; row < 3; row++) {
+			const float component = p_instance.transform.origin[row];
+			if (!Math::is_finite(component)) {
+				return false;
+			}
+			packed_transform[9 + row] = component;
+		}
+
+		*this = MDAccelerationStructureInstance();
+		memcpy(transformation_matrix, packed_transform, sizeof(packed_transform));
+		options = instance_options;
+		mask = blas_info != nullptr ? p_instance.mask : 0;
+		intersection_function_table_offset = p_instance.hit_sbt_offset;
+		blas = blas_info;
+		instance_id = p_instance.id;
+		requested_mask = p_instance.mask;
+		return true;
+	}
+};
+
+static_assert(sizeof(MTL::AccelerationStructureInstanceDescriptor) == 64, "Unexpected native Metal instance descriptor size.");
+static_assert(offsetof(MDAccelerationStructureInstance, options) == offsetof(MTL::AccelerationStructureInstanceDescriptor, options));
+static_assert(offsetof(MDAccelerationStructureInstance, mask) == offsetof(MTL::AccelerationStructureInstanceDescriptor, mask));
+static_assert(offsetof(MDAccelerationStructureInstance, intersection_function_table_offset) == offsetof(MTL::AccelerationStructureInstanceDescriptor, intersectionFunctionTableOffset));
+static_assert(offsetof(MDAccelerationStructureInstance, acceleration_structure_index) == offsetof(MTL::AccelerationStructureInstanceDescriptor, accelerationStructureIndex));
+static_assert(sizeof(MDAccelerationStructureInstance) == 128, "Metal TLAS instance records must preserve 64-byte suballocation alignment.");
+
+inline bool MDAccelerationStructure::prepare_tlas_build(MTL::Buffer *p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count) {
+	if (type != Type::TLAS || p_instance_buffer == nullptr || p_instance_buffer->contents() == nullptr || p_instance_count > max_instance_count) {
+		return false;
+	}
+	if ((p_instance_offset % 64) != 0) {
+		return false;
+	}
+
+	const uint64_t records_size = uint64_t(p_instance_count) * sizeof(MDAccelerationStructureInstance);
+	if (p_instance_offset > p_instance_buffer->length() || records_size > p_instance_buffer->length() - p_instance_offset) {
+		return false;
+	}
+
+	LocalVector<MDAccelerationStructureInstance> instances;
+	instances.resize(p_instance_count);
+	const uint8_t *instance_bytes = static_cast<const uint8_t *>(p_instance_buffer->contents()) + p_instance_offset;
+	for (uint32_t i = 0; i < p_instance_count; i++) {
+		memcpy(&instances[i], instance_bytes + (i * sizeof(MDAccelerationStructureInstance)), sizeof(MDAccelerationStructureInstance));
+		MDAccelerationStructure *blas_info = instances[i].blas;
+		if (instances[i].requested_mask > UINT8_MAX ||
+				(blas_info != nullptr && (blas_info->type != Type::BLAS || !blas_info->accel || !blas_info->build_encoded))) {
+			return false;
+		}
+	}
+
+	MDAccelerationStructure *fallback_blas = nullptr;
+	for (const MDAccelerationStructureInstance &instance : instances) {
+		if (instance.blas != nullptr) {
+			fallback_blas = instance.blas;
+			break;
+		}
+	}
+
+	MTL::InstanceAccelerationStructureDescriptor *tlas_descriptor = static_cast<MTL::InstanceAccelerationStructureDescriptor *>(descriptor.get());
+	tlas_descriptor->setInstanceDescriptorBuffer(p_instance_buffer);
+	tlas_descriptor->setInstanceDescriptorBufferOffset(p_instance_offset);
+	tlas_descriptor->setInstanceDescriptorStride(sizeof(MDAccelerationStructureInstance));
+
+	if (fallback_blas == nullptr) {
+		// A collection of null Godot instances is semantically an empty TLAS.
+		tlas_descriptor->setInstanceCount(0);
+		tlas_descriptor->setInstancedAccelerationStructures(NS::Array::array());
+		return true;
+	}
+
+	LocalVector<NS::Object *> instanced_acceleration_structures;
+	instanced_acceleration_structures.resize(p_instance_count);
+	uint8_t *writable_instance_bytes = static_cast<uint8_t *>(p_instance_buffer->contents()) + p_instance_offset;
+	for (uint32_t i = 0; i < p_instance_count; i++) {
+		MDAccelerationStructureInstance &instance = instances[i];
+		MDAccelerationStructure *blas_info = instance.blas != nullptr ? instance.blas : fallback_blas;
+		instance.acceleration_structure_index = i;
+		instance.mask = instance.blas != nullptr ? instance.requested_mask : 0;
+		instanced_acceleration_structures[i] = blas_info->accel.get();
+		memcpy(writable_instance_bytes + (i * sizeof(MDAccelerationStructureInstance)), &instance, sizeof(MDAccelerationStructureInstance));
+	}
+
+	NS::Array *blas_array = NS::Array::array(instanced_acceleration_structures.ptr(), instanced_acceleration_structures.size());
+	tlas_descriptor->setInstanceCount(p_instance_count);
+	tlas_descriptor->setInstancedAccelerationStructures(blas_array);
+	return true;
+}
