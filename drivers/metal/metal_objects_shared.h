@@ -1097,17 +1097,36 @@ public:
 	~MDComputePipeline() final = default;
 };
 
-/*! A ray-tracing pipeline placeholder.
+/*! A minimal compute-backed ray-tracing pipeline.
  *
  * Metal has no dedicated ray-tracing pipeline object; tracing runs as a compute
- * dispatch whose kernel uses the MSL intersector. This class establishes the
- * backend object boundary without committing to shader-group storage before the
- * shader-lowering strategy (chunk C7) and pipeline mapping (chunk C9) are known.
+ * dispatch whose kernel uses the MSL intersector. Chunk C8 gives this object a
+ * native trace-kernel pipeline and its pipeline-specific intersection-function
+ * table. Mapping Godot shader groups and bindings onto it remains chunk C9.
  */
 class API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0), visionos(2.0)) MDRaytracingPipeline final : public MDPipeline {
 public:
+	static constexpr uint32_t TRACE_PIXEL_SIZE_BYTES = 4;
+	static constexpr uint32_t TRACE_TLAS_BUFFER_INDEX = 0;
+	static constexpr uint32_t TRACE_OUTPUT_BUFFER_INDEX = 1;
+	static constexpr uint32_t TRACE_CONSTANTS_BUFFER_INDEX = 2;
+	static constexpr uint32_t TRACE_INTERSECTION_TABLE_BUFFER_INDEX = 3;
+
 	/// Compute pipeline that hosts the trace kernel (raygen equivalent).
 	NS::SharedPtr<MTL::ComputePipelineState> state;
+	/// Pipeline-specific table. C8 installs Metal's opaque-triangle function at
+	/// index zero; custom procedural intersection functions remain a later step.
+	NS::SharedPtr<MTL::IntersectionFunctionTable> intersection_function_table;
+	uint32_t intersection_function_count = 0;
+
+	/// Creates the backend-owned C8 kernel and its intersection-function table.
+	bool create_trace_one_ray(MTL::Device *p_device, String *r_error = nullptr);
+	/// Encodes a 2D image dispatch. Each output pixel is four bytes (RGBA8).
+	bool encode_trace_one_ray(MTL::ComputeCommandEncoder *p_encoder, MTL::AccelerationStructure *p_tlas, MTL::Buffer *p_output_buffer, uint32_t p_width, uint32_t p_height) const;
+
+	bool is_valid() const {
+		return state && intersection_function_table && intersection_function_count > 0;
+	}
 
 	MDRaytracingPipeline() :
 			MDPipeline(MDPipelineType::Raytracing) {}

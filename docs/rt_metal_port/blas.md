@@ -3,8 +3,9 @@
 Chunk C5 implements native Metal bottom-level acceleration structures for
 triangle and AABB geometry behind Godot's existing rendering-device driver
 interface. It does not advertise ray-tracing pipeline support yet. TLAS builds
-are implemented by [C6](tlas.md); shader lowering and ray dispatch remain later
-chunks.
+are implemented by [C6](tlas.md), the shader strategy by
+[C7](shader_strategy.md), and the isolated native trace path by
+[C8](trace_one_ray.md); public pipeline mapping remains a later chunk.
 
 ## Backend contract
 
