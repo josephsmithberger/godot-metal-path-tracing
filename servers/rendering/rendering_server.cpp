@@ -3820,10 +3820,10 @@ void RenderingServer::init() {
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/limits/cluster_builder/max_clustered_elements", PROPERTY_HINT_RANGE, "32,8192,1"), 512);
 	GLOBAL_DEF("rendering/pathtracer/use_shader_execution_reordering", true);
 	GLOBAL_DEF("rendering/pathtracer/async_shader_compilation", true);
-	// C10 debug toggle: lets the Metal driver report ray-query support so the
-	// compute-lane RT backend can be exercised. Off by default until the
-	// runtime gating/fallback work (C11) lands.
-	GLOBAL_DEF_RST("rendering/pathtracer/metal_ray_query_backend", false);
+	// The Metal driver applies the C11 capability gate before exposing its
+	// compute ray-query lane. Disabling this setting forces the regular non-RT
+	// renderer without attempting to create acceleration structures.
+	GLOBAL_DEF_RST("rendering/pathtracer/metal_ray_query_backend", true);
 	GLOBAL_DEF_RST("rendering/pathtracer/multimesh_cache_cpu_transforms", false);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracer/deformed_mesh_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,3600,1"), 60);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracer/multimesh_blas_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,18000,1"), 3600);

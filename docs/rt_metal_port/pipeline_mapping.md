@@ -67,10 +67,11 @@ re-expressed ray-query kernel over the pixel grid
 lane — ray-query kernels bind no intersection-function table, and the
 compatibility SBT buffers are not consumed at trace time because hit logic is
 inlined. Pipelines that still carry the C8 backend-owned kernel remain
-rejected by the public dispatch. The Metal feature flags stay off by default
-until the runtime/fallback gate in C11; the C10 debug toggle
-(`rendering/pathtracer/metal_ray_query_backend`) is the only way to expose
-ray-query support early.
+rejected by the public dispatch. C11 now exposes `SUPPORTS_RAY_QUERY` through
+the complete capability gate documented in
+[`runtime_gating.md`](runtime_gating.md). `SUPPORTS_RAYTRACING_PIPELINE`
+remains false until the scene shader bundle is re-expressed for this compute
+lane.
 
 ## Non-1:1 SBT semantics
 

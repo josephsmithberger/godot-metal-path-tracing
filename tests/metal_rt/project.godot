@@ -1,0 +1,8 @@
+; Minimal project used by the Metal RT runtime-gate smoke tests.
+
+config_version=5
+
+[application]
+
+config/name="Metal RT Runtime Gate"
+run/main_scene="res://runtime_gate.tscn"

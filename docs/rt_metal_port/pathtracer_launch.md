@@ -63,15 +63,15 @@ and tier-2 argument buffers) mark them resident with `useResources`. With
 Metal residency sets enabled, acceleration structures are already tracked
 globally and no per-dispatch call is issued.
 
-### Debug backend toggle
+### Runtime exposure
 
-`rendering/pathtracer/metal_ray_query_backend` (default **off**, restart
-required) lets the Metal driver report `SUPPORTS_RAY_QUERY` on capable
-devices. `SUPPORTS_RAYTRACING_PIPELINE` stays false, so the scene-side path
-tracer (`RenderForwardClustered::_setup_rt`) remains disabled; nothing changes
-for the editor until the C11 gating/fallback work flips the integration
-deliberately. The toggle exists so the RD-level trace path can be exercised
-end-to-end while that lands.
+C11 replaced the default-off debug exposure with the capability gate documented
+in [`runtime_gating.md`](runtime_gating.md).
+`rendering/pathtracer/metal_ray_query_backend` now defaults on, but the Metal
+driver reports `SUPPORTS_RAY_QUERY` only when every compute-lane and bindless
+requirement is available. `SUPPORTS_RAYTRACING_PIPELINE` stays false, so the
+scene-side path tracer (`RenderForwardClustered::_setup_rt`) remains disabled
+until its five-stage shader bundle is re-expressed for the compute lane.
 
 ### Bindless material-access foundation
 
@@ -137,13 +137,14 @@ MetalRT C10 path-tracer launch: device="..." image=8x8 spp=2 bounces=2 instances
 
 The engine's `SceneShaderRaytracing` still authors the five RT-pipeline stages
 and cannot compile them on Metal. Feeding real editor scenes through the C10
-trace path requires, in C11 or a dedicated follow-up:
+trace path requires a dedicated follow-up:
 
 1. a compute re-expression of `scene_raytracing_raygen.glsl` (HG0/standard
    material first) compiled as the compute-lane raygen when the driver lacks
    native RT stages, consuming the now-validated Metal bindless and
    buffer-device-address material-access lane;
 2. custom hit groups (HG1+): per-material inlined variants or a
-   visible-function dispatch design;
-3. the C11 runtime gate replacing the debug toggle, with graceful fallback and
-   the unsupported-configuration log contract.
+   visible-function dispatch design.
+
+The C11 runtime gate and fallback are complete; see
+[`runtime_gating.md`](runtime_gating.md).

@@ -3252,6 +3252,10 @@
 			Number of frames a skinned or vertex-displaced deformed-mesh BLAS is kept alive in the path tracer cache after its last visible frame. Once this threshold is exceeded the BLAS and its associated buffers are freed. Increase this value if deformed meshes flicker back into view after brief occlusion; decrease it to reclaim GPU memory sooner.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
+		<member name="rendering/pathtracer/metal_ray_query_backend" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], the Metal rendering driver exposes its native ray-query compute backend when all required device and operating-system capabilities are available. Unsupported configurations automatically continue with the non-ray-traced renderer and report the missing capabilities in the startup log. Set this to [code]false[/code] to force the non-ray-traced fallback.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
 		<member name="rendering/pathtracer/multimesh_blas_cache_ttl_frames" type="int" setter="" getter="" default="3600">
 			Number of frames a merged MultiMesh BLAS is kept alive in the path tracer cache after its last visible frame. At 60 fps, the default of 3600 corresponds to approximately one minute. Once this threshold is exceeded the BLAS and all merged vertex, attribute, and index buffers are freed. Decrease this value to reclaim GPU memory when MultiMeshes disappear from the scene.
 			[b]Note:[/b] Requires a restart to take effect.

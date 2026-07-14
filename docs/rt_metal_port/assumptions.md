@@ -65,9 +65,11 @@ scan does not know (it caps at `apple9`,
 `metal_device_properties.cpp:109-115`), and hardware-RT presence (apple9+) has
 no dedicated query at all.
 
-*Consequence for C11:* `SUPPORTS_RAYTRACING_PIPELINE` should be derived from
-`supportsRaytracing && supportsFunctionPointers` (plus the OS floor from A4),
-never from a family comparison.
+*Resolved in C11:* `SUPPORTS_RAY_QUERY` is derived from runtime capability
+queries plus the binding-model and OS-floor checks in
+[`runtime_gating.md`](runtime_gating.md), never from a family comparison.
+`SUPPORTS_RAYTRACING_PIPELINE` remains false because Metal executes the port
+through a re-expressed compute lane rather than the engine's five RT stages.
 
 *Falsify/re-verify:* run the caps stage; the probe cross-checks queries against
 family expectations and fails loudly on divergence.
@@ -191,9 +193,10 @@ issues specific to pre-hardware-RT devices (M1 = apple7, M2 = apple8), where
 the same API runs on a software/shader-based intersector with different
 performance and potentially different edge-case behavior.
 
-*Consequence:* before declaring C11 (gating/fallback) done, at least one probe
-record and one smoke run from an apple7 or apple8 device should be collected;
-until then results generalize only to apple9+.
+*Consequence:* C11's gate and forced fallback are repeatably tested on the M5,
+but at least one probe record and smoke run from an apple7 or apple8 device
+should still be collected before claiming cross-family performance and
+edge-case coverage; current GPU results generalize only to apple9+.
 
 *Falsify/re-verify:* run the caps stage on an M1/M2 machine and diff the
 record against the M5 one.
@@ -224,10 +227,9 @@ tracer later, but no chunk C1-C12 depends on it.
   kernel; `command_trace_rays` performs the grid dispatch and the
   compatibility SBT is not consumed at trace time. Instance custom indices are
   shader-visible through Metal UserID instance descriptors (macOS 12+; within
-  the A4 floor). The backend stays behind the default-off
-  `rendering/pathtracer/metal_ray_query_backend` debug toggle until C11's
-  runtime gate. Full `SceneShaderRaytracing` scene integration is the tracked
-  remainder — see
+  the A4 floor). C11 exposes this lane through the runtime checks and graceful
+  fallback in [`runtime_gating.md`](runtime_gating.md). Full
+  `SceneShaderRaytracing` scene integration is the tracked remainder — see
   [`pathtracer_launch.md`](pathtracer_launch.md).
 
 ## Open questions (tracked, not assumed)

@@ -32,6 +32,7 @@
 
 #include "drivers/metal/metal_device_profile.h"
 #include "drivers/metal/metal_objects_shared.h"
+#include "drivers/metal/metal_rt_availability.h"
 #include "servers/rendering/rendering_device_driver.h"
 
 #include <Metal/Metal.hpp>
@@ -160,10 +161,13 @@ protected:
 
 	bool use_barriers = false;
 	MTL::ResourceOptions base_hazard_tracking = MTL::ResourceHazardTrackingModeTracked;
+	bool metal_rt_gate_evaluated = false;
+	MetalRTGateResult metal_rt_gate;
 
 	virtual Error _create_device();
 	virtual void _track_resource(MTL::Resource *p_resource);
 	virtual void _untrack_resource(MTL::Resource *p_resource);
+	bool _is_metal_rt_enabled();
 	void _check_capabilities();
 	Error _initialize(uint32_t p_device_index, uint32_t p_frame_count);
 

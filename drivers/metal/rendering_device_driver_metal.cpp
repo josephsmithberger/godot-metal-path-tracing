@@ -2974,18 +2974,49 @@ bool RenderingDeviceDriverMetal::has_feature(Features p_feature) {
 		case SUPPORTS_POINT_SIZE:
 			return true;
 		case SUPPORTS_RAY_QUERY: {
-			// C10 debug toggle (restart required). Ray-query tracing needs the
-			// device intersector plus user-ID instance descriptors (macOS 12+)
-			// so the kernel can read Godot's instance custom index. The full
-			// runtime gate with graceful fallback is C11; until then the
-			// backend stays opt-in and SUPPORTS_RAYTRACING_PIPELINE stays
-			// false, which keeps the scene-side path tracer disabled.
-			static const bool ray_query_backend_enabled = ProjectSettings::get_singleton() != nullptr && GLOBAL_GET("rendering/pathtracer/metal_ray_query_backend");
-			return ray_query_backend_enabled && device_properties->features.supports_raytracing && device_properties->features.supports_user_id_instances;
+			return _is_metal_rt_enabled();
 		}
 		default:
 			return false;
 	}
+}
+
+bool RenderingDeviceDriverMetal::_is_metal_rt_enabled() {
+	if (metal_rt_gate_evaluated) {
+		return metal_rt_gate.is_enabled();
+	}
+	metal_rt_gate_evaluated = true;
+
+	bool project_enabled = true;
+	ProjectSettings *project_settings = ProjectSettings::get_singleton();
+	if (project_settings != nullptr && project_settings->has_setting("rendering/pathtracer/metal_ray_query_backend")) {
+		project_enabled = GLOBAL_GET("rendering/pathtracer/metal_ray_query_backend");
+	}
+
+	const MetalFeatures &features = device_properties->features;
+	MetalRTGateInputs inputs;
+#if TARGET_OS_OSX && defined(__aarch64__)
+	inputs.supported_platform = true;
+#else
+	inputs.supported_platform = false;
+#endif
+	inputs.project_enabled = project_enabled;
+	inputs.force_disabled = OS::get_singleton()->get_environment("GODOT_MTL_DISABLE_RAYTRACING") == "1";
+	inputs.supports_raytracing = features.supports_raytracing;
+	inputs.supports_function_pointers = features.supports_function_pointers;
+	inputs.supports_user_id_instances = features.supports_user_id_instances;
+	inputs.supports_gpu_address = features.supports_gpu_address;
+	inputs.argument_buffers_enabled = features.argument_buffers_enabled();
+	inputs.supports_msl_2_3 = features.msl_target_version >= MSL_VERSION_23;
+	metal_rt_gate = metal_rt_evaluate_gate(inputs);
+
+	if (metal_rt_gate.is_enabled()) {
+		print_line("Metal ray tracing: enabled (compute ray-query backend; fallback renderer remains available). C11_GATE=enabled");
+	} else {
+		WARN_PRINT(vformat("Metal ray tracing: disabled (%s); using non-RT rendering fallback. C11_GATE=disabled:%s", metal_rt_gate.get_description(), metal_rt_gate.get_reason_codes()));
+	}
+
+	return metal_rt_gate.is_enabled();
 }
 
 const RDD::MultiviewCapabilities &RenderingDeviceDriverMetal::get_multiview_capabilities() {

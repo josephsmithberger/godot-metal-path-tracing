@@ -35,10 +35,70 @@ TEST_FORCE_LINK(test_metal_rt)
 #ifdef METAL_ENABLED
 
 #include "drivers/metal/metal_objects_shared.h"
+#include "drivers/metal/metal_rt_availability.h"
 
 #include <limits>
 
 namespace TestMetalRT {
+
+TEST_CASE("[MetalRT] C11 enables the complete supported capability set") {
+	MetalRTGateInputs inputs;
+	inputs.supports_raytracing = true;
+	inputs.supports_function_pointers = true;
+	inputs.supports_user_id_instances = true;
+	inputs.supports_gpu_address = true;
+	inputs.argument_buffers_enabled = true;
+	inputs.supports_msl_2_3 = true;
+
+	MetalRTGateResult result = metal_rt_evaluate_gate(inputs);
+	CHECK(result.is_enabled());
+	CHECK(result.blockers == METAL_RT_BLOCKER_NONE);
+	CHECK(result.get_reason_codes().is_empty());
+	CHECK(result.get_description().is_empty());
+}
+
+TEST_CASE("[MetalRT] C11 reports every unsupported capability") {
+	MetalRTGateInputs inputs;
+	MetalRTGateResult result = metal_rt_evaluate_gate(inputs);
+
+	CHECK_FALSE(result.is_enabled());
+	CHECK(result.blockers == (METAL_RT_BLOCKER_RAYTRACING | METAL_RT_BLOCKER_FUNCTION_POINTERS | METAL_RT_BLOCKER_USER_ID_INSTANCES | METAL_RT_BLOCKER_GPU_ADDRESS | METAL_RT_BLOCKER_ARGUMENT_BUFFERS | METAL_RT_BLOCKER_MSL_2_3));
+	CHECK(result.get_reason_codes() == "missing_raytracing,missing_function_pointers,missing_user_id_instances,missing_gpu_address,missing_argument_buffers,missing_msl_2_3");
+	CHECK(result.get_description().contains("supportsRaytracing"));
+	CHECK(result.get_description().contains("GPU buffer addresses"));
+	CHECK(result.get_description().contains("2.3"));
+}
+
+TEST_CASE("[MetalRT] C11 explicit opt-outs force the non-RT fallback") {
+	MetalRTGateInputs inputs;
+	inputs.supports_raytracing = true;
+	inputs.supports_function_pointers = true;
+	inputs.supports_user_id_instances = true;
+	inputs.supports_gpu_address = true;
+	inputs.argument_buffers_enabled = true;
+	inputs.supports_msl_2_3 = true;
+
+	inputs.force_disabled = true;
+	MetalRTGateResult forced = metal_rt_evaluate_gate(inputs);
+	CHECK_FALSE(forced.is_enabled());
+	CHECK(forced.blockers == METAL_RT_BLOCKER_FORCED_DISABLED);
+	CHECK(forced.get_reason_codes() == "forced_disabled");
+	CHECK(forced.get_description() == "GODOT_MTL_DISABLE_RAYTRACING=1");
+
+	inputs.force_disabled = false;
+	inputs.project_enabled = false;
+	MetalRTGateResult project = metal_rt_evaluate_gate(inputs);
+	CHECK_FALSE(project.is_enabled());
+	CHECK(project.blockers == METAL_RT_BLOCKER_PROJECT_DISABLED);
+	CHECK(project.get_reason_codes() == "project_disabled");
+
+	inputs.project_enabled = true;
+	inputs.supported_platform = false;
+	MetalRTGateResult platform = metal_rt_evaluate_gate(inputs);
+	CHECK_FALSE(platform.is_enabled());
+	CHECK(platform.blockers == METAL_RT_BLOCKER_UNSUPPORTED_PLATFORM);
+	CHECK(platform.get_reason_codes() == "unsupported_platform");
+}
 
 TEST_CASE("[MetalRT] Acceleration structure metadata maps flags and scratch sizes") {
 	MTL::AccelerationStructureSizes sizes = {};

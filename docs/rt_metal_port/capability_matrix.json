@@ -40,11 +40,10 @@
   },
   "runtime_gates_current": {
     "has_feature": {
-      "value": "SUPPORTS_RAY_QUERY and SUPPORTS_RAYTRACING_PIPELINE both report false on Metal",
-      "evidence": "drivers/metal/rendering_device_driver_metal.cpp:2678-2701 (default: return false).",
-      "planned_replacement": "C11: report SUPPORTS_RAYTRACING_PIPELINE when supportsRaytracing && supportsFunctionPointers and the implemented path's OS floor is met (see rt_gating_expression below)."
+      "value": "SUPPORTS_RAY_QUERY reports the C11 compute-lane gate result; SUPPORTS_RAYTRACING_PIPELINE remains false until SceneShaderRaytracing is re-expressed for Metal",
+      "evidence": "drivers/metal/rendering_device_driver_metal.cpp (_is_metal_rt_enabled and has_feature); docs/rt_metal_port/runtime_gating.md"
     },
-    "rt_gating_expression": "device.supportsRaytracing && device.supportsFunctionPointers && argument_buffers_supported() [pending C7 audit, assumption A4]"
+    "rt_gating_expression": "macOS arm64 && project setting enabled && GODOT_MTL_DISABLE_RAYTRACING != 1 && supportsRaytracing && supportsFunctionPointers && supports_user_id_instances && supports_gpu_address && argument_buffers_enabled() && msl_target_version >= 2.3"
   },
   "gpu_family_expectations": {
     "apple6": "A13 Bionic. First family listing ray tracing (compute + render) and function pointers in Apple's feature tables. Baseline RT lane.",
