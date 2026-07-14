@@ -374,7 +374,7 @@ void SceneShaderRaytracing::invalidate_pipeline_bundles() {
 				RD::get_singleton()->free_rid(rid);
 			}
 		}
-		if (!compute_scene_lane && b.base_shader.is_valid()) {
+		if (b.owns_base_shader && b.base_shader.is_valid()) {
 			RD::get_singleton()->free_rid(b.base_shader);
 		}
 	}
@@ -515,6 +515,9 @@ uint32_t SceneShaderRaytracing::_register_slot(uint32_t /*p_shader_id*/, RID p_m
 	CustomShaderEntry entry;
 	entry.is_procedural = p_is_procedural;
 	if (!_preprocess_shader(p_material, p_is_procedural, entry)) {
+		if (compute_scene_lane) {
+			compute_variant_failure_count++;
+		}
 		// Failed slot still occupies an index so hash lookups stay stable.
 		HitGroupSlot failed_slot;
 		failed_slot.source_hash = hash;
@@ -526,7 +529,8 @@ uint32_t SceneShaderRaytracing::_register_slot(uint32_t /*p_shader_id*/, RID p_m
 			_bundle_resize_for_slots(kv.value);
 			kv.value.per_hg_states[failed_index] = HGState::Failed;
 		}
-		return 0;
+		WARN_PRINT(vformat("RT: custom material source could not be translated; material slot %d will be excluded from path tracing until its shader changes.", failed_index));
+		return failed_index;
 	}
 	// Empty custom HG source uses slot 0 (default).
 	if (!p_is_procedural && entry.fragment_code.is_empty() && entry.vertex_code.is_empty()) {
@@ -543,6 +547,7 @@ uint32_t SceneShaderRaytracing::_register_slot(uint32_t /*p_shader_id*/, RID p_m
 	uint32_t slot_index = (uint32_t)hit_group_slots.size();
 	hit_group_slots.push_back(slot);
 	source_hash_to_slot.insert(hash, slot_index);
+	material_generation++;
 
 	for (KeyValue<uint32_t, PipelineBundle> &kv : pipeline_bundles) {
 		PipelineBundle &bundle = kv.value;
@@ -596,11 +601,26 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 	r_entry.uniform_offsets = gen_code.uniform_offsets;
 	r_entry.uniforms = uniform_sink;
 	_finalize_uniforms_with_textures(r_entry, gen_code, uniform_sink, /*strip_intersection_globals=*/p_is_procedural);
+	if (compute_scene_lane && !p_is_procedural && !r_entry.fragment_globals.strip_edges().is_empty()) {
+		WARN_PRINT("RT: Metal material dispatch does not support stage-global custom helper functions. Inline the helper in fragment(), or guard it out of the RT shader path; the surface will be excluded until the shader source changes.");
+		return false;
+	}
 	return true;
 }
 
 void SceneShaderRaytracing::finalize_custom_shaders() {
 	if (compute_scene_lane) {
+		// Metal's ray-query lane is a monolithic compute kernel. Material source
+		// changes therefore rebuild the generated/inlined switch synchronously at
+		// the frame boundary, then atomically swap the deferred-safe RIDs.
+		for (KeyValue<uint32_t, PipelineBundle> &kv : pipeline_bundles) {
+			if (!kv.value.dirty || !kv.value.initial_pipeline_built) {
+				continue;
+			}
+			if (_build_compute_bundle(kv.key, kv.value)) {
+				kv.value.dirty = false;
+			}
+		}
 		return;
 	}
 	async_compilation_enabled = GLOBAL_GET_CACHED(bool, "rendering/pathtracer/async_shader_compilation");
@@ -807,10 +827,14 @@ void SceneShaderRaytracing::_bundle_resize_for_slots(PipelineBundle &r_bundle) {
 
 const SceneShaderRaytracing::PipelineBundle &SceneShaderRaytracing::ensure_pipeline_bundle(uint32_t p_rt_flags) {
 	static PipelineBundle EMPTY_BUNDLE;
-	p_rt_flags = sanitize_rt_flags(p_rt_flags);
+	const ComputeMaterialVariantKey requested_key = make_compute_material_variant_key(p_rt_flags, material_generation);
+	p_rt_flags = compute_scene_lane ? requested_key.rt_flags : p_rt_flags;
 
 	HashMap<uint32_t, PipelineBundle>::Iterator it = pipeline_bundles.find(p_rt_flags);
 	if (it != pipeline_bundles.end() && it->value.initial_pipeline_built) {
+		if (compute_scene_lane && !it->value.dirty && it->value.material_generation == requested_key.material_generation) {
+			compute_variant_cache_hit_count++;
+		}
 		return it->value;
 	}
 
@@ -844,7 +868,260 @@ const SceneShaderRaytracing::PipelineBundle &SceneShaderRaytracing::ensure_pipel
 	return bundle;
 }
 
+void SceneShaderRaytracing::_replace_identifier(String &r_source, const String &p_identifier, const String &p_replacement) {
+	if (p_identifier.is_empty()) {
+		return;
+	}
+	auto is_identifier_char = [](char32_t p_char) {
+		return (p_char >= 'a' && p_char <= 'z') || (p_char >= 'A' && p_char <= 'Z') ||
+				(p_char >= '0' && p_char <= '9') || p_char == '_';
+	};
+	int from = 0;
+	while (true) {
+		int pos = r_source.find(p_identifier, from);
+		if (pos < 0) {
+			break;
+		}
+		int end = pos + p_identifier.length();
+		bool left_ok = pos == 0 || !is_identifier_char(r_source[pos - 1]);
+		bool right_ok = end == r_source.length() || !is_identifier_char(r_source[end]);
+		if (left_ok && right_ok) {
+			r_source = r_source.substr(0, pos) + p_replacement + r_source.substr(end);
+			from = pos + p_replacement.length();
+		} else {
+			from = end;
+		}
+	}
+}
+
+String SceneShaderRaytracing::_build_compute_material_function(uint32_t p_slot_index, const CustomShaderEntry &p_entry) const {
+	// Stage-global helper functions need symbol namespacing before several
+	// unrelated materials can coexist in one monolithic compute kernel. Reject
+	// that uncommon form deterministically for C15; direct vertex/fragment code,
+	// uniforms, and textures remain supported.
+	if (!p_entry.fragment_globals.strip_edges().is_empty()) {
+		return String();
+	}
+
+	String vertex_code = p_entry.vertex_code;
+	String fragment_code = p_entry.fragment_code;
+	for (int ti = 0; ti < p_entry.texture_uniforms.size(); ti++) {
+		const TextureUniformInfo &tui = p_entry.texture_uniforms[ti];
+		String identifier = "m_" + tui.name;
+		String replacement = "bindless_textures[nonuniformEXT(material." + identifier + ")]";
+		_replace_identifier(vertex_code, identifier, replacement);
+		_replace_identifier(fragment_code, identifier, replacement);
+	}
+
+	const String suffix = itos(p_slot_index);
+	String source;
+	source += "MaterialResult evaluate_custom_" + suffix + "(ComputeHit hit, ComputeHitData hit_data, vec3 ray_direction) {\n";
+	source += "\tMaterialData rt_mat = materials[hit.geometry_idx];\n";
+	if (p_entry.uniform_total_size > 0) {
+		source += "\tRTCustomMaterialUniforms_" + suffix + " material = RTCustomMaterialUniforms_" + suffix + "(rt_mat.uniform_address);\n";
+	}
+	source += "\tmat4 read_model_matrix = hit.object_to_world;\n";
+	source += "\tmat4 read_view_matrix = transpose(mat4(scene_data_block.data.view_matrix[0], scene_data_block.data.view_matrix[1], scene_data_block.data.view_matrix[2], vec4(0.0, 0.0, 0.0, 1.0)));\n";
+	source += "\tmat4 inv_view_matrix = transpose(mat4(scene_data_block.data.inv_view_matrix[0], scene_data_block.data.inv_view_matrix[1], scene_data_block.data.inv_view_matrix[2], vec4(0.0, 0.0, 0.0, 1.0)));\n";
+	source += "\tmat4 projection_matrix = scene_data_block.data.projection_matrix;\n";
+	source += "\tmat4 inv_projection_matrix = scene_data_block.data.inv_projection_matrix;\n";
+	source += "\tmat3 model_normal_matrix = mat3(read_model_matrix);\n";
+	source += "\tfloat global_time = scene_data_block.data.time;\n";
+	source += "\tfloat global_prev_time = scene_data_block.prev_data.time;\n";
+	source += "\tvec2 read_viewport_size = scene_data_block.data.viewport_size;\n";
+	source += "\tvec3 vertex = (hit.world_to_object * vec4(hit_data.hit_pos, 1.0)).xyz;\n";
+	source += "\tvec3 normal = hit_data.geometry_normal;\n";
+	source += "\tvec3 tangent = hit_data.tangent;\n";
+	source += "\tvec3 binormal = hit_data.bitangent;\n";
+	source += "\tvec2 uv_interp = hit_data.uv;\n";
+	source += "\tvec2 uv2_interp = hit_data.uv;\n";
+	source += "\tvec4 color_interp = hit_data.color;\n";
+	source += "\tvec3 view = -ray_direction;\n";
+	source += "\tbool rt_front_facing = hit.front_face;\n";
+	source += "\tvec2 rt_screen_uv = vec2(gl_GlobalInvocationID.xy) / vec2(imageSize(image));\n";
+	source += "\tvec4 rt_frag_coord = vec4(gl_GlobalInvocationID.xy, 0.0, 1.0);\n";
+	source += "\tvec4 position = vec4(0.0);\n";
+	source += "\tfloat rt_point_size = 1.0;\n";
+	source += "\tuint rt_instance_id = hit.geometry_idx;\n";
+	source += "\tuint rt_vertex_id = 0u;\n";
+	source += "\tvec4 instance_custom = vec4(0.0);\n";
+	source += "\tuvec4 bone_attrib = uvec4(0u);\n";
+	source += "\tvec4 weight_attrib = vec4(0.0);\n";
+	source += "\tvec4 custom0_attrib = vec4(0.0);\n";
+	source += "\tvec4 custom1_attrib = vec4(0.0);\n";
+	source += "\tvec4 custom2_attrib = vec4(0.0);\n";
+	source += "\tvec4 custom3_attrib = vec4(0.0);\n";
+	if (!vertex_code.is_empty()) {
+		source += "\t{\n" + vertex_code + "\n\t}\n";
+	}
+	source += "\tmat3 rt_view_rotation = mat3(read_view_matrix);\n";
+	source += "\tnormal = normalize(rt_view_rotation * normal);\n";
+	source += "\ttangent = normalize(rt_view_rotation * tangent);\n";
+	source += "\tbinormal = normalize(rt_view_rotation * binormal);\n";
+	source += "\tvec3 albedo = vec3(1.0);\n";
+	source += "\tfloat alpha = 1.0;\n";
+	source += "\tfloat metallic = 0.0;\n";
+	source += "\tfloat roughness = 0.5;\n";
+	source += "\tfloat specular = 0.5;\n";
+	source += "\tvec3 emission = vec3(0.0);\n";
+	source += "\tvec3 normal_map = vec3(0.5, 0.5, 1.0);\n";
+	source += "\tfloat normal_map_depth = 1.0;\n";
+	source += "\tfloat ao = 1.0;\n";
+	source += "\tfloat ao_light_affect = 0.0;\n";
+	source += "\tvec3 backlight = vec3(0.0);\n";
+	source += "\tfloat sss_strength = 0.0;\n";
+	source += "\tfloat rim = 0.0;\n";
+	source += "\tfloat rim_tint = 0.0;\n";
+	source += "\tfloat clearcoat = 0.0;\n";
+	source += "\tfloat clearcoat_roughness = 0.0;\n";
+	source += "\tfloat anisotropy = 0.0;\n";
+	source += "\tvec2 anisotropy_flow = vec2(1.0, 0.0);\n";
+	source += "\tfloat alpha_scissor_threshold = 0.0;\n";
+	source += "\tfloat alpha_hash_scale = 1.0;\n";
+	source += "\tfloat alpha_antialiasing_edge = 0.0;\n";
+	source += "\tvec2 alpha_texture_coordinate = vec2(0.0);\n";
+	source += "\tfloat premul_alpha = 1.0;\n";
+	source += "\tvec3 light_vertex = vec3(0.0);\n";
+	source += "\tvec4 fog = vec4(0.0);\n";
+	source += "\tvec4 custom_radiance = vec4(0.0);\n";
+	source += "\tvec4 custom_irradiance = vec4(0.0);\n";
+	source += "\t{\n" + fragment_code + "\n\t}\n";
+	source += "\tMaterialResult result;\n";
+	source += "\tresult.albedo = albedo;\n";
+	source += "\tresult.alpha = alpha;\n";
+	source += "\tresult.alpha_scissor_threshold = alpha_scissor_threshold;\n";
+	source += "\tresult.roughness = clamp(roughness, 0.0, 1.0);\n";
+	source += "\tresult.metalness = clamp(metallic, 0.0, 1.0);\n";
+	source += "\tresult.specular = clamp(specular, 0.0, 1.0);\n";
+	source += "\tresult.emissive = emission * scene_data_block.data.emissive_exposure_normalization;\n";
+	source += "\tresult.normal = normalize(mat3(inv_view_matrix) * normal);\n";
+	source += "\tif (normal_map != vec3(0.5, 0.5, 1.0)) {\n";
+	source += "\t\tvec3 ts_normal;\n";
+	source += "\t\tts_normal.xy = normal_map.xy * 2.0 - 1.0;\n";
+	source += "\t\tts_normal.z = sqrt(max(0.0, 1.0 - dot(ts_normal.xy, ts_normal.xy)));\n";
+	source += "\t\tvec3 mapped = hit_data.tangent * ts_normal.x + hit_data.bitangent * ts_normal.y + hit_data.geometry_normal * ts_normal.z;\n";
+	source += "\t\tresult.normal = normalize(mix(hit_data.geometry_normal, mapped, normal_map_depth));\n";
+	source += "\t}\n";
+	source += "\treturn result;\n";
+	source += "}\n";
+	return source;
+}
+
+String SceneShaderRaytracing::_build_compute_material_source(const LocalVector<uint8_t> &p_active_slots) {
+	Vector<String> sources = compute_shader.version_build_variant_stage_sources(compute_shader_version, 0);
+	if (sources.size() <= RD::SHADER_STAGE_COMPUTE || sources[RD::SHADER_STAGE_COMPUTE].is_empty()) {
+		return String();
+	}
+
+	String types;
+	String functions;
+	String cases;
+	for (uint32_t i = 1; i < p_active_slots.size() && i < hit_group_slots.size(); i++) {
+		if (!p_active_slots[i]) {
+			continue;
+		}
+		const CustomShaderEntry &entry = hit_group_slots[i].entry;
+		String members = entry.uniform_members.is_empty() ? String("float _rt_pad;") : entry.uniform_members;
+		types += "layout(buffer_reference, std140) readonly buffer RTCustomMaterialUniforms_" + itos(i) + " {\n" + members + "\n};\n";
+		String function = _build_compute_material_function(i, entry);
+		if (function.is_empty()) {
+			return String();
+		}
+		functions += function;
+		cases += "case " + itos(i) + "u: return evaluate_custom_" + itos(i) + "(hit, hit_data, ray_direction);\n";
+	}
+
+	String source = sources[RD::SHADER_STAGE_COMPUTE];
+	source = source.replace("/* RT_COMPUTE_CUSTOM_TYPES */", types);
+	source = source.replace("/* RT_COMPUTE_CUSTOM_FUNCTIONS */", functions);
+	source = source.replace("/* RT_COMPUTE_CUSTOM_CASES */", cases);
+	return source;
+}
+
+RID SceneShaderRaytracing::_compile_compute_material_variant(const LocalVector<uint8_t> &p_active_slots, String &r_error) {
+	String source = _build_compute_material_source(p_active_slots);
+	if (source.is_empty()) {
+		r_error = "custom shader uses unsupported stage-global helpers or the compute template is unavailable";
+		return RID();
+	}
+	Vector<uint8_t> spirv;
+	{
+		MutexLock lock(spirv_compile_mutex);
+		spirv = RD::get_singleton()->shader_compile_spirv_from_source(
+				RD::SHADER_STAGE_COMPUTE, source, RD::SHADER_LANGUAGE_GLSL, &r_error);
+	}
+	if (spirv.is_empty()) {
+		_dump_failed_shader(source, "metal_compute_material_variant");
+		return RID();
+	}
+	RD::ShaderStageSPIRVData stage;
+	stage.shader_stage = RD::SHADER_STAGE_COMPUTE;
+	stage.spirv = spirv;
+	Vector<RD::ShaderStageSPIRVData> stages;
+	stages.push_back(stage);
+	Vector<uint8_t> binary = RD::get_singleton()->shader_compile_binary_from_spirv(stages, "RT_Metal_material_variant");
+	if (binary.is_empty()) {
+		r_error = "failed to lower the generated material variant";
+		return RID();
+	}
+	return RD::get_singleton()->shader_create_from_bytecode(binary);
+}
+
 bool SceneShaderRaytracing::_build_compute_bundle(uint32_t p_rt_flags, PipelineBundle &r_bundle) {
+	_bundle_resize_for_slots(r_bundle);
+	const uint32_t previous_material_generation = r_bundle.material_generation;
+	const uint32_t slot_count = hit_group_slots.size();
+	LocalVector<uint8_t> active_slots;
+	active_slots.resize(slot_count);
+	for (uint32_t i = 0; i < slot_count; i++) {
+		active_slots[i] = i < r_bundle.live_ready_mask.size() && r_bundle.live_ready_mask[i] ? 1 : 0;
+	}
+	if (slot_count > 0) {
+		active_slots[0] = 1;
+	}
+
+	RID selected_shader = r_bundle.base_shader;
+	bool selected_shader_owned = r_bundle.owns_base_shader;
+	LocalVector<HGState> staged_states(r_bundle.per_hg_states);
+	bool accepted_new_slot = false;
+	for (uint32_t i = 1; i < slot_count; i++) {
+		if (staged_states[i] == HGState::Ready || staged_states[i] == HGState::Failed ||
+				hit_group_slots[i].state != HGState::Ready) {
+			continue;
+		}
+		if (hit_group_slots[i].entry.is_procedural) {
+			staged_states[i] = HGState::Failed;
+			continue;
+		}
+
+		LocalVector<uint8_t> trial_slots(active_slots);
+		trial_slots[i] = 1;
+		String compile_error;
+		compute_variant_compile_count++;
+		RID trial_shader = _compile_compute_material_variant(trial_slots, compile_error);
+		if (!trial_shader.is_valid()) {
+			compute_variant_failure_count++;
+			staged_states[i] = HGState::Failed;
+			WARN_PRINT(vformat("RT: Metal material slot %d was excluded because its generated compute variant failed: %s. Edit the shader to create a new cache key and retry.", i, compile_error));
+			continue;
+		}
+
+		if (selected_shader_owned && selected_shader != r_bundle.base_shader) {
+			RD::get_singleton()->free_rid(selected_shader);
+		}
+		selected_shader = trial_shader;
+		selected_shader_owned = true;
+		active_slots = trial_slots;
+		staged_states[i] = HGState::Ready;
+		accepted_new_slot = true;
+	}
+
+	if (r_bundle.initial_pipeline_built && !accepted_new_slot) {
+		r_bundle.per_hg_states = staged_states;
+		r_bundle.material_generation = material_generation;
+		return true;
+	}
+
 	Vector<RD::PipelineSpecializationConstant> spec_constants;
 	RD::PipelineSpecializationConstant sc;
 	sc.constant_id = 0;
@@ -852,46 +1129,89 @@ bool SceneShaderRaytracing::_build_compute_bundle(uint32_t p_rt_flags, PipelineB
 	sc.int_value = (int)p_rt_flags;
 	spec_constants.push_back(sc);
 
-	RD::PipelineShader compute_raygen = { r_bundle.base_shader, spec_constants };
+	RD::PipelineShader compute_raygen = { selected_shader, spec_constants };
 	const RD::HitGroup empty_hit_group;
 	LocalVector<RD::HitGroup> hit_groups;
-	// Slot zero is the HG0 compatibility record; slot one is the sentinel used
-	// for unsupported/custom content. Hit execution is inlined in the kernel.
-	hit_groups.push_back(empty_hit_group);
-	hit_groups.push_back(empty_hit_group);
+	// Compute hit execution is inlined. Keep one empty record per material slot
+	// plus a sentinel so TLAS/SBT identity remains stable across both routes.
+	hit_groups.resize(slot_count + 1);
+	for (uint32_t i = 0; i < hit_groups.size(); i++) {
+		hit_groups[i] = empty_hit_group;
+	}
 
 	RID pipeline = RD::get_singleton()->raytracing_pipeline_create(
 			{ &compute_raygen, 1 }, {}, { hit_groups.ptr(), (uint64_t)hit_groups.size() }, 1);
 	if (!pipeline.is_valid()) {
-		WARN_PRINT(vformat("RT: Metal HG0 compute pipeline creation failed for variant 0x%x.", p_rt_flags));
+		if (selected_shader_owned && selected_shader != r_bundle.base_shader) {
+			RD::get_singleton()->free_rid(selected_shader);
+		}
+		WARN_PRINT(vformat("RT: Metal material compute pipeline creation failed for variant 0x%x.", p_rt_flags));
 		return false;
 	}
-	RD::get_singleton()->set_resource_name(pipeline, String("RT Metal HG0 Compute [flags=") + itos(p_rt_flags) + "]");
+	RD::get_singleton()->set_resource_name(pipeline, String("RT Metal Material Compute [flags=") + itos(p_rt_flags) + ", generation=" + itos(material_generation) + "]");
 
 	static constexpr uint32_t HIT_SBT_CAPACITY = 4096;
-	RID hit_sbt = RD::get_singleton()->hit_sbt_create(pipeline, HIT_SBT_CAPACITY);
+	uint32_t sbt_size = MAX(HIT_SBT_CAPACITY, slot_count + 1);
+	RID hit_sbt = RD::get_singleton()->hit_sbt_create(pipeline, sbt_size);
 	if (!hit_sbt.is_valid()) {
 		RD::get_singleton()->free_rid(pipeline);
+		if (selected_shader_owned && selected_shader != r_bundle.base_shader) {
+			RD::get_singleton()->free_rid(selected_shader);
+		}
 		return false;
 	}
-	RD::HitShaderBindingTableRange range = RD::get_singleton()->hit_sbt_range_alloc(hit_sbt, HIT_SBT_CAPACITY);
+	RD::HitShaderBindingTableRange range = RD::get_singleton()->hit_sbt_range_alloc(hit_sbt, sbt_size);
 	if (!range) {
 		RD::get_singleton()->free_rid(hit_sbt);
 		RD::get_singleton()->free_rid(pipeline);
+		if (selected_shader_owned && selected_shader != r_bundle.base_shader) {
+			RD::get_singleton()->free_rid(selected_shader);
+		}
 		return false;
 	}
 	LocalVector<uint32_t> indices;
-	indices.resize(HIT_SBT_CAPACITY);
-	for (uint32_t i = 0; i < HIT_SBT_CAPACITY; i++) {
-		indices[i] = 0;
+	indices.resize(sbt_size);
+	for (uint32_t i = 0; i < sbt_size; i++) {
+		indices[i] = i < slot_count ? i : slot_count;
 	}
 	RD::get_singleton()->hit_sbt_range_update(hit_sbt, range, 0, indices);
 
+	if (r_bundle.hit_sbt.is_valid()) {
+		RD::get_singleton()->free_rid(r_bundle.hit_sbt);
+	}
+	if (r_bundle.pipeline.is_valid()) {
+		RD::get_singleton()->free_rid(r_bundle.pipeline);
+	}
+	if (r_bundle.owns_base_shader && r_bundle.base_shader.is_valid() && r_bundle.base_shader != selected_shader) {
+		RD::get_singleton()->free_rid(r_bundle.base_shader);
+	}
 	r_bundle.pipeline = pipeline;
 	r_bundle.hit_sbt = hit_sbt;
-	r_bundle.live_hg_count = 1;
-	r_bundle.live_ready_mask.clear();
-	r_bundle.live_ready_mask.push_back(true);
+	r_bundle.base_shader = selected_shader;
+	r_bundle.owns_base_shader = selected_shader_owned;
+	r_bundle.per_hg_states = staged_states;
+	r_bundle.live_hg_count = slot_count;
+	r_bundle.live_ready_mask.resize(slot_count);
+	for (uint32_t i = 0; i < slot_count; i++) {
+		r_bundle.live_ready_mask[i] = active_slots[i] != 0;
+	}
+	r_bundle.material_generation = material_generation;
+	if (accepted_new_slot) {
+		uint32_t active_custom_count = 0;
+		for (uint32_t i = 1; i < active_slots.size(); i++) {
+			active_custom_count += active_slots[i] != 0 ? 1 : 0;
+		}
+		print_line(vformat("Metal RT material variant: status=compiled flags=0x%x generation=%d active_custom=%d compiles=%d failures=%d cache_hits=%d",
+				p_rt_flags, material_generation, active_custom_count, compute_variant_compile_count,
+				compute_variant_failure_count, compute_variant_cache_hit_count));
+		if (previous_material_generation > 0 && material_generation > previous_material_generation) {
+			static bool reload_marker_printed = false;
+			if (!reload_marker_printed) {
+				print_line("METAL_RT_CUSTOM_SHADER_RELOAD=passed");
+				reload_marker_printed = true;
+			}
+		}
+	}
 	return true;
 }
 

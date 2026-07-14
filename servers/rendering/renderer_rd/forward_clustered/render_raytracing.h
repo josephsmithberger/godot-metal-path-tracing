@@ -94,7 +94,7 @@ struct RT_InstanceMotionData {
 };
 static_assert(sizeof(RT_InstanceMotionData) == 48, "RT_InstanceMotionData must be 48 bytes");
 
-// Must match GLSL MaterialData (std430, 96 bytes).
+// Must match GLSL MaterialData (std430, 112 bytes).
 struct alignas(16) RT_MaterialData {
 	uint32_t albedo_texture_idx;
 	uint32_t normal_texture_idx;
@@ -112,8 +112,12 @@ struct alignas(16) RT_MaterialData {
 	float normal_map_depth; // Strength [0..N], default 1.0 (not Z-depth).
 	float specular; // Dielectric specular [0..1], default 0.5 -> F0 = 0.04.
 	uint64_t uniform_address; // BDA for custom shader uniform buffer (0 = none).
+	float alpha_scissor_threshold;
+	uint32_t dispatch_index; // Generated/inlined material function; 0 is HG0.
+	uint32_t material_id; // Stable RID identity for debug capture within a run.
+	uint32_t _material_pad;
 };
-static_assert(sizeof(RT_MaterialData) == 96, "RT_MaterialData must be 96 bytes for std430");
+static_assert(sizeof(RT_MaterialData) == 112, "RT_MaterialData must be 112 bytes for std430");
 
 // Light types for raytracing (matches GLSL RT_LIGHT_TYPE_* defines).
 enum RTLightType : uint32_t {
@@ -159,7 +163,17 @@ enum {
 	RT_MAT_FLAG_HAS_NORMAL_MAP = 1u,
 	RT_MAT_FLAG_HAS_EMISSION_TEX = 2u,
 	RT_MAT_FLAG_POINT_FILTER = 4u,
+	RT_MAT_FLAG_ALPHA_SCISSOR = 8u,
+	RT_MAT_FLAG_CUSTOM_SHADER = 16u,
 };
+
+_FORCE_INLINE_ bool rt_material_cache_needs_refresh(bool p_has_data, uint32_t p_cached_rid_version, uint16_t p_cached_counter, uint32_t p_rid_version, uint16_t p_counter) {
+	return !p_has_data || p_cached_rid_version != p_rid_version || p_cached_counter != p_counter;
+}
+
+_FORCE_INLINE_ bool rt_material_buffer_write_fits(uint32_t p_offset, uint32_t p_size, uint32_t p_total_size) {
+	return p_offset <= p_total_size && p_size <= p_total_size - p_offset;
+}
 
 // Index format for RT geometry (matches GLSL fetch_indices).
 enum {

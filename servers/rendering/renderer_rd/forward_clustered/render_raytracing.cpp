@@ -1345,6 +1345,9 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		s_default_mat.data.uv1_scale[1] = 1.0f;
 		s_default_mat.data.uv1_offset[0] = 0.0f;
 		s_default_mat.data.uv1_offset[1] = 0.0f;
+		s_default_mat.data.alpha_scissor_threshold = 0.0f;
+		s_default_mat.data.dispatch_index = 0;
+		s_default_mat.data.material_id = 0;
 		s_default_mat_initialized = true;
 	}
 
@@ -1358,9 +1361,8 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	RTMaterialCacheEntry *entry = get_material_cache_entry(mat_idx);
 
 	uint32_t current_frame = RSG::rasterizer->get_frame_number();
-	bool needs_refresh = !entry->ptr ||
-			entry->cached_rid_version != mat_version ||
-			entry->cached_counter != p_material_invalidation_counter;
+	bool needs_refresh = rt_material_cache_needs_refresh(entry->ptr != nullptr,
+			entry->cached_rid_version, entry->cached_counter, mat_version, p_material_invalidation_counter);
 
 	if (!needs_refresh) {
 		entry->last_used_frame = current_frame;
@@ -1411,6 +1413,10 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	mat.uv1_offset[1] = 0.0f;
 	mat.normal_map_depth = 1.0f;
 	mat.uniform_address = 0;
+	mat.alpha_scissor_threshold = 0.0f;
+	mat.dispatch_index = 0;
+	mat.material_id = mat_idx;
+	mat._material_pad = 0;
 
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
@@ -1484,6 +1490,8 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		mat_data->is_custom_shader = true;
 		uint32_t shader_id = material_storage->material_get_shader_id(p_material_rid);
 		mat_data->rt_sbt_offset = SceneShaderRaytracing::get_singleton()->register_custom_shader(shader_id, p_material_rid);
+		mat.dispatch_index = mat_data->rt_sbt_offset;
+		mat.flags |= RT_MAT_FLAG_CUSTOM_SHADER;
 
 		const SceneShaderRaytracing::CustomShaderEntry *cse =
 				SceneShaderRaytracing::get_singleton()->get_custom_shader_entry(mat_data->rt_sbt_offset);
@@ -1503,7 +1511,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 
 				uint32_t offset = cse->uniform_offsets[u.order];
 				uint32_t size = ShaderLanguage::get_datatype_size(u.type);
-				if (offset + size > cse->uniform_total_size) {
+				if (!rt_material_buffer_write_fits(offset, size, cse->uniform_total_size)) {
 					continue;
 				}
 
@@ -1570,16 +1578,19 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 					}
 				}
 
-				if (tui.buffer_offset + 4 <= cse->uniform_total_size) {
+				if (rt_material_buffer_write_fits(tui.buffer_offset, 4, cse->uniform_total_size)) {
 					memcpy(ubo_data.ptrw() + tui.buffer_offset, &bindless_idx, 4);
 				}
 			}
 
 			// Try the suballoc pool first. Common materials (UBO <= slot size)
 			// just buffer_update an existing slot - O(1), no driver allocation,
-			// no per-frame storage_buffer_create cost.
+			// no per-frame storage_buffer_create cost. Metal's compute lane uses
+			// initialized dedicated buffers because address-only reads are not
+			// visible to its pooled buffer-update hazard tracking.
 			bool used_pool = false;
-			if (cse->uniform_total_size <= MAT_UBO_POOL_SLOT_SIZE) {
+			bool metal_compute_record = SceneShaderRaytracing::get_singleton()->uses_compute_scene_lane();
+			if (!metal_compute_record && cse->uniform_total_size <= MAT_UBO_POOL_SLOT_SIZE) {
 				if (mat_data->uniform_pool_slot == UINT32_MAX) {
 					mat_data->uniform_pool_slot = mat_ubo_pool_allocate();
 				}
@@ -1601,14 +1612,16 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 				// every rebuild. Warn once so it's visible in the log; the fix is
 				// either to shrink the material's uniform footprint below
 				// MAT_UBO_POOL_SLOT_SIZE or to grow the pool slot/capacity.
-				const char *reason = (cse->uniform_total_size > MAT_UBO_POOL_SLOT_SIZE)
-						? "uniform size exceeds slot"
-						: "pool exhausted";
-				WARN_PRINT_ONCE(vformat(
-						"RT Material UBO falling back to dedicated buffer (%s): "
-						"sbt_offset=%u, uniform_total_size=%u, slot_size=%u.",
-						String(reason), mat_data->rt_sbt_offset,
-						cse->uniform_total_size, MAT_UBO_POOL_SLOT_SIZE));
+				if (!metal_compute_record) {
+					const char *reason = (cse->uniform_total_size > MAT_UBO_POOL_SLOT_SIZE)
+							? "uniform size exceeds slot"
+							: "pool exhausted";
+					WARN_PRINT_ONCE(vformat(
+							"RT Material UBO falling back to dedicated buffer (%s): "
+							"sbt_offset=%d, uniform_total_size=%d, slot_size=%d.",
+							String(reason), mat_data->rt_sbt_offset,
+							cse->uniform_total_size, MAT_UBO_POOL_SLOT_SIZE));
+				}
 
 				if (mat_data->uniform_pool_slot != UINT32_MAX) {
 					mat_ubo_pool_release(mat_data->uniform_pool_slot);
@@ -1676,6 +1689,19 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		// 4 = TEXTURE_FILTER_NEAREST_WITH_MIPMAPS_ANISOTROPIC
 		if (filter_mode == 0 || filter_mode == 2 || filter_mode == 4) {
 			mat.flags |= RT_MAT_FLAG_POINT_FILTER;
+		}
+	}
+
+	// StandardMaterial3D cutouts use the same alpha-scissor parameter that its
+	// generated spatial shader writes. Custom shaders provide their threshold
+	// from the generated material evaluator instead.
+	if (!mat_data->is_custom_shader) {
+		Variant alpha_scissor_var = material_storage->material_get_param(p_material_rid, "alpha_scissor_threshold");
+		if (alpha_scissor_var.get_type() == Variant::FLOAT) {
+			mat.alpha_scissor_threshold = CLAMP((float)alpha_scissor_var, 0.0f, 1.0f);
+			if (mat.alpha_scissor_threshold > 0.0f) {
+				mat.flags |= RT_MAT_FLAG_ALPHA_SCISSOR;
+			}
 		}
 	}
 
@@ -2208,14 +2234,6 @@ static bool _rt_triangle_geometry_supported(RSE::PrimitiveType p_primitive) {
 	return false;
 }
 
-static bool _rt_metal_hg0_cull_supported(const SceneShaderForwardClustered::ShaderData *p_shader) {
-	if (!p_shader || p_shader->rt_cull_mode() == RSE::CULL_MODE_BACK) {
-		return true;
-	}
-	WARN_PRINT_ONCE("Metal path tracing keeps double-sided and front-culled materials on the C15 fallback path; the surface was omitted from the TLAS.");
-	return false;
-}
-
 RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data, uint32_t p_rt_flags) {
 	if (!p_render_data || !p_render_data->rt_instances) {
 		return nullptr;
@@ -2389,11 +2407,6 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					mm_surf = mm_surf->next;
 					continue;
 				}
-				if (hg0_compute_lane && !_rt_metal_hg0_cull_supported(mm_surf->shader)) {
-					mm_surf = mm_surf->next;
-					continue;
-				}
-
 				void *mesh_surface = mm_surf->surface;
 				uint32_t surface_counter = mesh_storage->mesh_surface_get_rt_invalidation_counter(mesh_surface);
 
@@ -2412,12 +2425,6 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 				uint16_t material_counter = material_storage->material_get_rt_invalidation_counter(material_rid);
 				RTMaterialData *mat_data = process_material(material_rid, material_counter);
-				if (hg0_compute_lane && mat_data->rt_sbt_offset > 0) {
-					WARN_PRINT_ONCE("Metal path tracing keeps custom spatial materials on the C15 fallback path; the surface was omitted from the TLAS.");
-					mm_surf = mm_surf->next;
-					continue;
-				}
-
 				if (mat_data->rt_sbt_offset > 0 &&
 						!rt_shader_singleton->is_hg_ready_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
 					mm_surf = mm_surf->next;
@@ -2491,11 +2498,6 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 			void *mesh_surface = surf->surface;
 			uint32_t surface_counter = mesh_storage->mesh_surface_get_rt_invalidation_counter(mesh_surface);
-			if (hg0_compute_lane && !_rt_metal_hg0_cull_supported(surf->shader)) {
-				surf = surf->next;
-				continue;
-			}
-
 #ifdef TOOLS_ENABLED
 			uint32_t pre_build_size = dirty_blas_list.size();
 			uint32_t pre_refit_size = dirty_blas_update_list.size();
@@ -2542,12 +2544,6 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 			uint16_t material_counter = material_storage->material_get_rt_invalidation_counter(material_rid);
 			RTMaterialData *mat_data = process_material(material_rid, material_counter);
-			if (hg0_compute_lane && mat_data->rt_sbt_offset > 0) {
-				WARN_PRINT_ONCE("Metal path tracing keeps custom spatial materials on the C15 fallback path; the surface was omitted from the TLAS.");
-				surf = surf->next;
-				continue;
-			}
-
 			if (mat_data->rt_sbt_offset > 0 &&
 					!rt_shader_singleton->is_hg_ready_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
 				surf = surf->next;

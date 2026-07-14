@@ -56,7 +56,6 @@ layout(set = 1, binding = 0) uniform texture2D bindless_textures[];
 // clang-format off
 #include "raytracing_samplers_inc.glsl"
 #include "raytracing_material_eval_inc.glsl"
-#include "raytracing_lights_inc.glsl"
 // clang-format on
 
 struct ComputeHit {
@@ -75,23 +74,23 @@ struct ComputeHitData {
 	vec3 tangent;
 	vec3 bitangent;
 	vec2 uv;
+	vec4 color;
 	uint geometry_idx;
 };
 
-// HG0 is deliberately opaque in C13. Alpha/custom/procedural candidate
-// handling is added by C15/C16; the CPU scene builder excludes those surfaces
-// from this bundle instead of silently treating them as HG0.
-bool trace_hg0(vec3 origin, vec3 direction, float max_distance, out ComputeHit hit) {
-	rayQueryEXT query;
-	rayQueryInitializeEXT(query, tlas, RT_RAY_FLAGS | gl_RayFlagsOpaqueEXT,
-			0xFF, origin, 0.001, direction, max_distance);
-	while (rayQueryProceedEXT(query)) {
-	}
+/* RT_COMPUTE_CUSTOM_TYPES */
 
-	if (rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
-		return false;
-	}
+void load_query_candidate_hit(rayQueryEXT query, out ComputeHit hit) {
+	hit.t = rayQueryGetIntersectionTEXT(query, false);
+	hit.geometry_idx = rayQueryGetIntersectionInstanceCustomIndexEXT(query, false);
+	hit.primitive_idx = rayQueryGetIntersectionPrimitiveIndexEXT(query, false);
+	hit.barycentrics = rayQueryGetIntersectionBarycentricsEXT(query, false);
+	hit.object_to_world = mat4(rayQueryGetIntersectionObjectToWorldEXT(query, false));
+	hit.world_to_object = mat4(rayQueryGetIntersectionWorldToObjectEXT(query, false));
+	hit.front_face = rayQueryGetIntersectionFrontFaceEXT(query, false);
+}
 
+void load_query_committed_hit(rayQueryEXT query, out ComputeHit hit) {
 	hit.t = rayQueryGetIntersectionTEXT(query, true);
 	hit.geometry_idx = rayQueryGetIntersectionInstanceCustomIndexEXT(query, true);
 	hit.primitive_idx = rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
@@ -99,7 +98,6 @@ bool trace_hg0(vec3 origin, vec3 direction, float max_distance, out ComputeHit h
 	hit.object_to_world = mat4(rayQueryGetIntersectionObjectToWorldEXT(query, true));
 	hit.world_to_object = mat4(rayQueryGetIntersectionWorldToObjectEXT(query, true));
 	hit.front_face = rayQueryGetIntersectionFrontFaceEXT(query, true);
-	return true;
 }
 
 ComputeHitData compute_hit_data(ComputeHit hit, vec3 ray_origin, vec3 ray_direction) {
@@ -112,6 +110,7 @@ ComputeHitData compute_hit_data(ComputeHit hit, vec3 ray_origin, vec3 ray_direct
 	vec3 bary = vec3(1.0 - hit.barycentrics.x - hit.barycentrics.y,
 			hit.barycentrics.x, hit.barycentrics.y);
 	result.uv = fetch_uv(geometry, i0, i1, i2, bary);
+	result.color = fetch_color(geometry, i0, i1, i2, bary);
 
 	TBNResult tbn = fetch_tbn(geometry, i0, i1, i2, bary);
 	mat3 model_rotation = mat3(hit.object_to_world);
@@ -159,7 +158,8 @@ MaterialResult evaluate_hg0(ComputeHitData hit) {
 
 	MaterialResult result;
 	result.albedo = albedo_texture.rgb * material.albedo_color.rgb;
-	result.alpha = 1.0;
+	result.alpha = albedo_texture.a * material.albedo_color.a;
+	result.alpha_scissor_threshold = material.alpha_scissor_threshold;
 	result.roughness = saturate(orm.g * material.roughness);
 	result.metalness = saturate(orm.b * material.metallic);
 	result.specular = material.specular;
@@ -171,6 +171,57 @@ MaterialResult evaluate_hg0(ComputeHitData hit) {
 	result.normal = final_normal;
 	return result;
 }
+
+/* RT_COMPUTE_CUSTOM_FUNCTIONS */
+
+MaterialResult evaluate_material(ComputeHit hit, ComputeHitData hit_data, vec3 ray_direction) {
+	MaterialData material = materials[hit.geometry_idx];
+	switch (material.dispatch_index) {
+		/* RT_COMPUTE_CUSTOM_CASES */
+		default:
+			return evaluate_hg0(hit_data);
+	}
+}
+
+// Metal ray queries expose non-opaque triangle candidates to the compute
+// shader. Evaluate the selected inlined material before confirming each
+// candidate: this is the any-hit equivalent for alpha-scissored surfaces.
+bool trace_material(vec3 origin, vec3 direction, float max_distance, out ComputeHit hit) {
+	rayQueryEXT query;
+	rayQueryInitializeEXT(query, tlas, gl_RayFlagsNoneEXT,
+			0xFF, origin, 0.001, direction, max_distance);
+	while (rayQueryProceedEXT(query)) {
+		if (rayQueryGetIntersectionTypeEXT(query, false) != gl_RayQueryCandidateIntersectionTriangleEXT) {
+			continue;
+		}
+
+		ComputeHit candidate;
+		load_query_candidate_hit(query, candidate);
+		MaterialData candidate_material = materials[candidate.geometry_idx];
+		bool needs_alpha_test = (candidate_material.flags & 8u) != 0u;
+		if ((candidate_material.flags & 16u) != 0u && candidate_material.dispatch_index != 0u) {
+			needs_alpha_test = true;
+		}
+		if (needs_alpha_test) {
+			ComputeHitData candidate_data = compute_hit_data(candidate, origin, direction);
+			MaterialResult evaluated = evaluate_material(candidate, candidate_data, direction);
+			if (evaluated.alpha_scissor_threshold > 0.0 && evaluated.alpha < evaluated.alpha_scissor_threshold) {
+				continue;
+			}
+		}
+		rayQueryConfirmIntersectionEXT(query);
+	}
+
+	if (rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+		return false;
+	}
+	load_query_committed_hit(query, hit);
+	return true;
+}
+
+// clang-format off
+#include "raytracing_lights_inc.glsl"
+// clang-format on
 
 mat4 decode_prev_object_to_world(int motion_index) {
 	InstanceMotionData motion = motion_transforms[motion_index];
@@ -242,8 +293,8 @@ void main() {
 
 		[[dont_unroll]] for (uint bounce = 0u; bounce <= max_bounces; bounce++) {
 			ComputeHit hit;
-			if (!trace_hg0(ray_origin, ray_direction, 10000.0, hit)) {
-				if (visualization_mode == 23 || visualization_mode == 24) {
+			if (!trace_material(ray_origin, ray_direction, 10000.0, hit)) {
+				if (visualization_mode == 23 || visualization_mode == 24 || visualization_mode == 25) {
 					break;
 				}
 				if (sample_index == 0u && bounce == 0u) {
@@ -275,9 +326,16 @@ void main() {
 						float((encoded_id >> 8u) & 0xFFu),
 						float((encoded_id >> 16u) & 0xFFu)) * (0.8 / 255.0);
 				break;
+			} else if (visualization_mode == 25) {
+				uint encoded_id = pcg_hash(materials[hit.geometry_idx].material_id + 1u);
+				radiance = vec3(0.2) + vec3(
+						float(encoded_id & 0xFFu),
+						float((encoded_id >> 8u) & 0xFFu),
+						float((encoded_id >> 16u) & 0xFFu)) * (0.8 / 255.0);
+				break;
 			}
 
-			MaterialResult material = evaluate_hg0(hit_data);
+			MaterialResult material = evaluate_material(hit, hit_data, ray_direction);
 			vec3 view_direction = -ray_direction;
 			vec3 shading_normal = clampShadingNormal(material.normal, hit_data.geometry_normal,
 					view_direction, RT_SHADING_NORMAL_CLAMP_THRESHOLD);

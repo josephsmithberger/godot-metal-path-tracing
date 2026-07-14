@@ -80,7 +80,7 @@ struct InstanceMotionData {
 };
 
 // ============================================================================
-// MATERIAL DATA (matches C++ layout, 96 bytes)
+// MATERIAL DATA (matches C++ layout, 112 bytes)
 // ============================================================================
 struct MaterialData {
 	uint albedo_texture_idx;
@@ -103,4 +103,8 @@ struct MaterialData {
 	float normal_map_depth; // Normal map strength (default 1.0)
 	float specular; // Dielectric specular [0..1], default 0.5 -> F0 = 0.04.
 	uint64_t uniform_address; // BDA for custom shader uniform buffer (0 = none)
+	float alpha_scissor_threshold;
+	uint dispatch_index; // Generated/inlined material function; 0 is HG0.
+	uint material_id;
+	uint _material_pad;
 };
