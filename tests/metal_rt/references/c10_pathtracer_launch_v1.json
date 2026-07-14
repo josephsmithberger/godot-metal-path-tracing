@@ -1,0 +1,31 @@
+{
+  "chunk": "C12",
+  "comparison": {
+    "diff_scale": 32,
+    "max_channel_difference": 5,
+    "metric": "maximum absolute RGBA8 channel difference"
+  },
+  "reference": {
+    "approval_date": "2026-07-14",
+    "color_space": "linear radiance clamped and encoded directly as RGBA8",
+    "device_family": "Apple10 reported by supportsFamily (engine view Apple9)",
+    "device_name": "Apple M5",
+    "file": "c10_pathtracer_launch_v1.png",
+    "os": "macOS 26.5.2 (25F84)",
+    "renderer": "Metal ray-query compute lane",
+    "reviewer": "C12 local implementation review",
+    "sha256": "177c791267f7a90f5f4fb1df4dcd3e0a988f1e3919773bbbcca92576248edad9",
+    "source_commit": "532674cf074cb08956c6ece4be297d7593a0c82e"
+  },
+  "reference_id": "metal-rt-c10-pathtracer-v1",
+  "scene": {
+    "camera_revision": "c10-fixed-orthographic-v1",
+    "height": 8,
+    "max_bounces": 1,
+    "revision": "c10-controlled-floor-and-blocker-v1",
+    "samples_per_pixel": 2,
+    "test_case": "[MetalRT][GPU] C10 path-tracer scene launch matches the CPU reference",
+    "width": 8
+  },
+  "schema_version": 1
+}
