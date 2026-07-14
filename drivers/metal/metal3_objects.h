@@ -150,11 +150,13 @@ struct BindingCache {
 	LocalVector<MTL::Texture *> textures;
 	LocalVector<MTL::SamplerState *> samplers;
 	LocalVector<BufferBinding> buffers;
+	LocalVector<MTL::AccelerationStructure *> acceleration_structures;
 
 	_FORCE_INLINE_ void clear() {
 		textures.clear();
 		samplers.clear();
 		buffers.clear();
+		acceleration_structures.clear();
 	}
 
 private:
@@ -239,6 +241,15 @@ public:
 		}
 		return false;
 	}
+
+	_FORCE_INLINE_ bool update(MTL::AccelerationStructure *p_acceleration_structure, uint32_t p_index) {
+		ensure_size(acceleration_structures, p_index + 1);
+		if (acceleration_structures[p_index] != p_acceleration_structure) {
+			acceleration_structures[p_index] = p_acceleration_structure;
+			return true;
+		}
+		return false;
+	}
 };
 
 // A type used to encode resources directly to a MTLCommandEncoder
@@ -255,6 +266,7 @@ struct DirectEncoder {
 	void set(MTL::Buffer *p_buffer, NS::UInteger p_offset, uint32_t p_index);
 	void set(MTL::Texture **p_textures, NS::Range p_range);
 	void set(MTL::SamplerState **p_samplers, NS::Range p_range);
+	void set(MTL::AccelerationStructure *p_acceleration_structure, uint32_t p_index);
 
 	DirectEncoder(MTL::CommandEncoder *p_encoder, BindingCache &p_cache, Mode p_mode) :
 			encoder(p_encoder), cache(p_cache), mode(p_mode) {}
@@ -455,7 +467,7 @@ public:
 
 	// State specific for a compute pass.
 	struct ComputeState {
-		MDComputePipeline *pipeline = nullptr;
+		MDPipeline *pipeline = nullptr;
 		NS::SharedPtr<MTL::ComputeCommandEncoder> encoder;
 		ResourceTracker resource_tracker;
 		// clang-format off

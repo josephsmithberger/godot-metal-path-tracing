@@ -30,8 +30,8 @@ instance options. Masks are retained as eight-bit Godot values.
 The native macOS 11 descriptor has no user-ID field. Raising the deployment
 target solely to use the macOS 12 user-ID descriptor would violate the frozen
 port assumptions, so C6 keeps `AccelerationStructureInstance.id` in the driver
-record. C9 must carry it explicitly through the selected shader and
-resource-binding mapping.
+record. C9 now carries stable group/table metadata; C10 must expose this custom
+instance ID explicitly to the selected compute shader.
 
 ## TLAS build
 

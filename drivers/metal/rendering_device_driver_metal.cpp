@@ -1392,6 +1392,14 @@ RDD::UniformSetID RenderingDeviceDriverMetal::uniform_set_create(VectorView<Boun
 						ADD_USAGE(texture, ui.active_stages, ui.usage);
 					}
 				} break;
+				case UNIFORM_TYPE_ACCELERATION_STRUCTURE: {
+					const MDAccelerationStructure *acceleration_structure = (const MDAccelerationStructure *)uniform.ids[0].id;
+					ERR_FAIL_NULL_V(acceleration_structure, UniformSetID());
+					ERR_FAIL_COND_V(!acceleration_structure->accel, UniformSetID());
+					*(MTL::ResourceID *)(ptr + idx.buffer) = acceleration_structure->accel->gpuResourceID();
+
+					ADD_USAGE(acceleration_structure->accel.get(), ui.active_stages, MTL::ResourceUsageRead);
+				} break;
 				case UNIFORM_TYPE_UNIFORM_BUFFER_DYNAMIC:
 				case UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC: {
 					// Encode the base GPU address (frame 0); it will be updated at bind time.
@@ -2432,7 +2440,21 @@ uint32_t RenderingDeviceDriverMetal::acceleration_structure_get_scratch_size_byt
 // ----- PIPELINE -----
 
 RDD::RaytracingPipelineID RenderingDeviceDriverMetal::raytracing_pipeline_create(VectorView<PipelineShader> p_shaders, VectorView<uint32_t> p_raygen_shader_indices, VectorView<uint32_t> p_miss_shader_indices, VectorView<HitGroup> p_hit_groups, uint32_t p_max_trace_recursion_depth, ShaderID p_layout_defining_shader) {
-	ERR_FAIL_V_MSG(RaytracingPipelineID(), "Ray tracing pipelines are not implemented yet by the Metal driver.");
+	ERR_FAIL_COND_V_MSG(!device_properties->features.supports_raytracing, RaytracingPipelineID(), "Ray tracing pipelines are not supported by this device.");
+	ERR_FAIL_COND_V_MSG(!p_layout_defining_shader, RaytracingPipelineID(), "Metal raytracing pipeline layout shader is not valid.");
+
+	MDRaytracingPipeline *pipeline = new MDRaytracingPipeline;
+	String error;
+	if (!pipeline->configure_shader_groups(p_shaders, p_raygen_shader_indices, p_miss_shader_indices, p_hit_groups, p_max_trace_recursion_depth, &error)) {
+		delete pipeline;
+		ERR_FAIL_V_MSG(RaytracingPipelineID(), error);
+	}
+	pipeline->shader = (MDShader *)p_layout_defining_shader.id;
+	if (!pipeline->create_trace_one_ray(device, &error)) {
+		delete pipeline;
+		ERR_FAIL_V_MSG(RaytracingPipelineID(), vformat("Failed to create the Metal raytracing control pipeline: %s", error));
+	}
+	return RaytracingPipelineID(pipeline);
 }
 
 void RenderingDeviceDriverMetal::raytracing_pipeline_free(RDD::RaytracingPipelineID p_pipeline) {
@@ -2442,7 +2464,11 @@ void RenderingDeviceDriverMetal::raytracing_pipeline_free(RDD::RaytracingPipelin
 }
 
 bool RenderingDeviceDriverMetal::raytracing_pipeline_get_shader_group_handles(RaytracingPipelineID p_pipeline, uint32_t p_group_index_offset, VectorView<uint32_t> p_group_indices, uint8_t *r_data, uint32_t p_data_stride_bytes) {
-	ERR_FAIL_V_MSG(false, "Ray tracing shader group handles are not implemented yet by the Metal driver.");
+	const MDRaytracingPipeline *pipeline = (const MDRaytracingPipeline *)p_pipeline.id;
+	ERR_FAIL_NULL_V_MSG(pipeline, false, "Metal raytracing pipeline input parameter is not valid.");
+	String error;
+	ERR_FAIL_COND_V_MSG(!pipeline->get_shader_group_handles(p_group_index_offset, p_group_indices, r_data, p_data_stride_bytes, &error), false, error);
+	return true;
 }
 
 // ----- COMMANDS -----
@@ -2494,11 +2520,20 @@ void RenderingDeviceDriverMetal::command_build_tlas(CommandBufferID p_cmd_buffer
 }
 
 void RenderingDeviceDriverMetal::command_bind_raytracing_pipeline(CommandBufferID p_cmd_buffer, RaytracingPipelineID p_pipeline) {
-	ERR_FAIL_MSG("Ray tracing pipelines are not implemented yet by the Metal driver.");
+	MDCommandBufferBase *cmd_buffer = (MDCommandBufferBase *)p_cmd_buffer.id;
+	MDRaytracingPipeline *pipeline = (MDRaytracingPipeline *)p_pipeline.id;
+	ERR_FAIL_NULL_MSG(cmd_buffer, "Metal command buffer input parameter is not valid.");
+	ERR_FAIL_NULL_MSG(pipeline, "Metal raytracing pipeline input parameter is not valid.");
+	ERR_FAIL_COND_MSG(!pipeline->is_valid(), "Metal raytracing pipeline is not ready for binding.");
+	cmd_buffer->bind_pipeline(PipelineID(p_pipeline.id));
 }
 
 void RenderingDeviceDriverMetal::command_bind_raytracing_uniform_set(CommandBufferID p_cmd_buffer, UniformSetID p_uniform_set, ShaderID p_shader, uint32_t p_set_index) {
-	ERR_FAIL_MSG("Ray tracing pipelines are not implemented yet by the Metal driver.");
+	MDCommandBufferBase *cmd_buffer = (MDCommandBufferBase *)p_cmd_buffer.id;
+	ERR_FAIL_NULL_MSG(cmd_buffer, "Metal command buffer input parameter is not valid.");
+	ERR_FAIL_COND_MSG(!p_uniform_set, "Metal raytracing uniform set input parameter is not valid.");
+	ERR_FAIL_COND_MSG(!p_shader, "Metal raytracing uniform-set shader input parameter is not valid.");
+	cmd_buffer->compute_bind_uniform_sets(VectorView<UniformSetID>(p_uniform_set), p_shader, p_set_index, 1, 0);
 }
 
 void RenderingDeviceDriverMetal::command_trace_rays(CommandBufferID p_cmd_buffer, const ShaderBindingTable &p_raygen_sbt, const ShaderBindingTable &p_miss_sbt, const ShaderBindingTable &p_hit_sbt, uint32_t p_width, uint32_t p_height, uint32_t p_depth) {
@@ -2854,6 +2889,12 @@ uint64_t RenderingDeviceDriverMetal::api_trait_get(ApiTrait p_trait) {
 			return false;
 		case API_TRAIT_ACCELERATION_STRUCTURE_INSTANCE_SIZE:
 			return sizeof(MDAccelerationStructureInstance);
+		case API_TRAIT_SHADER_GROUP_HANDLE_SIZE:
+			return MDRaytracingPipeline::SHADER_GROUP_HANDLE_SIZE;
+		case API_TRAIT_SHADER_GROUP_HANDLE_ALIGNMENT:
+			return MDRaytracingPipeline::SHADER_GROUP_HANDLE_ALIGNMENT;
+		case API_TRAIT_SHADER_GROUP_BASE_ALIGNMENT:
+			return MDRaytracingPipeline::SHADER_GROUP_BASE_ALIGNMENT;
 		default:
 			return RenderingDeviceDriver::api_trait_get(p_trait);
 	}

@@ -8,10 +8,10 @@ C7. It provides the first backend-owned Metal RT pipeline state, creates and
 binds a pipeline-specific intersection-function table, dispatches a trace
 kernel, and writes deterministic RGBA8 output.
 
-This is intentionally below the public `RenderingDevice` ray-tracing API. The
-Godot shader-group, SBT, uniform-set, and command-list translation remains C9;
-the corresponding Metal driver entry points continue to reject use until that
-mapping exists.
+The C8 test remains intentionally below the public `RenderingDevice`
+ray-tracing API. C9 now maps Godot shader groups, SBT records, pipeline
+resources, and uniform-set binds; consuming those records in the path-tracer
+compute dispatch remains C10.
 
 ## Pipeline and bindings
 
@@ -76,8 +76,10 @@ Or isolate C8 after building the editor:
 ## Deliberate limits
 
 - Triangle geometry only; procedural intersection functions are not populated.
-- One backend-owned native MSL kernel; no user shader groups or recursion.
+- One backend-owned native MSL kernel; C9 records user shader groups and a
+  software recursion budget, but the C8 kernel does not consume them.
 - Exact buffer output only; the path-tracer scene and reviewed PNG reference
   arrive in C10/L5.
 - The custom Godot instance ID retained in the C6 record is not shader-visible
-  at the macOS 11 descriptor floor. C9 must carry that metadata explicitly.
+  at the macOS 11 descriptor floor. C9 carries group/table metadata explicitly;
+  C10 must expose instance metadata to the re-expressed compute shader.

@@ -38,6 +38,7 @@ TEST_FORCE_LINK(test_metal_rt_shader_strategy)
 
 #include "drivers/metal/metal_objects_shared.h"
 #include "drivers/metal/metal_rt_shader_lowering.h"
+
 #include "modules/glslang/shader_compile.h"
 
 namespace TestMetalRTShaderStrategy {
@@ -355,13 +356,11 @@ TEST_CASE("[MetalRT] C7 SPIRV-Cross lane lowers ray query compute to MSL") {
 	CHECK(classic.entry_point == "main0");
 
 	// Tier-2 argument buffers exactly as the container configures them
-	// (pad_argument_buffer_resources on): SPIRV-Cross rejects the
-	// acceleration-structure binding outright. If this starts passing, the
-	// vendored SPIRV-Cross gained AS padding support and
-	// docs/rt_metal_port/shader_strategy.md should be updated.
+	// (pad_argument_buffer_resources on). C9 teaches the small vendored padding
+	// switch that acceleration structures occupy the buffer-index namespace.
 	MetalRTShaderLowering::Result padded = MetalRTShaderLowering::lower_spirv(RDC::SHADER_STAGE_COMPUTE, spirv, 3, 0, true, true);
-	CHECK_FALSE(padded.ok);
-	CHECK(padded.error.contains("Unexpected argument buffer resource base type"));
+	REQUIRE_MESSAGE(padded.ok, vformat("SPIRV-Cross padded argument-buffer lowering failed: %s", padded.error));
+	CHECK(padded.msl_source.contains("acceleration_structure"));
 
 	// Tier-2 argument buffers with padding disabled lower cleanly.
 	MetalRTShaderLowering::Result argbuf = MetalRTShaderLowering::lower_spirv(RDC::SHADER_STAGE_COMPUTE, spirv, 3, 0, true, false);

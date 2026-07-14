@@ -101,6 +101,7 @@ void CompilerMSL::add_msl_resource_binding(const MSLResourceBinding &binding)
 		case SPIRType::Half:
 		case SPIRType::Float:
 		case SPIRType::Double:
+		case SPIRType::AccelerationStructure:
 			ADD_ARG_IDX_TO_BINDING_NUM_LOOKUP(buffer);
 			break;
 		case SPIRType::Image:
@@ -19763,6 +19764,7 @@ void CompilerMSL::analyze_argument_buffers()
 					case SPIRType::Half:
 					case SPIRType::Float:
 					case SPIRType::Double:
+					case SPIRType::AccelerationStructure:
 						add_argument_buffer_padding_buffer_type(buffer_type, member_index, next_arg_buff_index, rez_bind);
 						break;
 					case SPIRType::Image:

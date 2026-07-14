@@ -35,7 +35,7 @@ never from raster stages.
 | # | Experiment | Result |
 |---|---|---|
 | 1 | Ray-query compute GLSL → glslang → SPIRV-Cross MSL 2.4, classic bindings | **Lowers** to `metal::raytracing::intersection_query`; entry `main0` |
-| 2 | Same SPIR-V, tier-2 argument buffers, `pad_argument_buffer_resources` **on** (the container's exact configuration) | **Rejected**: "Unexpected argument buffer resource base type" — SPIRV-Cross's padded-binding registration has no acceleration-structure case |
+| 2 | Same SPIR-V, tier-2 argument buffers, `pad_argument_buffer_resources` **on** (the container's exact configuration) | **Lowered after C9**: the vendored padded-binding lookup now treats acceleration structures as buffer-index resources |
 | 3 | Same SPIR-V, tier-2 argument buffers, padding **off** | **Lowers** cleanly |
 | 4 | Lowered kernel from #1 compiled with `newLibraryWithSource` (MSL 2.4) and dispatched against the C5/C6 BLAS+TLAS | **Correct**: hit at t=2.0, primitive 0, instance 0; miss ray misses |
 | 5 | Raygen stage (`traceRayEXT`) → SPIRV-Cross MSL | **Fails**: "A memory declaration object must be used in TraceRayKHR." |
@@ -56,14 +56,12 @@ RT-pipeline stages.**
 1. **Lane A — existing SPIRV-Cross container lane** for everything that is a
    compute stage, including `GL_EXT_ray_query` tracing. Proven end-to-end by
    experiments #1/#3/#4. Requirements this creates for C8/C9:
-   - `RenderingShaderContainerMetal` must learn
-     `UNIFORM_TYPE_ACCELERATION_STRUCTURE` (its uniform switch currently has no
-     case for it and would crash).
-   - The argument-buffer path must resolve the padding gap from experiment #2:
-     either a small vendored SPIRV-Cross patch adding
-     `SPIRType::AccelerationStructure` to the padded-binding switch
-     (`CompilerMSL::add_msl_resource_binding`), or padding disabled for RT
-     kernels. Decide in C9 when the container consumes AS bindings for real.
+   - C9 taught `RenderingShaderContainerMetal`
+     `UNIFORM_TYPE_ACCELERATION_STRUCTURE` for classic and argument-buffer
+     bindings.
+   - C9 resolved the argument-buffer padding gap with the narrow vendored
+     SPIRV-Cross switch addition: `SPIRType::AccelerationStructure` uses the
+     buffer-index namespace. Padding remains enabled for RT kernels.
    - MSL floor for `intersection_query` is 2.4 (macOS 12); the effective
      RT floor stays macOS 13 per assumption A4, so this adds no constraint.
 
@@ -74,7 +72,7 @@ RT-pipeline stages.**
 
 3. **RT-pipeline stages are re-expressed, not translated.** The five-stage
    `traceRayEXT` program cannot be pushed through SPIRV-Cross (experiments
-   #5/#6). The path-tracer integration (C9/C10) therefore converts the
+   #5/#6). The path-tracer integration (C10) therefore converts the
    raygen/miss/closest-hit control flow into a **ray-query compute kernel**:
    the raygen loop becomes the kernel body, `traceRayEXT` becomes a ray query
    (or, if profiling justifies it later, a Lane-B intersector kernel calling

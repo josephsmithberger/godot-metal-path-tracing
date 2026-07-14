@@ -29,9 +29,9 @@ ray-tracing capabilities present.
 | A1 | Shipping scope is Apple Silicon arm64 only | High | A product decision to support Intel Macs |
 | A2 | Runtime device queries, not GPU families, gate the RT path | High | Apple removing/deprecating the query surface |
 | A3 | Every required RT API exists at the arm64 build floor, macOS 11.0 | High | Compile error against an older SDK path in C4-C6 |
-| A4 | The effective runtime floor will be macOS 13.0 (encoder-free tier-2 argument buffers + gpuAddress) | Medium (C7 found no lower requirement) | C8/C9 argument-buffer integration |
+| A4 | The effective runtime floor will be macOS 13.0 (encoder-free tier-2 argument buffers + gpuAddress) | High (C9 kept padded tier-2 argument buffers) | C10 finding a lower-floor binding design |
 | A5 | First scope is compute-pipeline ray tracing only | High (reinforced by C7: both proven lanes are compute) | C8 finding a hard dependency on render-stage RT |
-| A6 | Vulkan SBT handles map to function-table indices | Medium | C9 pipeline-mapping implementation |
+| A6 | Vulkan SBT handles map to function-table indices | Resolved by C9 | A future native Metal RT-pipeline model |
 | A7 | ~~The existing SPIRV-Cross lane cannot lower RT-stage SPIR-V~~ **Resolved by C7 as split**: the lane lowers ray-query compute; RT-pipeline stages are confirmed impossible and get re-expressed as compute | Resolved | A vendored SPIRV-Cross update gaining RT execution models |
 | A8 | Unified memory holds on all target devices; shared storage mode is acceptable for bring-up | High | Probe reporting `has_unified_memory: false` on a target device |
 | A9 | One dev machine (Apple M5) covers both RT hardware lanes for bring-up; M1/M2 coverage is deferred | Medium | Family-dependent bug reports on apple7/apple8 |
@@ -133,11 +133,16 @@ table. Metal's analog is an index into a `MTLVisibleFunctionTable` /
 `MTLIntersectionFunctionTable`. The plan is to return small fixed-size records
 containing table indices and have the trace path resolve them, documenting
 every place the SBT semantics (stride, offset arithmetic) do not map 1:1.
-This is a design assumption for C9, recorded here so that C4's skeleton
-reserves the right data shapes.
+**Resolved by C9.** Metal returns engine-defined 16-byte records containing the
+stable group index, group type, and intersection-function-table index. Group
+order is raygen, miss, then hit. Triangle hit groups share the system opaque
+triangle function at slot 0; procedural groups reserve stable slots; raygen,
+miss, and empty groups have no intersection-table index. See
+[`pipeline_mapping.md`](pipeline_mapping.md) for every non-1:1 rule.
 
-*Falsify/re-verify:* C9 unit test creating a pipeline from synthetic shader
-groups and validating stable indices and bind order.
+*Re-verify:* `--test-case="*[MetalRT] C9*"` creates a pipeline from synthetic
+shader groups and validates exact record bytes, stable indices, table entries,
+and bind order.
 
 ## A7: RT shader stages need a Metal-specific lowering lane (resolved by C7)
 
@@ -160,8 +165,9 @@ execution models.
   They are re-expressed as ray-query compute kernels, not translated.
 - One real defect in the existing lane was measured: with
   `pad_argument_buffer_resources` enabled (the container's configuration),
-  SPIRV-Cross rejects acceleration-structure bindings outright. C9 must patch
-  the vendored switch or disable padding for RT kernels.
+  SPIRV-Cross rejected acceleration-structure bindings. C9 fixed the narrow
+  vendored lookup by treating them as buffer-index resources; padding remains
+  enabled.
 
 *Re-verify:* `--test-case="*[MetalRT] C7*"` pins every result above; the GPU
 half runs in the runner's `gpu` stage.
@@ -208,20 +214,19 @@ tracer later, but no chunk C1-C12 depends on it.
   Core Metal RT descriptors and size queries are available at the macOS 11
   build floor and do not depend on Metal 3 residency sets or newer encoders;
   keeping them in the base also replaces the 14 stubs at their owning layer.
+- **SBT and recursion mapping (resolved in C9).** Shader-group handles are
+  stable 16-byte Metal index records, not native function pointers. The
+  requested recursion depth is stored as a software budget because Metal has
+  no corresponding pipeline property; C10 enforces it in the compute loop.
 
 ## Open questions (tracked, not assumed)
 
-1. **Trace recursion depth.** `raytracing_pipeline_create` receives
-   `p_max_trace_recursion_depth`; Metal's intersector model has no pipeline
-   recursion limit — recursion becomes an in-kernel loop. Where the engine
-   relies on Vulkan's `maxRayRecursionDepth`, the Metal driver must pick and
-   report an honest equivalent. Decide in C9.
-2. **64-bit image atomics.** ~~Whether the path tracer's accumulation targets
+1. **64-bit image atomics.** ~~Whether the path tracer's accumulation targets
    need `supports_image_atomic_64_bit` (apple9-or-apple8+mac2 only) is unknown
    until the C7 shader audit.~~ Closed by the C7 audit: the RT shader tree
    under `servers/rendering/renderer_rd/shaders/raytracing/` contains no image
    atomics, so no lane fragmentation on apple7/apple8.
-3. **Family scan staleness.** The engine's highest-family scan stops at
+2. **Family scan staleness.** The engine's highest-family scan stops at
    apple9; M5 reports apple10. Nothing RT-critical keys off the exact family
    today, but any future family-based tiering (A2) must use `>=` comparisons,
    not equality, and the scan ceiling should be raised opportunistically.
