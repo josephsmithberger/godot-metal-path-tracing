@@ -135,6 +135,11 @@ public:
 	};
 
 	struct UniformData {
+		/// Sentinel for `array_length`: the binding is a runtime-sized
+		/// (unbounded) array. Requires tier-2 argument buffers; the actual
+		/// descriptor count is only known when the uniform set is created.
+		static constexpr uint32_t UNBOUNDED_ARRAY_LENGTH = UINT32_MAX;
+
 		uint32_t active_stages = 0;
 		uint32_t uniform_type = 0; // UniformType
 		uint32_t data_type = 0; // MTLDataTypeNone

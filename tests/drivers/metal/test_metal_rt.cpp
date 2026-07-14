@@ -162,6 +162,27 @@ TEST_CASE("[MetalRT] Backend placeholders own descriptors and preserve metadata"
 	delete pipeline;
 }
 
+TEST_CASE("[MetalRT] Sizes unbounded argument buffers from the bound descriptor count") {
+	UniformSet shader_set;
+	shader_set.uniforms.resize(1);
+	shader_set.uniforms[0].arrayLength = UINT32_MAX;
+	shader_set.uniforms[0].arg_buffer.texture = 3;
+	shader_set.buffer_size = 4 * sizeof(uint64_t); // Three fixed entries plus the reserved runtime entry.
+	shader_set.has_unbounded_array = true;
+
+	Vector<RDD::BoundUniform> bound_uniforms;
+	bound_uniforms.resize(1);
+	bound_uniforms.write[0].type = RDD::UNIFORM_TYPE_TEXTURE;
+	CHECK(shader_set.argument_buffer_size(bound_uniforms) == 4 * sizeof(uint64_t));
+
+	bound_uniforms.write[0].ids.push_back(RDD::ID());
+	bound_uniforms.write[0].ids.push_back(RDD::ID());
+	CHECK(shader_set.argument_buffer_size(bound_uniforms) == 5 * sizeof(uint64_t));
+
+	shader_set.has_unbounded_array = false;
+	CHECK(shader_set.argument_buffer_size(bound_uniforms) == shader_set.buffer_size);
+}
+
 TEST_CASE_PENDING("[MetalRT][GPU] Builds, queries, and refits a single-triangle BLAS") {
 	NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
 	NS::SharedPtr<MTL::Device> device = NS::TransferPtr(MTL::CreateSystemDefaultDevice());

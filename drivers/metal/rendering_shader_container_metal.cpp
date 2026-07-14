@@ -429,6 +429,9 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 	typedef std::pair<MSLResourceBinding, uint32_t> MSLBindingInfo;
 	LocalVector<MSLBindingInfo> spirv_bindings;
 	MSLResourceBinding push_constant_resource_binding;
+	// Sets that contain an unbounded (runtime-sized) array. SPIRV-Cross requires
+	// those argument buffers to live in the device address space.
+	uint32_t unbounded_arg_buffer_sets_mask = 0;
 	{
 		enum IndexType {
 			Texture,
@@ -454,6 +457,7 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 		UniformData::IndexType shader_index_type = msl_options.argument_buffers ? UniformData::IndexType::ARG : UniformData::IndexType::SLOT;
 
 		for (const ReflectDescriptorSet &dset : p_shader.uniform_sets) {
+			bool set_has_unbounded = false;
 			// Reset the index count for each descriptor set, as this is an index in to the argument table.
 			uint32_t next_arg_buffer_index = 0;
 			auto next_arg_index = [&next_arg_buffer_index](uint32_t p_stride) -> uint32_t {
@@ -467,9 +471,26 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 
 				found->active_stages = uniform.stages;
 
+				// Bindings are iterated in ascending binding order, so any binding
+				// after an unbounded one would sit past a runtime-sized region in
+				// the argument buffer with no fixed offset.
+				ERR_FAIL_COND_V_MSG(set_has_unbounded, false,
+						vformat("Metal: an unbounded (runtime-sized) array must be the last binding of its descriptor set (set %d, binding %d follows one).", idx_dset, uniform.binding));
+
 				RDC::UniformType type = RDC::UniformType(uniform.type);
 				uint32_t binding_stride = 1; // If this is an array, stride will be the length of the array.
-				if (uniform.length > 1) {
+				if (uniform.unbounded) {
+					// Runtime-sized (bindless) array: SPIRV-Cross lowers it as a
+					// spvDescriptorArray over the trailing argument-buffer region,
+					// which requires tier-2 argument buffers in the device address
+					// space. The descriptor count is only known per uniform set.
+					ERR_FAIL_COND_V_MSG(!msl_options.argument_buffers, false,
+							vformat("Metal: unbounded (runtime-sized) arrays require tier-2 argument buffers (set %d, binding %d).", idx_dset, uniform.binding));
+					ERR_FAIL_COND_V_MSG(type != RDC::UNIFORM_TYPE_TEXTURE, false,
+							vformat("Metal: unbounded (runtime-sized) arrays are only supported for texture bindings (set %d, binding %d).", idx_dset, uniform.binding));
+					set_has_unbounded = true;
+					found->array_length = UniformData::UNBOUNDED_ARRAY_LENGTH;
+				} else if (uniform.length > 1) {
 					switch (type) {
 						case RDC::UNIFORM_TYPE_UNIFORM_BUFFER_DYNAMIC:
 						case RDC::UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC:
@@ -525,7 +546,13 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 				MSLResourceBinding &rb = iter->first;
 				rb.desc_set = idx_dset;
 				rb.binding = uniform.binding;
-				rb.count = binding_stride;
+				// A count of 0 keeps SPIRV-Cross on the runtime-sized descriptor
+				// path (spvDescriptorArray) instead of a fixed-size array<T, N>.
+				rb.count = uniform.unbounded ? 0 : binding_stride;
+				if (uniform.unbounded) {
+					ERR_FAIL_COND_V_MSG(idx_dset >= 32, false, "Metal: unbounded arrays are limited to descriptor sets 0-31.");
+					unbounded_arg_buffer_sets_mask |= 1u << idx_dset;
+				}
 
 				switch (type) {
 					case RDC::UNIFORM_TYPE_SAMPLER: {
@@ -679,6 +706,14 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 		CompilerMSL compiler(std::move(parser.get_parsed_ir()));
 		compiler.set_msl_options(msl_options);
 		compiler.set_common_options(options);
+
+		if (msl_options.argument_buffers && unbounded_arg_buffer_sets_mask != 0) {
+			for (uint32_t set_index = 0; set_index < 32; set_index++) {
+				if (unbounded_arg_buffer_sets_mask & (1u << set_index)) {
+					compiler.set_argument_buffer_device_address_space(set_index, true);
+				}
+			}
+		}
 
 		spv::ExecutionModel execution_model = map_stage(stage);
 		for (uint32_t jj = 0; jj < spirv_bindings.size(); jj++) {

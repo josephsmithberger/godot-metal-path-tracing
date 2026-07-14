@@ -1222,7 +1222,15 @@ RDD::ShaderID RenderingDeviceDriverMetal::shader_create_from_container(const Ref
 			}
 #define VAL(x) (x == UINT32_MAX ? 0 : x)
 			uint32_t max = std::max({ VAL(ui.arg_buffer.texture), VAL(ui.arg_buffer.buffer), VAL(ui.arg_buffer.sampler) });
-			max += ui.arrayLength > 0 ? ui.arrayLength - 1 : 0;
+			if (ui.arrayLength == RSCM::UniformData::UNBOUNDED_ARRAY_LENGTH) {
+				// Runtime-sized array: the trailing descriptor region is sized per
+				// uniform set from the actual descriptor count; reserve one entry.
+				ERR_FAIL_COND_V_MSG(!device_properties->features.argument_buffers_supported(), RDD::ShaderID(),
+						"Metal: shaders with unbounded (runtime-sized) arrays require tier-2 argument buffer support.");
+				set.has_unbounded_array = true;
+			} else {
+				max += ui.arrayLength > 0 ? ui.arrayLength - 1 : 0;
+			}
 			set.buffer_size = std::max(set.buffer_size, (max + 1) * (uint32_t)sizeof(uint64_t));
 #undef VAL
 		}
@@ -1288,7 +1296,17 @@ RDD::UniformSetID RenderingDeviceDriverMetal::uniform_set_create(VectorView<Boun
 	Vector<uint8_t> arg_buffer_data;
 
 	if (device_properties->features.argument_buffers_supported()) {
-		arg_buffer_data.resize(shader_set.buffer_size);
+		if (shader_set.has_unbounded_array) {
+			for (uint32_t i = 0; i < p_uniforms.size(); i += 1) {
+				const UniformInfo &ui = shader_set.uniforms[i];
+				if (ui.arrayLength != RenderingShaderContainerMetal::UniformData::UNBOUNDED_ARRAY_LENGTH) {
+					continue;
+				}
+				ERR_FAIL_COND_V_MSG(p_uniforms[i].type != UNIFORM_TYPE_TEXTURE, UniformSetID(),
+						"Metal: unbounded (runtime-sized) arrays are only supported for texture bindings.");
+			}
+		}
+		arg_buffer_data.resize(shader_set.argument_buffer_size(p_uniforms));
 
 		// If argument buffers are enabled, we have already verified availability, so we can skip the runtime check.
 		GODOT_CLANG_WARNING_PUSH_AND_IGNORE("-Wunguarded-availability-new")
@@ -1430,7 +1448,7 @@ RDD::UniformSetID RenderingDeviceDriverMetal::uniform_set_create(VectorView<Boun
 		}
 
 		if (!is_dynamic) {
-			set->arg_buffer = NS::TransferPtr(device->newBuffer(shader_set.buffer_size, base_hazard_tracking | MTL::ResourceStorageModePrivate));
+			set->arg_buffer = NS::TransferPtr(device->newBuffer(arg_buffer_data.size(), base_hazard_tracking | MTL::ResourceStorageModePrivate));
 #if DEV_ENABLED
 			char label[64];
 			snprintf(label, sizeof(label), "Uniform Set %u", p_set_index);

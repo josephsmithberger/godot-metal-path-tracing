@@ -73,6 +73,23 @@ for the editor until the C11 gating/fallback work flips the integration
 deliberately. The toggle exists so the RD-level trace path can be exercised
 end-to-end while that lands.
 
+### Bindless material-access foundation
+
+The Metal shader container now preserves runtime-sized texture arrays as
+unbounded bindings instead of treating them as fixed one-element arrays. Such
+bindings are accepted only as the final binding in a descriptor set and only
+with tier-2 argument buffers; SPIRV-Cross then receives a zero descriptor count
+and emits the argument buffer in the device address space. Uniform-set creation
+sizes the trailing descriptor region from the set's actual texture count.
+
+`tests/drivers/metal/test_metal_rt_shader_strategy.cpp` exercises the real
+container with the material-access pattern needed by the scene shaders: a
+GPU-addressed material record selects a nonuniform entry from an unbounded
+texture array. Its GPU case binds two descriptors and verifies that material
+index 1 returns the second texture's color. The focused sizing case in
+`tests/drivers/metal/test_metal_rt.cpp` verifies that the allocated argument
+buffer grows with the runtime descriptor count.
+
 ## Controlled scene evidence
 
 `tests/drivers/metal/test_metal_rt_pathtracer_launch.cpp` launches an
@@ -124,8 +141,8 @@ trace path requires, in C11 or a dedicated follow-up:
 
 1. a compute re-expression of `scene_raytracing_raygen.glsl` (HG0/standard
    material first) compiled as the compute-lane raygen when the driver lacks
-   native RT stages, including the bindless set and buffer-device-address
-   material access on the Metal container lane;
+   native RT stages, consuming the now-validated Metal bindless and
+   buffer-device-address material-access lane;
 2. custom hit groups (HG1+): per-material inlined variants or a
    visible-function dispatch design;
 3. the C11 runtime gate replacing the debug toggle, with graceful fallback and

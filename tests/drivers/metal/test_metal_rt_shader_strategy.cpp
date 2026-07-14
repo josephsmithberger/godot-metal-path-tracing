@@ -38,6 +38,7 @@ TEST_FORCE_LINK(test_metal_rt_shader_strategy)
 
 #include "drivers/metal/metal_objects_shared.h"
 #include "drivers/metal/metal_rt_shader_lowering.h"
+#include "drivers/metal/rendering_shader_container_metal.h"
 
 #include "modules/glslang/shader_compile.h"
 
@@ -119,6 +120,37 @@ void main() {
 }
 )GLSL";
 
+// Compute-lane facsimile of the material access pattern used by the scene RT
+// shaders: a GPU-addressed material record selects an entry from an unbounded
+// texture array. This deliberately goes through RenderingShaderContainerMetal,
+// not just the small C7 lowering probe.
+static const char *BINDLESS_MATERIAL_GLSL = R"GLSL(
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_ARB_gpu_shader_int64 : require
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430) readonly buffer Material {
+	uint texture_index;
+};
+
+layout(set = 0, binding = 0, std430) readonly buffer MaterialAddresses {
+	uint64_t material_address;
+} material_addresses;
+layout(set = 0, binding = 1) uniform sampler material_sampler;
+layout(set = 0, binding = 2, std430) writeonly buffer Result {
+	vec4 color;
+} result;
+layout(set = 1, binding = 0) uniform texture2D bindless_textures[];
+
+void main() {
+	Material material = Material(material_addresses.material_address);
+	result.color = texture(sampler2D(bindless_textures[nonuniformEXT(material.texture_index)], material_sampler), vec2(0.5));
+}
+)GLSL";
+
 // Native MSL twin of RAY_QUERY_COMPUTE_GLSL, written directly against
 // metal::raytracing::intersector at the MSL 2.3 (macOS 11) floor.
 static const char *NATIVE_INTERSECTOR_MSL = R"MSL(
@@ -180,6 +212,32 @@ struct SpikeResultData {
 static Vector<uint8_t> compile_stage_to_spirv(RDC::ShaderStage p_stage, const char *p_glsl, String *r_error) {
 	return compile_glslang_shader(p_stage, String::utf8(p_glsl),
 			RDC::SHADER_LANGUAGE_VULKAN_VERSION_1_3, RDC::SHADER_SPIRV_VERSION_1_6, r_error);
+}
+
+static bool build_bindless_material_container(const Vector<uint8_t> &p_spirv, Ref<RenderingShaderContainerMetal> &r_container, String &r_msl_source) {
+	const MetalDeviceProfile *profile = MetalDeviceProfile::get_profile(
+			MetalDeviceProfile::Platform::macOS, MetalDeviceProfile::GPU::Apple8, os_version::MACOS_13_0);
+	ERR_FAIL_NULL_V(profile, false);
+
+	r_container.instantiate();
+	r_container->set_device_profile(profile);
+
+	Vector<RDC::ShaderStageSPIRVData> stages;
+	stages.resize(1);
+	stages.write[0].shader_stage = RDC::SHADER_STAGE_COMPUTE;
+	stages.write[0].spirv = p_spirv;
+	ERR_FAIL_COND_V(!r_container->set_code_from_spirv("bindless_material_probe", stages), false);
+	ERR_FAIL_COND_V(r_container->shaders.size() != 1 || r_container->mtl_shaders.size() != 1, false);
+
+	const RenderingShaderContainer::Shader &shader = r_container->shaders[0];
+	const RenderingShaderContainerMetal::StageData &stage_data = r_container->mtl_shaders[0];
+	Vector<uint8_t> source;
+	source.resize(shader.code_decompressed_size);
+	ERR_FAIL_COND_V(!r_container->decompress_code(shader.code_compressed_bytes.ptr(), shader.code_compressed_bytes.size(),
+							shader.code_compression_flags, source.ptrw(), source.size()),
+			false);
+	r_msl_source = String::utf8(reinterpret_cast<const char *>(source.ptr()), stage_data.source_size);
+	return true;
 }
 
 // Builds the C5/C6 single-triangle BLAS + one-instance TLAS scene and leaves
@@ -366,6 +424,153 @@ TEST_CASE("[MetalRT] C7 SPIRV-Cross lane lowers ray query compute to MSL") {
 	MetalRTShaderLowering::Result argbuf = MetalRTShaderLowering::lower_spirv(RDC::SHADER_STAGE_COMPUTE, spirv, 3, 0, true, false);
 	REQUIRE_MESSAGE(argbuf.ok, vformat("SPIRV-Cross argument-buffer lowering failed: %s", argbuf.error));
 	CHECK(argbuf.msl_source.contains("intersection_query"));
+}
+
+TEST_CASE("[MetalRT] Metal container lowers bindless GPU-addressed material access") {
+	String glsl_error;
+	Vector<uint8_t> spirv = compile_stage_to_spirv(RDC::SHADER_STAGE_COMPUTE, BINDLESS_MATERIAL_GLSL, &glsl_error);
+	REQUIRE_MESSAGE(!spirv.is_empty(), vformat("glslang failed: %s", glsl_error));
+
+	Ref<RenderingShaderContainerMetal> container;
+	String msl_source;
+	REQUIRE(build_bindless_material_container(spirv, container, msl_source));
+
+	RDC::ShaderReflection reflection = container->get_shader_reflection();
+	REQUIRE(reflection.uniform_sets.size() == 2);
+	REQUIRE(reflection.uniform_sets[1].size() == 1);
+	CHECK(reflection.uniform_sets[1][0].type == RDC::UNIFORM_TYPE_TEXTURE);
+	CHECK(reflection.uniform_sets[1][0].unbounded);
+
+	RenderingShaderContainerMetal::MetalShaderReflection metal_reflection = container->get_metal_shader_reflection();
+	REQUIRE(metal_reflection.uniform_sets.size() == 2);
+	REQUIRE(metal_reflection.uniform_sets[1].size() == 1);
+	CHECK(metal_reflection.uniform_sets[1][0].array_length == RenderingShaderContainerMetal::UniformData::UNBOUNDED_ARRAY_LENGTH);
+	CHECK(metal_reflection.uniform_sets[1][0].arg_buffer.texture == 0);
+	CHECK(container->mtl_reflection_data.uses_argument_buffers());
+
+	CHECK(msl_source.contains("spvDescriptorArray"));
+	CHECK(msl_source.contains("device spvDescriptorSetBuffer1"));
+	CHECK(msl_source.contains("device Material"));
+}
+
+TEST_CASE_PENDING("[MetalRT][GPU] Metal container executes bindless GPU-addressed material access") {
+	NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+	NS::SharedPtr<MTL::Device> device = NS::TransferPtr(MTL::CreateSystemDefaultDevice());
+	if (!device || !device->supportsFamily(MTL::GPUFamilyMetal3) || device->argumentBuffersSupport() != MTL::ArgumentBuffersTier2) {
+		MESSAGE("SKIP_REASON=missing_metal3_argument_buffers");
+		return;
+	}
+	if (!__builtin_available(macOS 13.0, *)) {
+		MESSAGE("SKIP_REASON=missing_gpu_address_os_support");
+		return;
+	}
+
+	String glsl_error;
+	Vector<uint8_t> spirv = compile_stage_to_spirv(RDC::SHADER_STAGE_COMPUTE, BINDLESS_MATERIAL_GLSL, &glsl_error);
+	REQUIRE_MESSAGE(!spirv.is_empty(), vformat("glslang failed: %s", glsl_error));
+
+	Ref<RenderingShaderContainerMetal> container;
+	String msl_source;
+	REQUIRE(build_bindless_material_container(spirv, container, msl_source));
+
+	NS::Error *error = nullptr;
+	NS::SharedPtr<MTL::CompileOptions> compile_options = NS::TransferPtr(MTL::CompileOptions::alloc()->init());
+	compile_options->setLanguageVersion(MTL::LanguageVersion3_0);
+	CharString source_utf8 = msl_source.utf8();
+	NS::SharedPtr<NS::String> source_string = NS::TransferPtr(NS::String::alloc()->init(source_utf8.get_data(), NS::UTF8StringEncoding));
+	NS::SharedPtr<MTL::Library> library = NS::TransferPtr(device->newLibrary(source_string.get(), compile_options.get(), &error));
+	REQUIRE_MESSAGE(library, vformat("MSL runtime compile failed: %s", error ? error->localizedDescription()->utf8String() : "unknown error"));
+	NS::SharedPtr<NS::String> entry_name = NS::TransferPtr(NS::String::alloc()->init("main0", NS::UTF8StringEncoding));
+	NS::SharedPtr<MTL::Function> function = NS::TransferPtr(library->newFunction(entry_name.get()));
+	REQUIRE(function);
+	NS::SharedPtr<MTL::ComputePipelineState> pipeline = NS::TransferPtr(device->newComputePipelineState(function.get(), &error));
+	REQUIRE_MESSAGE(pipeline, vformat("compute pipeline creation failed: %s", error ? error->localizedDescription()->utf8String() : "unknown error"));
+
+	struct MaterialData {
+		uint32_t texture_index = 1;
+	};
+	MaterialData material;
+	NS::SharedPtr<MTL::Buffer> material_buffer = NS::TransferPtr(device->newBuffer(&material, sizeof(material), MTL::ResourceStorageModeShared));
+	REQUIRE(material_buffer);
+	uint64_t material_address = material_buffer->gpuAddress();
+	NS::SharedPtr<MTL::Buffer> address_buffer = NS::TransferPtr(device->newBuffer(&material_address, sizeof(material_address), MTL::ResourceStorageModeShared));
+	REQUIRE(address_buffer);
+	float result_data[4] = {};
+	NS::SharedPtr<MTL::Buffer> result_buffer = NS::TransferPtr(device->newBuffer(result_data, sizeof(result_data), MTL::ResourceStorageModeShared));
+	REQUIRE(result_buffer);
+
+	NS::SharedPtr<MTL::TextureDescriptor> texture_descriptor = NS::TransferPtr(MTL::TextureDescriptor::alloc()->init());
+	texture_descriptor->setTextureType(MTL::TextureType2D);
+	texture_descriptor->setPixelFormat(MTL::PixelFormatRGBA32Float);
+	texture_descriptor->setWidth(1);
+	texture_descriptor->setHeight(1);
+	texture_descriptor->setStorageMode(MTL::StorageModeShared);
+	texture_descriptor->setUsage(MTL::TextureUsageShaderRead);
+	NS::SharedPtr<MTL::Texture> sentinel_texture = NS::TransferPtr(device->newTexture(texture_descriptor.get()));
+	NS::SharedPtr<MTL::Texture> material_texture = NS::TransferPtr(device->newTexture(texture_descriptor.get()));
+	REQUIRE(sentinel_texture);
+	REQUIRE(material_texture);
+	const float sentinel_color[4] = { 1.0f, 0.0f, 1.0f, 1.0f };
+	const float expected_color[4] = { 0.125f, 0.75f, 0.25f, 1.0f };
+	sentinel_texture->replaceRegion(MTL::Region::Make2D(0, 0, 1, 1), 0, sentinel_color, sizeof(sentinel_color));
+	material_texture->replaceRegion(MTL::Region::Make2D(0, 0, 1, 1), 0, expected_color, sizeof(expected_color));
+
+	NS::SharedPtr<MTL::SamplerDescriptor> sampler_descriptor = NS::TransferPtr(MTL::SamplerDescriptor::alloc()->init());
+	sampler_descriptor->setSupportArgumentBuffers(true);
+	sampler_descriptor->setMinFilter(MTL::SamplerMinMagFilterNearest);
+	sampler_descriptor->setMagFilter(MTL::SamplerMinMagFilterNearest);
+	NS::SharedPtr<MTL::SamplerState> sampler = NS::TransferPtr(device->newSamplerState(sampler_descriptor.get()));
+	REQUIRE(sampler);
+
+	RenderingShaderContainerMetal::MetalShaderReflection reflection = container->get_metal_shader_reflection();
+	REQUIRE(reflection.uniform_sets.size() == 2);
+	REQUIRE(reflection.uniform_sets[0].size() == 3);
+	REQUIRE(reflection.uniform_sets[1].size() == 1);
+	const RenderingShaderContainerMetal::UniformData &addresses_uniform = reflection.uniform_sets[0][0];
+	const RenderingShaderContainerMetal::UniformData &sampler_uniform = reflection.uniform_sets[0][1];
+	const RenderingShaderContainerMetal::UniformData &result_uniform = reflection.uniform_sets[0][2];
+	const RenderingShaderContainerMetal::UniformData &textures_uniform = reflection.uniform_sets[1][0];
+
+	uint64_t fixed_argument_data[3] = {};
+	fixed_argument_data[addresses_uniform.arg_buffer.buffer] = address_buffer->gpuAddress();
+	fixed_argument_data[sampler_uniform.arg_buffer.sampler] = sampler->gpuResourceID()._impl;
+	fixed_argument_data[result_uniform.arg_buffer.buffer] = result_buffer->gpuAddress();
+	NS::SharedPtr<MTL::Buffer> fixed_argument_buffer = NS::TransferPtr(device->newBuffer(fixed_argument_data, sizeof(fixed_argument_data), MTL::ResourceStorageModeShared));
+	REQUIRE(fixed_argument_buffer);
+
+	Vector<uint64_t> bindless_argument_data;
+	bindless_argument_data.resize(textures_uniform.arg_buffer.texture + 2);
+	bindless_argument_data.write[textures_uniform.arg_buffer.texture + 0] = sentinel_texture->gpuResourceID()._impl;
+	bindless_argument_data.write[textures_uniform.arg_buffer.texture + 1] = material_texture->gpuResourceID()._impl;
+	NS::SharedPtr<MTL::Buffer> bindless_argument_buffer = NS::TransferPtr(device->newBuffer(bindless_argument_data.ptr(), bindless_argument_data.size() * sizeof(uint64_t), MTL::ResourceStorageModeShared));
+	REQUIRE(bindless_argument_buffer);
+
+	NS::SharedPtr<MTL::CommandQueue> queue = NS::TransferPtr(device->newCommandQueue());
+	REQUIRE(queue);
+	NS::SharedPtr<MTL::CommandBuffer> command = NS::RetainPtr(queue->commandBuffer());
+	NS::SharedPtr<MTL::ComputeCommandEncoder> encoder = NS::RetainPtr(command->computeCommandEncoder());
+	REQUIRE(encoder);
+	encoder->setComputePipelineState(pipeline.get());
+	encoder->setBuffer(fixed_argument_buffer.get(), 0, 0);
+	encoder->setBuffer(bindless_argument_buffer.get(), 0, 1);
+	encoder->useResource(address_buffer.get(), MTL::ResourceUsageRead);
+	encoder->useResource(material_buffer.get(), MTL::ResourceUsageRead);
+	encoder->useResource(result_buffer.get(), MTL::ResourceUsageWrite);
+	encoder->useResource(sentinel_texture.get(), MTL::ResourceUsageRead);
+	encoder->useResource(material_texture.get(), MTL::ResourceUsageRead);
+	encoder->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(1, 1, 1));
+	encoder->endEncoding();
+	command->commit();
+	command->waitUntilCompleted();
+	REQUIRE(command->status() == MTL::CommandBufferStatusCompleted);
+	CHECK(command->error() == nullptr);
+
+	memcpy(result_data, result_buffer->contents(), sizeof(result_data));
+	for (uint32_t i = 0; i < 4; i++) {
+		CHECK(result_data[i] == doctest::Approx(expected_color[i]));
+	}
+	print_line(vformat("MetalRT bindless material access: device=\"%s\" descriptors=%d color=(%f, %f, %f, %f)",
+			device->name()->utf8String(), bindless_argument_data.size(), result_data[0], result_data[1], result_data[2], result_data[3]));
 }
 
 TEST_CASE("[MetalRT] C7 SPIRV-Cross lane cannot lower RT pipeline stages") {
