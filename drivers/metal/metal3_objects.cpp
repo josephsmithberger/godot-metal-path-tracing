@@ -259,7 +259,7 @@ void MDCommandBuffer::bind_pipeline(RDD::PipelineID p_pipeline) {
 			}
 			render.pipeline = rp;
 		}
-	} else if (p->type == MDPipelineType::Compute) {
+	} else if (p->type == MDPipelineType::Compute || p->type == MDPipelineType::Raytracing) {
 		DEV_ASSERT(type == MDCommandBufferStateType::None);
 		type = MDCommandBufferStateType::Compute;
 
@@ -267,7 +267,7 @@ void MDCommandBuffer::bind_pipeline(RDD::PipelineID p_pipeline) {
 			compute.dirty.set_flag(ComputeState::DIRTY_PIPELINE);
 			binding_cache.clear();
 			compute.mark_uniforms_dirty();
-			compute.pipeline = (MDComputePipeline *)p;
+			compute.pipeline = p;
 		}
 	}
 }
@@ -1379,7 +1379,9 @@ void MDCommandBuffer::_compute_set_dirty_state() {
 	if (compute.dirty.has_flag(ComputeState::DIRTY_PIPELINE)) {
 		compute.encoder = NS::RetainPtr(command_buffer()->computeCommandEncoder(MTL::DispatchTypeConcurrent));
 		_encode_barrier(compute.encoder.get());
-		compute.encoder->setComputePipelineState(compute.pipeline->state.get());
+		MTL::ComputePipelineState *pipeline_state = compute.pipeline->get_compute_pipeline_state();
+		DEV_ASSERT(pipeline_state != nullptr);
+		compute.encoder->setComputePipelineState(pipeline_state);
 	}
 
 	_compute_bind_uniform_sets();
@@ -1407,7 +1409,8 @@ void MDCommandBuffer::_compute_bind_uniform_sets() {
 	uint64_t set_uniforms = compute.uniform_set_mask;
 	compute.uniform_set_mask = 0;
 
-	MDComputeShader *shader = compute.pipeline->shader;
+	MDShader *shader = compute.pipeline->get_compute_shader();
+	DEV_ASSERT(shader != nullptr);
 	const uint32_t dynamic_offsets = compute.dynamic_offsets;
 
 	while (set_uniforms != 0) {
@@ -1483,7 +1486,7 @@ void MDCommandBuffer::compute_dispatch(uint32_t p_x_groups, uint32_t p_y_groups,
 	MTL::Size size = MTL::Size(p_x_groups, p_y_groups, p_z_groups);
 
 	MTL::ComputeCommandEncoder *enc = compute.encoder.get();
-	enc->dispatchThreadgroups(size, compute.pipeline->compute_state.local);
+	enc->dispatchThreadgroups(size, compute.pipeline->get_threads_per_threadgroup());
 }
 
 void MDCommandBuffer::compute_dispatch_indirect(RDD::BufferID p_indirect_buffer, uint64_t p_offset) {
@@ -1494,7 +1497,7 @@ void MDCommandBuffer::compute_dispatch_indirect(RDD::BufferID p_indirect_buffer,
 	const RenderingDeviceDriverMetal::BufferInfo *indirectBuffer = (const RenderingDeviceDriverMetal::BufferInfo *)p_indirect_buffer.id;
 
 	MTL::ComputeCommandEncoder *enc = compute.encoder.get();
-	enc->dispatchThreadgroups(indirectBuffer->metal_buffer.get(), p_offset, compute.pipeline->compute_state.local);
+	enc->dispatchThreadgroups(indirectBuffer->metal_buffer.get(), p_offset, compute.pipeline->get_threads_per_threadgroup());
 }
 
 #pragma mark - Acceleration Structure Commands
@@ -1630,6 +1633,14 @@ void DirectEncoder::set(MTL::SamplerState **p_samplers, NS::Range p_range) {
 				enc->setSamplerStates(p_samplers, p_range);
 			} break;
 		}
+	}
+}
+
+void DirectEncoder::set(MTL::AccelerationStructure *p_acceleration_structure, uint32_t p_index) {
+	DEV_ASSERT(mode == COMPUTE);
+	if (cache.update(p_acceleration_structure, p_index)) {
+		MTL::ComputeCommandEncoder *enc = static_cast<MTL::ComputeCommandEncoder *>(encoder);
+		enc->setAccelerationStructure(p_acceleration_structure, p_index);
 	}
 }
 
@@ -1783,6 +1794,11 @@ void MDCommandBuffer::_bind_uniforms_direct(MDUniformSet *p_set, MDShader *p_sha
 				}
 				NS::Range texture_range = { indexes.texture, count };
 				p_enc.set(objects, texture_range);
+			} break;
+			case RDD::UNIFORM_TYPE_ACCELERATION_STRUCTURE: {
+				const MDAccelerationStructure *acceleration_structure = (const MDAccelerationStructure *)uniform.ids[0].id;
+				DEV_ASSERT(acceleration_structure != nullptr && acceleration_structure->accel);
+				p_enc.set(acceleration_structure->accel.get(), indexes.buffer);
 			} break;
 			default: {
 				DEV_ASSERT(false);

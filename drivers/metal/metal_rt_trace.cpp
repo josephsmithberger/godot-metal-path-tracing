@@ -117,7 +117,11 @@ bool MDRaytracingPipeline::create_trace_one_ray(MTL::Device *p_device, String *r
 	}
 
 	NS::SharedPtr<MTL::IntersectionFunctionTableDescriptor> table_descriptor = NS::TransferPtr(MTL::IntersectionFunctionTableDescriptor::alloc()->init());
-	table_descriptor->setFunctionCount(1);
+	// Slot zero is always the system opaque-triangle function. C9 reserves one
+	// additional stable slot per procedural hit group; those slots are populated
+	// by the C10 compute lowering rather than Vulkan RT-stage functions.
+	const uint32_t function_count = MAX(1u, uint32_t(intersection_functions.size()));
+	table_descriptor->setFunctionCount(function_count);
 	intersection_function_table = NS::TransferPtr(state->newIntersectionFunctionTable(table_descriptor.get()));
 	if (!intersection_function_table) {
 		state.reset();
@@ -130,7 +134,7 @@ bool MDRaytracingPipeline::create_trace_one_ray(MTL::Device *p_device, String *r
 	const MTL::IntersectionFunctionSignature signature = static_cast<MTL::IntersectionFunctionSignature>(
 			MTL::IntersectionFunctionSignatureInstancing | MTL::IntersectionFunctionSignatureTriangleData);
 	intersection_function_table->setOpaqueTriangleIntersectionFunction(signature, 0);
-	intersection_function_count = 1;
+	intersection_function_count = function_count;
 	return true;
 }
 

@@ -997,6 +997,10 @@ class API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0), visionos(2.0)) MDPipelin
 public:
 	MDPipelineType type;
 
+	virtual MTL::ComputePipelineState *get_compute_pipeline_state() const { return nullptr; }
+	virtual MDShader *get_compute_shader() const { return nullptr; }
+	virtual MTL::Size get_threads_per_threadgroup() const { return {}; }
+
 	explicit MDPipeline(MDPipelineType p_type) :
 			type(p_type) {}
 	virtual ~MDPipeline() = default;
@@ -1094,18 +1098,65 @@ public:
 
 	explicit MDComputePipeline(NS::SharedPtr<MTL::ComputePipelineState> p_state) :
 			MDPipeline(MDPipelineType::Compute), state(std::move(p_state)) {}
+
+	MTL::ComputePipelineState *get_compute_pipeline_state() const final { return state.get(); }
+	MDShader *get_compute_shader() const final { return shader; }
+	MTL::Size get_threads_per_threadgroup() const final { return compute_state.local; }
 	~MDComputePipeline() final = default;
 };
 
-/*! A minimal compute-backed ray-tracing pipeline.
+/*! A compute-backed ray-tracing pipeline and Godot shader-group translation.
  *
  * Metal has no dedicated ray-tracing pipeline object; tracing runs as a compute
- * dispatch whose kernel uses the MSL intersector. Chunk C8 gives this object a
- * native trace-kernel pipeline and its pipeline-specific intersection-function
- * table. Mapping Godot shader groups and bindings onto it remains chunk C9.
+ * dispatch whose kernel uses a ray query or the MSL intersector. Godot's Vulkan-
+ * shaped shader groups are retained as small, deterministic records. Triangle
+ * groups share Metal's system opaque-triangle intersection function; procedural
+ * groups reserve stable table slots for the compute lowering supplied by C10.
  */
 class API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0), visionos(2.0)) MDRaytracingPipeline final : public MDPipeline {
 public:
+	enum class ShaderGroupType : uint32_t {
+		RAYGEN,
+		MISS,
+		TRIANGLE_HIT,
+		PROCEDURAL_HIT,
+		EMPTY_HIT,
+	};
+
+	enum class IntersectionFunctionType : uint32_t {
+		OPAQUE_TRIANGLE,
+		PROCEDURAL,
+	};
+
+	struct ShaderGroup {
+		ShaderGroupType type = ShaderGroupType::EMPTY_HIT;
+		uint32_t general_shader_index = UINT32_MAX;
+		uint32_t closest_hit_shader_index = UINT32_MAX;
+		uint32_t any_hit_shader_index = UINT32_MAX;
+		uint32_t intersection_shader_index = UINT32_MAX;
+		uint32_t intersection_function_table_index = UINT32_MAX;
+	};
+
+	struct IntersectionFunction {
+		IntersectionFunctionType type = IntersectionFunctionType::OPAQUE_TRIANGLE;
+		uint32_t shader_index = UINT32_MAX;
+	};
+
+	// Metal has no opaque Vulkan-style shader-group handle. These records are
+	// copied into Godot's compatibility SBT buffers and consumed as stable table
+	// indices by the compute lowering.
+	struct ShaderGroupHandle {
+		static constexpr uint32_t MAGIC = 0x4d525447; // "MRTG".
+		uint32_t magic = MAGIC;
+		uint32_t group_index = UINT32_MAX;
+		uint32_t intersection_function_table_index = UINT32_MAX;
+		ShaderGroupType type = ShaderGroupType::EMPTY_HIT;
+	};
+
+	static constexpr uint32_t SHADER_GROUP_HANDLE_SIZE = sizeof(ShaderGroupHandle);
+	static constexpr uint32_t SHADER_GROUP_HANDLE_ALIGNMENT = alignof(ShaderGroupHandle);
+	static constexpr uint32_t SHADER_GROUP_BASE_ALIGNMENT = 16;
+
 	static constexpr uint32_t TRACE_PIXEL_SIZE_BYTES = 4;
 	static constexpr uint32_t TRACE_TLAS_BUFFER_INDEX = 0;
 	static constexpr uint32_t TRACE_OUTPUT_BUFFER_INDEX = 1;
@@ -1119,6 +1170,20 @@ public:
 	NS::SharedPtr<MTL::IntersectionFunctionTable> intersection_function_table;
 	uint32_t intersection_function_count = 0;
 
+	Vector<ShaderGroup> shader_groups;
+	Vector<IntersectionFunction> intersection_functions;
+	uint32_t raygen_group_count = 0;
+	uint32_t miss_group_count = 0;
+	uint32_t hit_group_count = 0;
+	// Metal has no pipeline recursion limit. This is the software recursion
+	// budget which the C10 compute lowering must enforce explicitly.
+	uint32_t max_trace_recursion_depth = 0;
+	MDShader *shader = nullptr;
+	MTL::Size threads_per_threadgroup = MTL::Size(8, 8, 1);
+
+	bool configure_shader_groups(VectorView<RDD::PipelineShader> p_shaders, VectorView<uint32_t> p_raygen_shader_indices, VectorView<uint32_t> p_miss_shader_indices, VectorView<RDD::HitGroup> p_hit_groups, uint32_t p_max_trace_recursion_depth, String *r_error = nullptr);
+	bool get_shader_group_handles(uint32_t p_group_index_offset, VectorView<uint32_t> p_group_indices, uint8_t *r_data, uint32_t p_data_stride_bytes, String *r_error = nullptr) const;
+
 	/// Creates the backend-owned C8 kernel and its intersection-function table.
 	bool create_trace_one_ray(MTL::Device *p_device, String *r_error = nullptr);
 	/// Encodes a 2D image dispatch. Each output pixel is four bytes (RGBA8).
@@ -1128,10 +1193,16 @@ public:
 		return state && intersection_function_table && intersection_function_count > 0;
 	}
 
+	MTL::ComputePipelineState *get_compute_pipeline_state() const final { return state.get(); }
+	MDShader *get_compute_shader() const final { return shader; }
+	MTL::Size get_threads_per_threadgroup() const final { return threads_per_threadgroup; }
+
 	MDRaytracingPipeline() :
 			MDPipeline(MDPipelineType::Raytracing) {}
 	~MDRaytracingPipeline() final = default;
 };
+
+static_assert(sizeof(MDRaytracingPipeline::ShaderGroupHandle) == 16, "Metal RT shader-group handles must remain stable 16-byte records.");
 
 #pragma mark - Acceleration Structures
 

@@ -571,6 +571,12 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 						found->get_indexes(UniformData::IndexType::ARG).texture = next_arg_index(binding_stride);
 						rb.basetype = SPIRType::BaseType::Image;
 					} break;
+					case RDC::UNIFORM_TYPE_ACCELERATION_STRUCTURE: {
+						found->data_type = MTL::DataTypeInstanceAccelerationStructure;
+						found->get_indexes(UniformData::IndexType::SLOT).buffer = next_index(Buffer, binding_stride);
+						found->get_indexes(UniformData::IndexType::ARG).buffer = next_arg_index(binding_stride);
+						rb.basetype = SPIRType::BaseType::AccelerationStructure;
+					} break;
 					case RDC::UNIFORM_TYPE_MAX:
 					default:
 						CRASH_NOW_MSG("Unreachable");
