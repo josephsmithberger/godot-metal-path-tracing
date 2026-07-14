@@ -19,7 +19,7 @@ from typing import Any
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[2]
 DEFAULT_ARTIFACT_ROOT = REPO_ROOT / "mac-rt-planning" / "artifacts"
-VALID_STAGES = ("preflight", "caps", "build", "smoke", "unit", "gpu", "image", "editor-scene", "geometry-scene", "fallback")
+VALID_STAGES = ("preflight", "caps", "build", "smoke", "unit", "gpu", "image", "editor-scene", "geometry-scene", "material-scene", "fallback")
 CAPS_PROBE_SOURCE = REPO_ROOT / "docs" / "rt_metal_port" / "capability_probe.mm"
 RUNTIME_GATE_PROJECT = REPO_ROOT / "tests" / "metal_rt"
 EDITOR_SCENE_PROJECT = RUNTIME_GATE_PROJECT / "editor"
@@ -27,6 +27,8 @@ EDITOR_SCENE_FIXTURE = "res://fixtures/e0_hg0.tscn"
 EDITOR_SCENE_VERIFY_SCRIPT = RUNTIME_GATE_PROJECT / "verify_editor_scene.py"
 GEOMETRY_SCENE_FIXTURE = "res://fixtures/e1_geometry.tscn"
 GEOMETRY_SCENE_VERIFY_SCRIPT = RUNTIME_GATE_PROJECT / "verify_geometry_scene.py"
+MATERIAL_SCENE_FIXTURE = "res://fixtures/e2_materials.tscn"
+MATERIAL_SCENE_VERIFY_SCRIPT = RUNTIME_GATE_PROJECT / "verify_material_scene.py"
 IMAGE_DIFF_SCRIPT = RUNTIME_GATE_PROJECT / "image_diff.py"
 IMAGE_DIFF_TEST_SCRIPT = RUNTIME_GATE_PROJECT / "test_image_diff.py"
 IMAGE_REFERENCE = RUNTIME_GATE_PROJECT / "references" / "c10_pathtracer_launch_v1.png"
@@ -177,7 +179,7 @@ def make_commands(
         ])
 
     if "caps" in stages or (
-        any(stage in stages for stage in ("gpu", "image", "editor-scene", "geometry-scene", "fallback")) and args.arch == "arm64"
+        any(stage in stages for stage in ("gpu", "image", "editor-scene", "geometry-scene", "material-scene", "fallback")) and args.arch == "arm64"
     ):
         probe_binary = artifact_dir / "capability_probe"
         commands.extend([
@@ -422,6 +424,73 @@ def make_commands(
                     "METAL_RT_FIXTURE_REVISION=e1-geometry-v1",
                 ),
                 forbidden_log_patterns=("METAL_RT_C13_EDITOR_HG0=passed", "METAL_RT_C14_SCENE_GEOMETRY=passed"),
+            ),
+        ])
+
+    if "material-scene" in stages:
+        material_command = [
+            str(binary),
+            "--editor",
+            "--path",
+            str(EDITOR_SCENE_PROJECT),
+            MATERIAL_SCENE_FIXTURE,
+            "--quit-after",
+            "900",
+        ]
+        material_environment = {
+            **METAL_VALIDATION_ENVIRONMENT,
+            "GODOT_MRT_EDITOR_CAPTURE": "1",
+            "GODOT_MRT_FIXTURE": "e2_materials",
+        }
+        material_markers = (
+            "METAL_RT_EDITOR_ROUTE=compute_ray_query",
+            "METAL_RT_C15_MATERIAL_DISPATCH=passed",
+            "METAL_RT_ALPHA_TEST=passed",
+            "METAL_RT_CUSTOM_SHADER_RELOAD=passed",
+            "METAL_RT_FIXTURE_REVISION=e2-materials-v1",
+        )
+        commands.extend([
+            command_record(
+                "material-scene-cold",
+                material_command,
+                requires_passed="caps-probe" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                environment={**material_environment, "GODOT_MRT_CAPTURE_LABEL": "cold"},
+                required_log_patterns=material_markers,
+                forbidden_log_patterns=METAL_VALIDATION_FORBIDDEN_PATTERNS,
+            ),
+            command_record(
+                "material-scene-reload",
+                material_command,
+                requires_passed="material-scene-cold" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                environment={**material_environment, "GODOT_MRT_CAPTURE_LABEL": "reload"},
+                required_log_patterns=material_markers,
+                forbidden_log_patterns=METAL_VALIDATION_FORBIDDEN_PATTERNS,
+            ),
+            command_record(
+                "material-scene-verify",
+                [sys.executable, str(MATERIAL_SCENE_VERIFY_SCRIPT), str(artifact_dir)],
+                requires_passed="material-scene-reload" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                required_log_patterns=("METAL_RT_C15_FIXTURE_VERIFY=passed",),
+            ),
+            command_record(
+                "material-scene-forced-fallback",
+                material_command,
+                requires_passed="material-scene-verify" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                environment={
+                    **material_environment,
+                    "GODOT_MRT_CAPTURE_LABEL": "fallback",
+                    "GODOT_MTL_DISABLE_RAYTRACING": "1",
+                },
+                required_log_patterns=(
+                    "using non-RT rendering fallback",
+                    "C11_GATE=disabled:forced_disabled",
+                    "METAL_RT_FIXTURE_REVISION=e2-materials-v1",
+                ),
+                forbidden_log_patterns=("METAL_RT_C13_EDITOR_HG0=passed", "METAL_RT_C15_MATERIAL_DISPATCH=passed"),
             ),
         ])
 
