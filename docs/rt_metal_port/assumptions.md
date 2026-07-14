@@ -230,7 +230,8 @@ tracer later, but no chunk C1-C12 depends on it.
   the A4 floor). C11 exposes this lane through the runtime checks and graceful
   fallback in [`runtime_gating.md`](runtime_gating.md). C13 adds the restricted
   HG0 `SceneShaderRaytracing` integration; its exact subset and remaining
-  parity work are documented in [`editor_hg0.md`](editor_hg0.md).
+  first editor subset is documented in [`editor_hg0.md`](editor_hg0.md), and
+  C14 geometry/lifetime widening in [`scene_geometry.md`](scene_geometry.md).
 
 ## Open questions (tracked, not assumed)
 

@@ -28,6 +28,7 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
+#include "servers/rendering/renderer_rd/forward_clustered/render_raytracing.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h"
 #include "tests/test_macros.h"
 
@@ -59,6 +60,20 @@ TEST_CASE("[MetalRT] C13 masks unsupported Metal scene variants") {
 	CHECK((sanitized & SceneShader::RT_FLAG_SER_ENABLED) == 0);
 	CHECK(((sanitized >> SceneShader::RT_SAMPLE_COUNT_SHIFT) & SceneShader::RT_SAMPLE_COUNT_MASK) == 4);
 	CHECK(((sanitized >> SceneShader::RT_MAX_BOUNCES_SHIFT) & SceneShader::RT_MAX_BOUNCES_MASK) == 2);
+}
+
+TEST_CASE("[MetalRT] C14 preserves front-face winding across mirrored transforms") {
+	using namespace RendererSceneRenderImplementation;
+	const uint32_t flip = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT;
+	const uint32_t opaque = RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
+
+	Transform3D regular;
+	CHECK(rt_instance_flags_apply_transform_winding(flip | opaque, regular) == (flip | opaque));
+
+	Transform3D mirrored;
+	mirrored.basis.scale(Vector3(-1.0, 1.0, 1.0));
+	CHECK(rt_instance_flags_apply_transform_winding(flip | opaque, mirrored) == opaque);
+	CHECK(rt_instance_flags_apply_transform_winding(opaque, mirrored) == (flip | opaque));
 }
 
 } // namespace TestSceneShaderRaytracing

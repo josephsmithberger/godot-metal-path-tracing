@@ -236,13 +236,20 @@ uint64_t RenderRaytracing::mat_ubo_pool_get_address(uint32_t p_slot) const {
 // ---------------------------------------------------------------------------
 
 void RenderRaytracing::cleanup_caches() {
-	// Static-surface BLASes are NOT freed here: they were created with the default
-	// lifetime and will be cascade-freed by RD when their source vertex buffer is freed.
+	RD *rd = RD::get_singleton();
+
+	// Static BLASes are owned by this cache. A source mesh deletion may have
+	// already cascade-freed one through RenderingDevice dependencies, hence the
+	// explicit validity check before renderer restart / shutdown cleanup.
 	for (uint32_t i = 0; i < surface_chunks.size(); i++) {
 		if (surface_chunks[i]) {
 			for (uint32_t j = 0; j < RT_CACHE_CHUNK_SIZE; j++) {
 				RTCacheEntry *entry = &surface_chunks[i][j];
 				if (entry->ptr) {
+					if (entry->ptr->blas.is_valid() && rd->acceleration_structure_is_valid(entry->ptr->blas)) {
+						rd->free_rid(entry->ptr->blas);
+						entry->ptr->blas = RID();
+					}
 					memdelete(entry->ptr);
 					entry->ptr = nullptr;
 				}
@@ -251,8 +258,6 @@ void RenderRaytracing::cleanup_caches() {
 		}
 	}
 	surface_chunks.clear();
-
-	RD *rd = RD::get_singleton();
 
 	// Free all cached deformed surface data.
 	{
@@ -1791,6 +1796,26 @@ bool RenderRaytracing::_build_merged_mm_blas(
 	if (prim_count == 0 || vertex_count == 0) {
 		return false;
 	}
+
+	// A merged BLAS has one TLAS winding flag for every baked instance. Mixed
+	// mirrored/non-mirrored transforms cannot be represented by that flag, so
+	// use the expanded TLAS path where each repeated instance gets its own flag.
+	const float *mm_local_data = mesh_storage->multimesh_get_local_data_ptr(p_mm_rid);
+	const uint32_t mm_stride = mesh_storage->multimesh_get_stride(p_mm_rid);
+	const uint32_t mm_offset = mesh_storage->multimesh_get_current_instance_offset(p_mm_rid);
+	if (!mm_local_data || mm_stride < 12) {
+		return false;
+	}
+	for (uint32_t i = 0; i < p_mm_count; i++) {
+		const float *d = mm_local_data + (mm_offset + i) * mm_stride;
+		const float determinant =
+				d[0] * (d[5] * d[10] - d[6] * d[9]) -
+				d[1] * (d[4] * d[10] - d[6] * d[8]) +
+				d[2] * (d[4] * d[9] - d[5] * d[8]);
+		if (determinant < 0.0f) {
+			return false;
+		}
+	}
 	static const uint32_t MM_MERGED_BLAS_MAX_TRIANGLES = (uint32_t)GLOBAL_GET("rendering/pathtracer/multimesh_merged_blas_max_triangles");
 	if ((uint64_t)p_mm_count * prim_count > MM_MERGED_BLAS_MAX_TRIANGLES) {
 		return false; // Too large; fall back to expanded TLAS.
@@ -1992,7 +2017,6 @@ bool RenderRaytracing::_build_merged_mm_blas(
 		}
 		RID merge_uniform_set = rd->uniform_set_create(uniforms, mm_merge_shader.version_shader[merge_mode], 0, /*p_linear_pool=*/true);
 		ERR_FAIL_COND_V(!merge_uniform_set.is_valid(), false);
-		uint32_t mm_stride = mesh_storage->multimesh_get_stride(p_mm_rid);
 		uint32_t mm_cur_offset = mesh_storage->multimesh_get_current_instance_offset(p_mm_rid);
 		uint32_t tbn_stride_words = tbn_stride / 4;
 		// In the merged vertex buffer the TBN block starts after all N*V float3 positions.
@@ -2176,6 +2200,22 @@ _FORCE_INLINE_ static uint32_t _rt_indices_to_primitives(RSE::PrimitiveType p_pr
 	return (p_indices - subtractor[p_primitive]) / divisor[p_primitive];
 }
 
+static bool _rt_triangle_geometry_supported(RSE::PrimitiveType p_primitive) {
+	if (p_primitive == RSE::PRIMITIVE_TRIANGLES) {
+		return true;
+	}
+	WARN_PRINT_ONCE("Path tracing supports triangle-list mesh surfaces only. Convert point, line, or strip surfaces to PRIMITIVE_TRIANGLES; the unsupported surface was omitted from the TLAS.");
+	return false;
+}
+
+static bool _rt_metal_hg0_cull_supported(const SceneShaderForwardClustered::ShaderData *p_shader) {
+	if (!p_shader || p_shader->rt_cull_mode() == RSE::CULL_MODE_BACK) {
+		return true;
+	}
+	WARN_PRINT_ONCE("Metal path tracing keeps double-sided and front-culled materials on the C15 fallback path; the surface was omitted from the TLAS.");
+	return false;
+}
+
 RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data, uint32_t p_rt_flags) {
 	if (!p_render_data || !p_render_data->rt_instances) {
 		return nullptr;
@@ -2245,7 +2285,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		// Handle procedural RT instances (intersection shaders).
 		if (inst->rt_procedural) {
 			if (hg0_compute_lane) {
-				WARN_PRINT_ONCE("Metal C13 HG0 excludes procedural ray-tracing geometry; the instance was omitted from the TLAS.");
+				WARN_PRINT_ONCE("Metal path tracing keeps procedural AABB geometry on the C16 fallback path; the instance was omitted from the TLAS.");
 				continue;
 			}
 			SceneShaderRaytracing *rt_shader = SceneShaderRaytracing::get_singleton();
@@ -2321,10 +2361,6 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		// MultiMesh: resolve materials and warm data cache now.
 		// Compute dispatches and TLAS assembly are deferred to Phase 2.
 		if (inst->data->base_type == RSE::INSTANCE_MULTIMESH) {
-			if (hg0_compute_lane) {
-				WARN_PRINT_ONCE("Metal C13 HG0 excludes MultiMesh content; the instance was omitted from the TLAS.");
-				continue;
-			}
 			RID mm_rid = inst->data->base;
 
 			if (mesh_storage->multimesh_get_transform_format(mm_rid) != RSE::MULTIMESH_TRANSFORM_3D) {
@@ -2349,6 +2385,14 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					mm_surf = mm_surf->next;
 					continue;
 				}
+				if (!_rt_triangle_geometry_supported(mm_surf->primitive)) {
+					mm_surf = mm_surf->next;
+					continue;
+				}
+				if (hg0_compute_lane && !_rt_metal_hg0_cull_supported(mm_surf->shader)) {
+					mm_surf = mm_surf->next;
+					continue;
+				}
 
 				void *mesh_surface = mm_surf->surface;
 				uint32_t surface_counter = mesh_storage->mesh_surface_get_rt_invalidation_counter(mesh_surface);
@@ -2368,6 +2412,11 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 				uint16_t material_counter = material_storage->material_get_rt_invalidation_counter(material_rid);
 				RTMaterialData *mat_data = process_material(material_rid, material_counter);
+				if (hg0_compute_lane && mat_data->rt_sbt_offset > 0) {
+					WARN_PRINT_ONCE("Metal path tracing keeps custom spatial materials on the C15 fallback path; the surface was omitted from the TLAS.");
+					mm_surf = mm_surf->next;
+					continue;
+				}
 
 				if (mat_data->rt_sbt_offset > 0 &&
 						!rt_shader_singleton->is_hg_ready_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
@@ -2435,11 +2484,14 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				surf = surf->next;
 				continue;
 			}
+			if (!_rt_triangle_geometry_supported(surf->primitive)) {
+				surf = surf->next;
+				continue;
+			}
 
 			void *mesh_surface = surf->surface;
 			uint32_t surface_counter = mesh_storage->mesh_surface_get_rt_invalidation_counter(mesh_surface);
-			if (hg0_compute_lane && surf->shader && surf->shader->rt_cull_mode() != RSE::CULL_MODE_BACK) {
-				WARN_PRINT_ONCE("Metal C13 HG0 supports back-face-culled opaque surfaces only; a double-sided/front-culled surface was omitted from the TLAS.");
+			if (hg0_compute_lane && !_rt_metal_hg0_cull_supported(surf->shader)) {
 				surf = surf->next;
 				continue;
 			}
@@ -2454,11 +2506,6 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			if (inst->mesh_instance.is_valid()) {
 				RID curr_vb = mesh_storage->mesh_instance_get_vertex_buffer(inst->mesh_instance, surf->surface_index);
 				if (curr_vb.is_valid()) {
-					if (hg0_compute_lane) {
-						WARN_PRINT_ONCE("Metal C13 HG0 excludes skinned, blend-shape, and otherwise deformed meshes; the surface was omitted from the TLAS.");
-						surf = surf->next;
-						continue;
-					}
 					RTDeformedGeometrySource src;
 					src.current_vb = curr_vb;
 					src.prev_vb = mesh_storage->mesh_instance_get_prev_vertex_buffer(inst->mesh_instance, surf->surface_index);
@@ -2495,6 +2542,11 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 			uint16_t material_counter = material_storage->material_get_rt_invalidation_counter(material_rid);
 			RTMaterialData *mat_data = process_material(material_rid, material_counter);
+			if (hg0_compute_lane && mat_data->rt_sbt_offset > 0) {
+				WARN_PRINT_ONCE("Metal path tracing keeps custom spatial materials on the C15 fallback path; the surface was omitted from the TLAS.");
+				surf = surf->next;
+				continue;
+			}
 
 			if (mat_data->rt_sbt_offset > 0 &&
 					!rt_shader_singleton->is_hg_ready_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
@@ -2583,7 +2635,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 				}
 			}
-			instance_flags.push_back(inst_flags);
+			instance_flags.push_back(rt_instance_flags_apply_transform_winding(inst_flags, final_transform));
 			instance_masks.push_back(0xFF);
 
 			surf = surf->next;
@@ -2613,7 +2665,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			sbt_offsets.push_back(pending.mat_data->rt_sbt_offset);
 			material_data.push_back(pending.mat_data->data);
 			motion_indices.push_back(-1);
-			instance_flags.push_back(pending.inst_flags);
+			instance_flags.push_back(rt_instance_flags_apply_transform_winding(pending.inst_flags, pending.instance_transform));
 			instance_masks.push_back(0xFF);
 #ifdef TOOLS_ENABLED
 			if (collect_render_info) {
@@ -2685,7 +2737,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					motion_indices.push_back(-1);
 				}
 
-				instance_flags.push_back(pending.inst_flags);
+				instance_flags.push_back(rt_instance_flags_apply_transform_winding(pending.inst_flags, final_transform));
 				instance_masks.push_back(0xFF);
 			}
 

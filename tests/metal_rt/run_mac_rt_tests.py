@@ -19,12 +19,14 @@ from typing import Any
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[2]
 DEFAULT_ARTIFACT_ROOT = REPO_ROOT / "mac-rt-planning" / "artifacts"
-VALID_STAGES = ("preflight", "caps", "build", "smoke", "unit", "gpu", "image", "editor-scene", "fallback")
+VALID_STAGES = ("preflight", "caps", "build", "smoke", "unit", "gpu", "image", "editor-scene", "geometry-scene", "fallback")
 CAPS_PROBE_SOURCE = REPO_ROOT / "docs" / "rt_metal_port" / "capability_probe.mm"
 RUNTIME_GATE_PROJECT = REPO_ROOT / "tests" / "metal_rt"
 EDITOR_SCENE_PROJECT = RUNTIME_GATE_PROJECT / "editor"
 EDITOR_SCENE_FIXTURE = "res://fixtures/e0_hg0.tscn"
 EDITOR_SCENE_VERIFY_SCRIPT = RUNTIME_GATE_PROJECT / "verify_editor_scene.py"
+GEOMETRY_SCENE_FIXTURE = "res://fixtures/e1_geometry.tscn"
+GEOMETRY_SCENE_VERIFY_SCRIPT = RUNTIME_GATE_PROJECT / "verify_geometry_scene.py"
 IMAGE_DIFF_SCRIPT = RUNTIME_GATE_PROJECT / "image_diff.py"
 IMAGE_REFERENCE = RUNTIME_GATE_PROJECT / "references" / "c10_pathtracer_launch_v1.png"
 IMAGE_REFERENCE_MANIFEST = IMAGE_REFERENCE.with_suffix(".json")
@@ -151,7 +153,7 @@ def make_commands(
         ])
 
     if "caps" in stages or (
-        any(stage in stages for stage in ("gpu", "image", "editor-scene", "fallback")) and args.arch == "arm64"
+        any(stage in stages for stage in ("gpu", "image", "editor-scene", "geometry-scene", "fallback")) and args.arch == "arm64"
     ):
         probe_binary = artifact_dir / "capability_probe"
         commands.extend([
@@ -274,6 +276,7 @@ def make_commands(
         ]
         editor_environment = {
             "GODOT_MRT_EDITOR_CAPTURE": "1",
+            "GODOT_MRT_FIXTURE": "e0_hg0",
             "MTL_DEBUG_LAYER": "1",
         }
         scene_markers = (
@@ -322,6 +325,71 @@ def make_commands(
                     "METAL_RT_FIXTURE_REVISION=e0-hg0-v1",
                 ),
                 forbidden_log_patterns=("METAL_RT_C13_EDITOR_HG0=passed",),
+            ),
+        ])
+
+    if "geometry-scene" in stages:
+        geometry_command = [
+            str(binary),
+            "--editor",
+            "--path",
+            str(EDITOR_SCENE_PROJECT),
+            GEOMETRY_SCENE_FIXTURE,
+            "--quit-after",
+            "900",
+        ]
+        geometry_environment = {
+            "GODOT_MRT_EDITOR_CAPTURE": "1",
+            "GODOT_MRT_FIXTURE": "e1_geometry",
+            "MTL_DEBUG_LAYER": "1",
+        }
+        geometry_markers = (
+            "METAL_RT_EDITOR_ROUTE=compute_ray_query",
+            "METAL_RT_C13_EDITOR_HG0=passed",
+            "METAL_RT_C14_SCENE_GEOMETRY=passed",
+            "METAL_RT_MUTATION_SEQUENCE=passed",
+            "METAL_RT_FIXTURE_REVISION=e1-geometry-v1",
+        )
+        commands.extend([
+            command_record(
+                "geometry-scene-cold",
+                geometry_command,
+                requires_passed="caps-probe" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                environment={**geometry_environment, "GODOT_MRT_CAPTURE_LABEL": "cold"},
+                required_log_patterns=geometry_markers,
+            ),
+            command_record(
+                "geometry-scene-reload",
+                geometry_command,
+                requires_passed="geometry-scene-cold" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                environment={**geometry_environment, "GODOT_MRT_CAPTURE_LABEL": "reload"},
+                required_log_patterns=geometry_markers,
+            ),
+            command_record(
+                "geometry-scene-verify",
+                [sys.executable, str(GEOMETRY_SCENE_VERIFY_SCRIPT), str(artifact_dir)],
+                requires_passed="geometry-scene-reload" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                required_log_patterns=("METAL_RT_C14_FIXTURE_VERIFY=passed",),
+            ),
+            command_record(
+                "geometry-scene-forced-fallback",
+                geometry_command,
+                requires_passed="geometry-scene-verify" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                environment={
+                    **geometry_environment,
+                    "GODOT_MRT_CAPTURE_LABEL": "fallback",
+                    "GODOT_MTL_DISABLE_RAYTRACING": "1",
+                },
+                required_log_patterns=(
+                    "using non-RT rendering fallback",
+                    "C11_GATE=disabled:forced_disabled",
+                    "METAL_RT_FIXTURE_REVISION=e1-geometry-v1",
+                ),
+                forbidden_log_patterns=("METAL_RT_C13_EDITOR_HG0=passed", "METAL_RT_C14_SCENE_GEOMETRY=passed"),
             ),
         ])
 

@@ -57,6 +57,7 @@
 #include "core/string/ustring.h"
 #include "core/templates/hash_map.h"
 #include "drivers/apple/foundation_helpers.h"
+#include "drivers/metal/metal_rt_geometry.h"
 #include "drivers/metal/pixel_formats.h"
 #include "drivers/metal/rendering_context_driver_metal.h"
 #include "drivers/metal/rendering_shader_container_metal.h"
@@ -2328,12 +2329,25 @@ RDD::AccelerationStructureID RenderingDeviceDriverMetal::_acceleration_structure
 
 RDD::AccelerationStructureID RenderingDeviceDriverMetal::blas_create(VectorView<AccelerationStructureGeometry> p_geometries, BitField<AccelerationStructureFlagBits> p_flags) {
 	ERR_FAIL_COND_V_MSG(!device_properties->features.supports_raytracing, AccelerationStructureID(), "Acceleration structures are not supported by this device.");
+	ERR_FAIL_COND_V_MSG(p_geometries.size() == 0, AccelerationStructureID(), "A Metal BLAS requires at least one fully initialized geometry.");
+
+	bool extended_vertex_formats = false;
+	if (__builtin_available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
+		extended_vertex_formats = true;
+	}
+	LocalVector<MetalRTGeometryLayout> layouts;
+	layouts.resize(p_geometries.size());
+	for (uint32_t i = 0; i < p_geometries.size(); i++) {
+		String validation_error;
+		ERR_FAIL_COND_V_MSG(!MetalRTGeometryLayout::validate(p_geometries[i], extended_vertex_formats, layouts[i], validation_error), AccelerationStructureID(), vformat("Metal BLAS geometry %d is unsupported: %s The geometry was omitted before descriptor creation.", i, validation_error));
+	}
 
 	LocalVector<NS::Object *> geometry_descriptors;
 	NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
 
 	for (uint32_t i = 0; i < p_geometries.size(); i++) {
 		const AccelerationStructureGeometry &geometry = p_geometries[i];
+		const MetalRTGeometryLayout &layout = layouts[i];
 
 		MTL::AccelerationStructureGeometryDescriptor *geom_desc = nullptr;
 		switch (geometry.type) {
@@ -2346,47 +2360,25 @@ RDD::AccelerationStructureID RenderingDeviceDriverMetal::blas_create(VectorView<
 				tri_desc->setVertexBufferOffset(t.vertex_offset);
 				tri_desc->setVertexStride(t.vertex_stride);
 
-				MTL::AttributeFormat vertex_format = MTL::AttributeFormatInvalid;
-				switch (t.vertex_format) {
-					case DATA_FORMAT_R32G32B32_SFLOAT:
-						vertex_format = MTL::AttributeFormatFloat3;
-						break;
-					case DATA_FORMAT_R32G32_SFLOAT:
-						vertex_format = MTL::AttributeFormatFloat2;
-						break;
-					case DATA_FORMAT_R16G16B16A16_UNORM:
-						vertex_format = MTL::AttributeFormatUShort4Normalized;
-						break;
-					default:
-						ERR_FAIL_V_MSG(AccelerationStructureID(), "Unsupported acceleration structure vertex format.");
-				}
-
-				if (vertex_format != MTL::AttributeFormatFloat3) {
+				if (layout.vertex_format != MTL::AttributeFormatFloat3) {
 					// Float3 is Metal's default. Selecting another format requires
 					// the vertexFormat property (macOS 13.0 / iOS 16.0).
-					if (__builtin_available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
-						tri_desc->setVertexFormat(vertex_format);
-					} else {
-						ERR_FAIL_V_MSG(AccelerationStructureID(), "Acceleration structure vertex formats other than R32G32B32_SFLOAT require macOS 13.0 / iOS 16.0.");
-					}
+					tri_desc->setVertexFormat(layout.vertex_format);
 				}
 
-				if (t.index_buffer != BufferID()) {
+				if (layout.indexed) {
 					const BufferInfo *index_buffer = (const BufferInfo *)t.index_buffer.id;
 					tri_desc->setIndexBuffer(index_buffer->metal_buffer.get());
 					tri_desc->setIndexBufferOffset(t.index_offset);
-					tri_desc->setIndexType(t.index_format == INDEX_BUFFER_FORMAT_UINT16 ? MTL::IndexTypeUInt16 : MTL::IndexTypeUInt32);
-					tri_desc->setTriangleCount(t.index_count / 3);
-				} else {
-					tri_desc->setTriangleCount(t.vertex_count / 3);
+					tri_desc->setIndexType(layout.index_type);
 				}
+				tri_desc->setTriangleCount(layout.primitive_count);
 
 				geom_desc = tri_desc;
 			} break;
 
 			case AccelerationStructureGeometry::TYPE_AABBS: {
 				const AccelerationStructureGeometry::Aabbs &a = geometry.geometry.aabbs;
-				ERR_FAIL_COND_V_MSG(a.stride < 24 || (a.stride % 4) != 0, AccelerationStructureID(), "AABB stride must be at least 24 bytes and a multiple of 4.");
 				MTL::AccelerationStructureBoundingBoxGeometryDescriptor *aabb_desc = MTL::AccelerationStructureBoundingBoxGeometryDescriptor::descriptor();
 
 				const BufferInfo *aabb_buffer = (const BufferInfo *)a.buffer.id;

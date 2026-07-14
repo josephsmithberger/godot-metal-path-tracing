@@ -86,3 +86,9 @@ Open the fixture in the editor with the Path Tracing view active and confirm:
 
 These appearance and interactive-editor judgments are the part automation
 cannot approve on the user's behalf.
+
+C14 subsequently widens the live Metal geometry path to static compressed and
+non-indexed surfaces, deformed meshes, MultiMesh, negative scale, and scene
+mutation. Its current contract and E1 fixture are documented in
+[`scene_geometry.md`](scene_geometry.md); the exclusions above remain the
+historical boundary of the C13 test itself.

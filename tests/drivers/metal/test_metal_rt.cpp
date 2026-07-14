@@ -36,6 +36,7 @@ TEST_FORCE_LINK(test_metal_rt)
 
 #include "drivers/metal/metal_objects_shared.h"
 #include "drivers/metal/metal_rt_availability.h"
+#include "drivers/metal/metal_rt_geometry.h"
 
 #include <limits>
 
@@ -126,6 +127,80 @@ TEST_CASE("[MetalRT] Acceleration structure metadata maps flags and scratch size
 	deferred_flags.set_flag(RDD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
 	deferred_flags.set_flag(RDD::ACCELERATION_STRUCTURE_LOW_MEMORY_BIT);
 	CHECK(MDAccelerationStructure::usage_from_flags(deferred_flags) == MTL::AccelerationStructureUsageNone);
+}
+
+TEST_CASE("[MetalRT] C14 validates indexed, non-indexed, and compressed geometry layouts") {
+	RDD::AccelerationStructureGeometry geometry;
+	RDD::AccelerationStructureGeometry::Triangles triangles = {};
+	triangles.vertex_buffer = RDD::BufferID(uint64_t(1));
+	triangles.vertex_stride = 12;
+	triangles.vertex_count = 4;
+	triangles.vertex_format = RDD::DATA_FORMAT_R32G32B32_SFLOAT;
+	triangles.index_buffer = RDD::BufferID(uint64_t(2));
+	triangles.index_count = 6;
+	triangles.index_format = RDD::INDEX_BUFFER_FORMAT_UINT16;
+	geometry.geometry.triangles = triangles;
+
+	MetalRTGeometryLayout layout;
+	String error;
+	REQUIRE(MetalRTGeometryLayout::validate(geometry, true, layout, error));
+	CHECK(error.is_empty());
+	CHECK(layout.type == RDD::AccelerationStructureGeometry::TYPE_TRIANGLES);
+	CHECK(layout.vertex_format == MTL::AttributeFormatFloat3);
+	CHECK(layout.indexed);
+	CHECK(layout.index_type == MTL::IndexTypeUInt16);
+	CHECK(layout.primitive_count == 2);
+	geometry.geometry.triangles.vertex_offset = 4;
+	REQUIRE(MetalRTGeometryLayout::validate(geometry, true, layout, error));
+	geometry.geometry.triangles.vertex_offset = 2;
+	CHECK_FALSE(MetalRTGeometryLayout::validate(geometry, true, layout, error));
+	CHECK(error.contains("vertex offset"));
+	geometry.geometry.triangles.vertex_offset = 0;
+
+	geometry.geometry.triangles.index_buffer = RDD::BufferID();
+	geometry.geometry.triangles.index_count = 0;
+	geometry.geometry.triangles.vertex_count = 6;
+	REQUIRE(MetalRTGeometryLayout::validate(geometry, true, layout, error));
+	CHECK_FALSE(layout.indexed);
+	CHECK(layout.primitive_count == 2);
+
+	geometry.geometry.triangles.vertex_format = RDD::DATA_FORMAT_R32G32_SFLOAT;
+	geometry.geometry.triangles.vertex_stride = 8;
+	REQUIRE(MetalRTGeometryLayout::validate(geometry, true, layout, error));
+	CHECK(layout.vertex_format == MTL::AttributeFormatFloat2);
+	CHECK_FALSE(MetalRTGeometryLayout::validate(geometry, false, layout, error));
+	CHECK(error.contains("require macOS 13.0"));
+
+	geometry.geometry.triangles.vertex_format = RDD::DATA_FORMAT_R16G16B16A16_UNORM;
+	REQUIRE(MetalRTGeometryLayout::validate(geometry, true, layout, error));
+	CHECK(layout.vertex_format == MTL::AttributeFormatUShort4Normalized);
+
+	geometry.geometry.triangles.vertex_stride = 6;
+	CHECK_FALSE(MetalRTGeometryLayout::validate(geometry, true, layout, error));
+	CHECK(error.contains("vertex stride"));
+
+	geometry.geometry.triangles.vertex_stride = 8;
+	geometry.geometry.triangles.vertex_count = 5;
+	CHECK_FALSE(MetalRTGeometryLayout::validate(geometry, true, layout, error));
+	CHECK(error.contains("multiple of three"));
+
+	geometry.type = RDD::AccelerationStructureGeometry::TYPE_AABBS;
+	RDD::AccelerationStructureGeometry::Aabbs aabbs = {};
+	aabbs.buffer = RDD::BufferID(uint64_t(3));
+	aabbs.stride = 24;
+	aabbs.count = 2;
+	geometry.geometry.aabbs = aabbs;
+	REQUIRE(MetalRTGeometryLayout::validate(geometry, true, layout, error));
+	CHECK(layout.primitive_count == 2);
+	geometry.geometry.aabbs.offset = 4;
+	REQUIRE(MetalRTGeometryLayout::validate(geometry, true, layout, error));
+	geometry.geometry.aabbs.offset = 2;
+	CHECK_FALSE(MetalRTGeometryLayout::validate(geometry, true, layout, error));
+	CHECK(error.contains("AABB offset"));
+	geometry.geometry.aabbs.offset = 0;
+	geometry.geometry.aabbs.stride = 22;
+	CHECK_FALSE(MetalRTGeometryLayout::validate(geometry, true, layout, error));
+	CHECK(error.contains("AABB stride"));
 }
 
 TEST_CASE("[MetalRT] Packs and validates TLAS instance records") {

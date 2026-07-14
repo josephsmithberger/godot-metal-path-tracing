@@ -168,6 +168,17 @@ enum {
 	RT_INDEX_FORMAT_NONE = 2,
 };
 
+/// Applies the winding reversal caused by a mirrored instance transform to
+/// the API-neutral acceleration-structure flags. Godot meshes use clockwise
+/// front faces, while the existing material cull mapping stores the Metal /
+/// Vulkan counter-clockwise override in the FLIP bit.
+_FORCE_INLINE_ uint32_t rt_instance_flags_apply_transform_winding(uint32_t p_flags, const Transform3D &p_transform) {
+	if (p_transform.basis.determinant() < 0.0) {
+		p_flags ^= RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT;
+	}
+	return p_flags;
+}
+
 enum {
 	RT_GEOM_FLAG_COMPRESSED = 1u,
 	RT_GEOM_FLAG_PROCEDURAL = 2u,
