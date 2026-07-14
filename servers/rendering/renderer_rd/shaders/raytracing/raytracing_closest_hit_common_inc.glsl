@@ -426,6 +426,12 @@ void debug_visualize(
 		} else {
 			ps.radiance = vec3(1.0, 0.0, 0.0);
 		}
+	} else if (vis_mode == 23) {
+		uint encoded_id = pcg_hash(gl_InstanceCustomIndexEXT + 1u);
+		ps.radiance = vec3(0.2) + vec3(
+				float(encoded_id & 0xFFu),
+				float((encoded_id >> 8u) & 0xFFu),
+				float((encoded_id >> 16u) & 0xFFu)) * (0.8 / 255.0);
 	}
 
 	ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);

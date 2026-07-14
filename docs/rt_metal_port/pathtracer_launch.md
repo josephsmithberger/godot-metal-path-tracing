@@ -1,9 +1,9 @@
 # Path-tracer scene launch on the Metal compute lane (C10)
 
-Status: **Available** for the driver/RenderingDevice trace path and the
-controlled-scene evidence; the `SceneShaderRaytracing` bundle conversion that
-feeds real editor scenes into this path is **Planned** (tracked below), per the
-status vocabulary in `mac-rt-planning/README.md`.
+Status: **Available** for the driver/RenderingDevice trace path, the controlled
+scene evidence, and the restricted C13 HG0 editor scene. See
+[`editor_hg0.md`](editor_hg0.md) for the real-scene contract and remaining
+material/geometry exclusions.
 
 Chunk C10 makes the Metal backend launch a path-traced scene through Godot's
 own raytracing abstractions. It implements the compute-lane design selected in
@@ -69,9 +69,10 @@ C11 replaced the default-off debug exposure with the capability gate documented
 in [`runtime_gating.md`](runtime_gating.md).
 `rendering/pathtracer/metal_ray_query_backend` now defaults on, but the Metal
 driver reports `SUPPORTS_RAY_QUERY` only when every compute-lane and bindless
-requirement is available. `SUPPORTS_RAYTRACING_PIPELINE` stays false, so the
-scene-side path tracer (`RenderForwardClustered::_setup_rt`) remains disabled
-until its five-stage shader bundle is re-expressed for the compute lane.
+requirement is available. `SUPPORTS_RAYTRACING_PIPELINE` stays false. C13 gives
+`SceneShaderRaytracing` a separate compute bundle and enables the scene route
+only when that bundle reports ready; native Vulkan RT-pipeline selection is
+unchanged.
 
 ### Bindless material-access foundation
 
@@ -140,16 +141,12 @@ manifest, visual diff, numeric metrics, and self-hosted CI lane. See
 
 ## Remaining work toward full scene integration
 
-The engine's `SceneShaderRaytracing` still authors the five RT-pipeline stages
-and cannot compile them on Metal. Feeding real editor scenes through the C10
-trace path requires a dedicated follow-up:
-
-1. a compute re-expression of `scene_raytracing_raygen.glsl` (HG0/standard
-   material first) compiled as the compute-lane raygen when the driver lacks
-   native RT stages, consuming the now-validated Metal bindless and
-   buffer-device-address material-access lane;
-2. custom hit groups (HG1+): per-material inlined variants or a
-   visible-function dispatch design.
+C13 supplies the compute re-expression for opaque, static HG0
+`StandardMaterial3D` scenes. Full parity still requires custom hit groups
+(HG1+), alpha policy, deformed and instanced geometry lifetime, broader light
+and environment coverage, native denoising/presentation, and export coverage.
+Those remain separate follow-up chunks so this first editor lane has an honest,
+testable boundary.
 
 The C11 runtime gate and fallback are complete; see
 [`runtime_gating.md`](runtime_gating.md).

@@ -1,6 +1,7 @@
 // Shared defines and common bindings for all RT shader stages.
 // Include AFTER raytracing_inc.glsl and scene_data_inc.glsl.
-// The includer must set exactly one of RT_STAGE_{RAYGEN,MISS,CLOSEST_HIT,ANY_HIT,INTERSECTION}.
+// The includer must set exactly one of
+// RT_STAGE_{RAYGEN,MISS,CLOSEST_HIT,ANY_HIT,INTERSECTION,COMPUTE}.
 
 // Specialization constant (bits 0-20: flags, 21-28: samples, 29-31: bounces).
 layout(constant_id = 0) const uint RT_FLAGS = 0u;
@@ -30,7 +31,7 @@ layout(set = 0, binding = 14, std430) readonly buffer GlobalShaderUniformData {
 }
 global_shader_uniforms;
 
-#ifndef RT_STAGE_ANY_HIT
+#if !defined(RT_STAGE_ANY_HIT) && !defined(RT_STAGE_INTERSECTION)
 
 layout(set = 0, binding = 6, std140) uniform RaytracingParams {
 	vec4 rt_params[4];
@@ -61,7 +62,7 @@ layout(set = 0, binding = 12, r16f) uniform image2D dlss_rr_specular_hit_dist;
 layout(set = 0, binding = 28, rg16f) uniform image2D rt_velocity_image;
 layout(set = 0, binding = 15, r32f) uniform image2D rt_depth_image;
 
-#endif // !RT_STAGE_ANY_HIT
+#endif // !RT_STAGE_ANY_HIT && !RT_STAGE_INTERSECTION
 
 // Shared hitAttributeEXT layout for all hit-group stages.
 // Vulkan requires every shader in a hit group to agree on this layout.

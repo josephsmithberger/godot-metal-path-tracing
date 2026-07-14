@@ -19,9 +19,12 @@ from typing import Any
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[2]
 DEFAULT_ARTIFACT_ROOT = REPO_ROOT / "mac-rt-planning" / "artifacts"
-VALID_STAGES = ("preflight", "caps", "build", "smoke", "unit", "gpu", "image", "fallback")
+VALID_STAGES = ("preflight", "caps", "build", "smoke", "unit", "gpu", "image", "editor-scene", "fallback")
 CAPS_PROBE_SOURCE = REPO_ROOT / "docs" / "rt_metal_port" / "capability_probe.mm"
 RUNTIME_GATE_PROJECT = REPO_ROOT / "tests" / "metal_rt"
+EDITOR_SCENE_PROJECT = RUNTIME_GATE_PROJECT / "editor"
+EDITOR_SCENE_FIXTURE = "res://fixtures/e0_hg0.tscn"
+EDITOR_SCENE_VERIFY_SCRIPT = RUNTIME_GATE_PROJECT / "verify_editor_scene.py"
 IMAGE_DIFF_SCRIPT = RUNTIME_GATE_PROJECT / "image_diff.py"
 IMAGE_REFERENCE = RUNTIME_GATE_PROJECT / "references" / "c10_pathtracer_launch_v1.png"
 IMAGE_REFERENCE_MANIFEST = IMAGE_REFERENCE.with_suffix(".json")
@@ -108,6 +111,7 @@ def command_record(
     detect_log_skip: bool = False,
     environment: dict[str, str] | None = None,
     required_log_patterns: tuple[str, ...] = (),
+    forbidden_log_patterns: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     environment = environment or {}
     displayed_command = ["env", *(f"{key}={value}" for key, value in sorted(environment.items())), *command]
@@ -125,6 +129,7 @@ def command_record(
         "preset_skip_reason": preset_skip_reason,
         "detect_log_skip": detect_log_skip,
         "required_log_patterns": list(required_log_patterns),
+        "forbidden_log_patterns": list(forbidden_log_patterns),
     }
 
 
@@ -145,7 +150,9 @@ def make_commands(
             command_record("preflight-scons", ["scons", "--version"]),
         ])
 
-    if "caps" in stages or (("gpu" in stages or "image" in stages or "fallback" in stages) and args.arch == "arm64"):
+    if "caps" in stages or (
+        any(stage in stages for stage in ("gpu", "image", "editor-scene", "fallback")) and args.arch == "arm64"
+    ):
         probe_binary = artifact_dir / "capability_probe"
         commands.extend([
             command_record(
@@ -255,6 +262,69 @@ def make_commands(
             )
         )
 
+    if "editor-scene" in stages:
+        editor_command = [
+            str(binary),
+            "--editor",
+            "--path",
+            str(EDITOR_SCENE_PROJECT),
+            EDITOR_SCENE_FIXTURE,
+            "--quit-after",
+            "600",
+        ]
+        editor_environment = {
+            "GODOT_MRT_EDITOR_CAPTURE": "1",
+            "MTL_DEBUG_LAYER": "1",
+        }
+        scene_markers = (
+            "METAL_RT_EDITOR_ROUTE=compute_ray_query",
+            "METAL_RT_DENOISER=none",
+            "METAL_RT_C13_EDITOR_HG0=passed",
+            "METAL_RT_FIXTURE_REVISION=e0-hg0-v1",
+        )
+        commands.extend([
+            command_record(
+                "editor-scene-cold",
+                editor_command,
+                requires_passed="caps-probe" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                environment={**editor_environment, "GODOT_MRT_CAPTURE_LABEL": "cold"},
+                required_log_patterns=scene_markers,
+            ),
+            command_record(
+                "editor-scene-reload",
+                editor_command,
+                requires_passed="editor-scene-cold" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                environment={**editor_environment, "GODOT_MRT_CAPTURE_LABEL": "reload"},
+                required_log_patterns=scene_markers,
+            ),
+            command_record(
+                "editor-scene-verify",
+                [sys.executable, str(EDITOR_SCENE_VERIFY_SCRIPT), str(artifact_dir)],
+                requires_passed="editor-scene-reload" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                required_log_patterns=("METAL_RT_C13_FIXTURE_VERIFY=passed",),
+            ),
+            command_record(
+                "editor-scene-forced-fallback",
+                editor_command,
+                requires_passed="editor-scene-verify" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                environment={
+                    **editor_environment,
+                    "GODOT_MRT_CAPTURE_LABEL": "fallback",
+                    "GODOT_MTL_DISABLE_RAYTRACING": "1",
+                },
+                required_log_patterns=(
+                    "using non-RT rendering fallback",
+                    "C11_GATE=disabled:forced_disabled",
+                    "METAL_RT_FIXTURE_REVISION=e0-hg0-v1",
+                ),
+                forbidden_log_patterns=("METAL_RT_C13_EDITOR_HG0=passed",),
+            ),
+        ])
+
     if "fallback" in stages:
         gate_command = [
             str(binary),
@@ -342,8 +412,14 @@ def run_command(command: dict[str, Any], index: int, artifact_dir: Path, dry_run
     if exit_code == 0:
         log_text = log_path.read_text(encoding="utf-8", errors="replace")
         missing_patterns = [pattern for pattern in command["required_log_patterns"] if pattern not in log_text]
-        if missing_patterns:
-            message = f"ERROR: required log pattern(s) not found: {', '.join(missing_patterns)}\n"
+        forbidden_patterns = [pattern for pattern in command["forbidden_log_patterns"] if pattern in log_text]
+        if missing_patterns or forbidden_patterns:
+            errors = []
+            if missing_patterns:
+                errors.append(f"required log pattern(s) not found: {', '.join(missing_patterns)}")
+            if forbidden_patterns:
+                errors.append(f"forbidden log pattern(s) found: {', '.join(forbidden_patterns)}")
+            message = f"ERROR: {'; '.join(errors)}\n"
             print(message, end="", file=sys.stderr)
             with log_path.open("a", encoding="utf-8", newline="\n") as log:
                 log.write(message)

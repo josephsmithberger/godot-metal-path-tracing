@@ -1,0 +1,87 @@
+[gd_scene load_steps=10 format=3]
+
+[ext_resource type="Script" path="res://scripts/capture_editor_scene.gd" id="1_capture"]
+[ext_resource type="Texture2D" path="res://fixtures/checker.svg" id="2_checker"]
+
+[sub_resource type="ProceduralSkyMaterial" id="ProceduralSkyMaterial_e0"]
+sky_top_color = Color(0.08, 0.15, 0.28, 1)
+sky_horizon_color = Color(0.52, 0.68, 0.82, 1)
+ground_bottom_color = Color(0.035, 0.03, 0.025, 1)
+ground_horizon_color = Color(0.32, 0.31, 0.28, 1)
+sun_angle_max = 18.0
+
+[sub_resource type="Sky" id="Sky_e0"]
+sky_material = SubResource("ProceduralSkyMaterial_e0")
+
+[sub_resource type="Environment" id="Environment_e0"]
+background_mode = 2
+sky = SubResource("Sky_e0")
+ambient_light_source = 3
+reflected_light_source = 2
+pathtracing_enabled = true
+pathtracing_samples_per_pixel = 4
+pathtracing_max_bounces = 2
+pathtracing_denoiser = 0
+
+[sub_resource type="StandardMaterial3D" id="FloorMaterial_e0"]
+albedo_texture = ExtResource("2_checker")
+roughness = 0.78
+metallic_specular = 0.35
+uv1_scale = Vector3(3, 3, 3)
+
+[sub_resource type="PlaneMesh" id="FloorMesh_e0"]
+material = SubResource("FloorMaterial_e0")
+size = Vector2(8, 8)
+subdivide_width = 2
+subdivide_depth = 2
+
+[sub_resource type="StandardMaterial3D" id="BoxMaterial_e0"]
+albedo_color = Color(0.82, 0.16, 0.08, 1)
+metallic = 0.15
+roughness = 0.32
+
+[sub_resource type="BoxMesh" id="BoxMesh_e0"]
+material = SubResource("BoxMaterial_e0")
+size = Vector3(1.6, 1.6, 1.6)
+
+[sub_resource type="StandardMaterial3D" id="SphereMaterial_e0"]
+albedo_color = Color(0.08, 0.42, 0.72, 1)
+metallic = 0.75
+roughness = 0.2
+
+[sub_resource type="SphereMesh" id="SphereMesh_e0"]
+material = SubResource("SphereMaterial_e0")
+radius = 0.85
+height = 1.7
+radial_segments = 32
+rings = 16
+
+[node name="C13EditorHG0" type="Node3D"]
+script = ExtResource("1_capture")
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("Environment_e0")
+
+[node name="KeyLight" type="DirectionalLight3D" parent="."]
+rotation_degrees = Vector3(-52, -32, 0)
+light_color = Color(1, 0.88, 0.72, 1)
+light_energy = 2.2
+shadow_enabled = true
+directional_shadow_max_distance = 20.0
+
+[node name="Floor" type="MeshInstance3D" parent="."]
+mesh = SubResource("FloorMesh_e0")
+
+[node name="Box" type="MeshInstance3D" parent="."]
+position = Vector3(-1.25, 0.8, 0)
+rotation_degrees = Vector3(0, 24, 0)
+mesh = SubResource("BoxMesh_e0")
+
+[node name="Sphere" type="MeshInstance3D" parent="."]
+position = Vector3(1.15, 0.85, -0.45)
+mesh = SubResource("SphereMesh_e0")
+
+[node name="Camera" type="Camera3D" parent="."]
+position = Vector3(5.2, 3.8, 6.8)
+current = true
+fov = 48.0

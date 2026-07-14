@@ -10,11 +10,11 @@ requirement is absent, the feature remains false and Godot continues through
 the existing non-ray-traced renderer without creating Metal acceleration
 structures.
 
-`SUPPORTS_RAYTRACING_PIPELINE` deliberately remains false. Metal runs the C10
-path as a ray-query compute kernel, and the engine's five-stage
-`SceneShaderRaytracing` bundle has not yet been re-expressed for that lane.
-Advertising RT-pipeline support would route real editor scenes into shader
-stages that SPIRV-Cross cannot compile.
+`SUPPORTS_RAYTRACING_PIPELINE` deliberately remains false. Metal runs the path
+as a ray-query compute kernel. C13 adds a separate compute
+`SceneShaderRaytracing` bundle and an explicit readiness check, so restricted
+HG0 editor scenes can use the query lane without advertising native RT stages
+that SPIRV-Cross cannot compile.
 
 ## Gate contract
 

@@ -40,8 +40,8 @@
   },
   "runtime_gates_current": {
     "has_feature": {
-      "value": "SUPPORTS_RAY_QUERY reports the C11 compute-lane gate result; SUPPORTS_RAYTRACING_PIPELINE remains false until SceneShaderRaytracing is re-expressed for Metal",
-      "evidence": "drivers/metal/rendering_device_driver_metal.cpp (_is_metal_rt_enabled and has_feature); docs/rt_metal_port/runtime_gating.md"
+      "value": "SUPPORTS_RAY_QUERY reports the C11 compute-lane gate result; SUPPORTS_RAYTRACING_PIPELINE remains false, while C13 selects its separate SceneShaderRaytracing compute bundle only after an explicit readiness check",
+      "evidence": "drivers/metal/rendering_device_driver_metal.cpp (_is_metal_rt_enabled and has_feature); servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.cpp; docs/rt_metal_port/runtime_gating.md"
     },
     "rt_gating_expression": "macOS arm64 && project setting enabled && GODOT_MTL_DISABLE_RAYTRACING != 1 && supportsRaytracing && supportsFunctionPointers && supports_user_id_instances && supports_gpu_address && argument_buffers_enabled() && msl_target_version >= 2.3"
   },

@@ -228,9 +228,9 @@ tracer later, but no chunk C1-C12 depends on it.
   compatibility SBT is not consumed at trace time. Instance custom indices are
   shader-visible through Metal UserID instance descriptors (macOS 12+; within
   the A4 floor). C11 exposes this lane through the runtime checks and graceful
-  fallback in [`runtime_gating.md`](runtime_gating.md). Full
-  `SceneShaderRaytracing` scene integration is the tracked remainder — see
-  [`pathtracer_launch.md`](pathtracer_launch.md).
+  fallback in [`runtime_gating.md`](runtime_gating.md). C13 adds the restricted
+  HG0 `SceneShaderRaytracing` integration; its exact subset and remaining
+  parity work are documented in [`editor_hg0.md`](editor_hg0.md).
 
 ## Open questions (tracked, not assumed)
 
