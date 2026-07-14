@@ -35,6 +35,17 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Output path for machine-readable comparison metrics.",
     )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--exact-pixels",
+        action="store_true",
+        help="Require decoded RGBA8 pixels to match exactly, ignoring PNG encoding differences.",
+    )
+    mode.add_argument(
+        "--exact-bytes",
+        action="store_true",
+        help="Require the complete encoded PNG files to be byte-for-byte identical.",
+    )
     return parser.parse_args()
 
 
@@ -195,8 +206,19 @@ def write_json(path: Path, value: dict[str, Any]) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def comparison_mode(args: argparse.Namespace) -> str:
+    if getattr(args, "exact_bytes", False):
+        return "exact_bytes"
+    if getattr(args, "exact_pixels", False):
+        return "exact_pixels"
+    return "threshold"
+
+
 def compare(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest, args.reference)
+    actual_encoded = args.actual.read_bytes()
+    reference_encoded = args.reference.read_bytes()
+    encoded_bytes_equal = actual_encoded == reference_encoded
     actual_width, actual_height, actual = read_rgba8_png(args.actual)
     reference_width, reference_height, reference = read_rgba8_png(args.reference)
     if (actual_width, actual_height) != (reference_width, reference_height):
@@ -206,7 +228,8 @@ def compare(args: argparse.Namespace) -> int:
         )
 
     comparison = manifest["comparison"]
-    threshold = comparison["max_channel_difference"]
+    mode = comparison_mode(args)
+    threshold = 0 if mode != "threshold" else comparison["max_channel_difference"]
     diff_scale = comparison["diff_scale"]
     channel_diffs = [abs(actual_value - reference_value) for actual_value, reference_value in zip(actual, reference)]
     max_diff = max(channel_diffs, default=0)
@@ -226,19 +249,25 @@ def compare(args: argparse.Namespace) -> int:
         visual_diff[offset + 3] = 255
     write_rgba8_png(args.diff, actual_width, actual_height, bytes(visual_diff))
 
+    pixels_equal = max_diff == 0
     passed = max_diff <= threshold
+    if mode == "exact_bytes":
+        passed = pixels_equal and encoded_bytes_equal
     metrics = {
         "schema_version": 1,
         "status": "passed" if passed else "failed",
         "reference_id": manifest["reference_id"],
         "actual_file": args.actual.name,
-        "actual_sha256": hashlib.sha256(args.actual.read_bytes()).hexdigest(),
+        "actual_sha256": hashlib.sha256(actual_encoded).hexdigest(),
         "reference_file": args.reference.name,
-        "reference_sha256": hashlib.sha256(args.reference.read_bytes()).hexdigest(),
+        "reference_sha256": hashlib.sha256(reference_encoded).hexdigest(),
         "diff_file": args.diff.name,
         "width": actual_width,
         "height": actual_height,
         "color_space": manifest["reference"]["color_space"],
+        "comparison_mode": mode,
+        "decoded_pixels_equal": pixels_equal,
+        "encoded_bytes_equal": encoded_bytes_equal,
         "max_channel_difference": max_diff,
         "max_channel_difference_normalized": max_diff / 255.0,
         "mean_absolute_channel_difference": mean_diff,
@@ -248,7 +277,7 @@ def compare(args: argparse.Namespace) -> int:
         "differing_pixels": differing_pixels,
         "total_pixels": actual_width * actual_height,
         "threshold": {
-            "metric": comparison["metric"],
+            "metric": "encoded_file_identity" if mode == "exact_bytes" else comparison["metric"],
             "max_channel_difference": threshold,
         },
     }
@@ -256,7 +285,8 @@ def compare(args: argparse.Namespace) -> int:
     print(
         "MetalRT C12 image diff: "
         f"reference={manifest['reference_id']} status={metrics['status']} "
-        f"max_diff={max_diff}/{threshold} mean_diff={mean_diff:.6f} "
+        f"mode={mode} max_diff={max_diff}/{threshold} mean_diff={mean_diff:.6f} "
+        f"encoded_bytes_equal={str(encoded_bytes_equal).lower()} "
         f"differing_pixels={differing_pixels}/{actual_width * actual_height}"
     )
     return 0 if passed else 1
@@ -273,6 +303,7 @@ def main() -> int:
                 "schema_version": 1,
                 "status": "error",
                 "error": str(error),
+                "comparison_mode": comparison_mode(args),
                 "actual_file": args.actual.name,
                 "reference_file": args.reference.name,
                 "diff_file": args.diff.name,

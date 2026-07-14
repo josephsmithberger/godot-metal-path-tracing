@@ -59,6 +59,20 @@ corresponding RGB channel; any max channel difference above 5 fails the stage.
 Manifest, decode, dimension, or reference-integrity errors are distinct hard
 failures rather than skips.
 
+The comparer also has two opt-in exact modes:
+
+- `--exact-pixels` requires identical decoded RGBA8 values while allowing PNG
+  metadata, compression, and chunk-layout differences;
+- `--exact-bytes` additionally requires the complete encoded files to be
+  byte-for-byte identical.
+
+Exact pixels are appropriate for deterministic integer/debug outputs. Exact
+bytes are useful for a fixed encoder/toolchain artifact check, but are not a
+cross-GPU path-tracing gate: PNG encoding may differ even when every pixel is
+identical, and floating-point GPU results may require the reviewed tolerance.
+`python3 tests/metal_rt/test_image_diff.py` exercises threshold, exact-pixel,
+and exact-byte behavior and is included in the runner's `preflight` stage.
+
 ## Running locally
 
 Run the complete C12 GPU contract against an existing Metal-only editor:
