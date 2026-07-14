@@ -190,8 +190,7 @@ bool ray_query_alpha_test(uint geometry_idx, uint primitive_id, vec2 candidate_b
 /// TerminateOnFirstHit causes early exit on first confirmed opaque hit.
 bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout uint rng_state) {
 #ifdef RT_COMPUTE_LANE
-	ComputeHit shadow_hit;
-	return !trace_material(origin, direction, max_dist - 0.001, shadow_hit);
+	return !trace_shadow_blocked(origin, direction, max_dist - 0.001);
 #elif defined(USE_SER)
 	hitObjectEXT hitObject;
 	hitObjectTraceRayEXT(hitObject, tlas,

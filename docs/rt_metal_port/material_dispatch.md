@@ -47,6 +47,29 @@ Metal RT material variant: status=compiled flags=0x... generation=... active_cus
 | Shader specialization | Generated source slot plus the sanitized scene specialization flags |
 | Material identity | Stable RID index in `MaterialData.material_id`, exposed by the Material ID debug view |
 
+## Device-address residency
+
+The compute lane reads geometry (vertex/attribute/index) and material data
+through raw GPU buffer addresses. Metal only guarantees residency for
+resources an encoder binds, so the driver now tracks every buffer whose
+device address is queried: on OSes with `MTLResidencySet` support these
+buffers join a queue-level set once, and otherwise they are marked with
+`useResources` on any compute encoder that binds an acceleration structure.
+Without this, alpha-test candidate evaluation dereferenced non-resident
+buffers (Metal shader validation: `Invalid device load ... resident:No`),
+producing per-frame garbage alpha tests, missing cutout holes, corrupted
+textures after pipeline swaps, and eventual GPU faults that hang
+`waitUntilCompleted`.
+
+## Ray flags
+
+`trace_material` keeps `RT_RAY_FLAGS` (back-face culling) so the compute lane
+matches the Vulkan raygen lane; double-sided materials override culling per
+instance via `ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT`.
+Shadow visibility uses a dedicated `trace_shadow_blocked` query with
+`gl_RayFlagsTerminateOnFirstHitEXT`, which stops at the first alpha-accepted
+candidate instead of resolving the closest hit.
+
 Custom source reload is append-only. At the render-frame boundary, pending
 sources are compiled into a trial monolithic variant. A successful variant and
 its pipeline/SBT are swapped together; the rendering device defers old RID

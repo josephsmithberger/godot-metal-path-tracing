@@ -1821,9 +1821,14 @@ void MDCommandBuffer::_bind_uniforms_direct(MDUniformSet *p_set, MDShader *p_sha
 				// The direct bind makes only the TLAS itself resident; Metal
 				// requires the primitive structures it references to be marked
 				// explicitly before they can be intersected.
-				if (p_enc.mode == DirectEncoder::COMPUTE && !acceleration_structure->resident_blases.is_empty()) {
+				if (p_enc.mode == DirectEncoder::COMPUTE) {
 					MTL::ComputeCommandEncoder *enc = static_cast<MTL::ComputeCommandEncoder *>(p_enc.encoder);
-					enc->useResources(reinterpret_cast<const MTL::Resource *const *>(acceleration_structure->resident_blases.ptr()), acceleration_structure->resident_blases.size(), MTL::ResourceUsageRead);
+					if (!acceleration_structure->resident_blases.is_empty()) {
+						enc->useResources(reinterpret_cast<const MTL::Resource *const *>(acceleration_structure->resident_blases.ptr()), acceleration_structure->resident_blases.size(), MTL::ResourceUsageRead);
+					}
+					// Tracing dereferences raw device addresses (geometry,
+					// material data); those buffers need residency too.
+					device_driver->encode_bda_residency(enc);
 				}
 			} break;
 			default: {
@@ -1854,6 +1859,9 @@ void MDCommandBuffer::_bind_uniforms_argument_buffers_compute(MDUniformSet *p_se
 			if (acceleration_structure != nullptr && !acceleration_structure->resident_blases.is_empty()) {
 				enc->useResources(reinterpret_cast<const MTL::Resource *const *>(acceleration_structure->resident_blases.ptr()), acceleration_structure->resident_blases.size(), MTL::ResourceUsageRead);
 			}
+			// Tracing dereferences raw device addresses (geometry, material
+			// data); those buffers need residency too.
+			device_driver->encode_bda_residency(enc);
 		}
 	}
 

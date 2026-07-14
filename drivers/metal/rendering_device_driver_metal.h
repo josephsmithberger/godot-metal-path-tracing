@@ -164,6 +164,32 @@ protected:
 	bool metal_rt_gate_evaluated = false;
 	MetalRTGateResult metal_rt_gate;
 
+#pragma mark - Buffer device-address residency
+
+	/// Buffers whose GPU address has been queried are read through raw device
+	/// pointers, so no encoder bind ever marks them resident. Metal requires
+	/// explicit residency for such indirect access: on OS versions with
+	/// residency sets they join a queue-level set once; otherwise they are
+	/// marked with useResources on compute encoders that bind an acceleration
+	/// structure (the only pass that dereferences these addresses today).
+	Mutex bda_residency_mutex;
+	GODOT_CLANG_WARNING_PUSH_AND_IGNORE("-Wunguarded-availability")
+	NS::SharedPtr<MTL::ResidencySet> bda_residency_set;
+	GODOT_CLANG_WARNING_POP
+	bool bda_residency_set_creation_failed = false;
+	bool bda_residency_dirty = false;
+	HashMap<MTL::Buffer *, uint32_t> bda_buffer_indices;
+	LocalVector<MTL::Resource *> bda_buffers;
+	void _bda_track_buffer(MTL::Buffer *p_buffer);
+	void _bda_untrack_buffer(MTL::Buffer *p_buffer);
+	void _bda_commit_residency();
+
+public:
+	/// Fallback residency for device-address reads when residency sets are
+	/// unavailable; called when a compute encoder binds an acceleration structure.
+	void encode_bda_residency(MTL::ComputeCommandEncoder *p_enc);
+
+protected:
 	virtual Error _create_device();
 	virtual void _track_resource(MTL::Resource *p_resource);
 	virtual void _untrack_resource(MTL::Resource *p_resource);

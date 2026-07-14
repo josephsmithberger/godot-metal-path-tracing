@@ -186,30 +186,36 @@ MaterialResult evaluate_material(ComputeHit hit, ComputeHitData hit_data, vec3 r
 // Metal ray queries expose non-opaque triangle candidates to the compute
 // shader. Evaluate the selected inlined material before confirming each
 // candidate: this is the any-hit equivalent for alpha-scissored surfaces.
+bool ray_query_candidate_accepts(rayQueryEXT query, vec3 origin, vec3 direction) {
+	ComputeHit candidate;
+	load_query_candidate_hit(query, candidate);
+	MaterialData candidate_material = materials[candidate.geometry_idx];
+	bool needs_alpha_test = (candidate_material.flags & 8u) != 0u;
+	if ((candidate_material.flags & 16u) != 0u && candidate_material.dispatch_index != 0u) {
+		needs_alpha_test = true;
+	}
+	if (!needs_alpha_test) {
+		return true;
+	}
+	ComputeHitData candidate_data = compute_hit_data(candidate, origin, direction);
+	MaterialResult evaluated = evaluate_material(candidate, candidate_data, direction);
+	return !(evaluated.alpha_scissor_threshold > 0.0 && evaluated.alpha < evaluated.alpha_scissor_threshold);
+}
+
+// RT_RAY_FLAGS keeps back-face culling aligned with the Vulkan lanes;
+// double-sided materials override it per instance via
+// ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT.
 bool trace_material(vec3 origin, vec3 direction, float max_distance, out ComputeHit hit) {
 	rayQueryEXT query;
-	rayQueryInitializeEXT(query, tlas, gl_RayFlagsNoneEXT,
+	rayQueryInitializeEXT(query, tlas, RT_RAY_FLAGS,
 			0xFF, origin, 0.001, direction, max_distance);
 	while (rayQueryProceedEXT(query)) {
 		if (rayQueryGetIntersectionTypeEXT(query, false) != gl_RayQueryCandidateIntersectionTriangleEXT) {
 			continue;
 		}
-
-		ComputeHit candidate;
-		load_query_candidate_hit(query, candidate);
-		MaterialData candidate_material = materials[candidate.geometry_idx];
-		bool needs_alpha_test = (candidate_material.flags & 8u) != 0u;
-		if ((candidate_material.flags & 16u) != 0u && candidate_material.dispatch_index != 0u) {
-			needs_alpha_test = true;
+		if (ray_query_candidate_accepts(query, origin, direction)) {
+			rayQueryConfirmIntersectionEXT(query);
 		}
-		if (needs_alpha_test) {
-			ComputeHitData candidate_data = compute_hit_data(candidate, origin, direction);
-			MaterialResult evaluated = evaluate_material(candidate, candidate_data, direction);
-			if (evaluated.alpha_scissor_threshold > 0.0 && evaluated.alpha < evaluated.alpha_scissor_threshold) {
-				continue;
-			}
-		}
-		rayQueryConfirmIntersectionEXT(query);
 	}
 
 	if (rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
@@ -217,6 +223,23 @@ bool trace_material(vec3 origin, vec3 direction, float max_distance, out Compute
 	}
 	load_query_committed_hit(query, hit);
 	return true;
+}
+
+// Shadow rays only need any confirmed hit, so they terminate on the first
+// alpha-accepted candidate instead of resolving the closest one.
+bool trace_shadow_blocked(vec3 origin, vec3 direction, float max_distance) {
+	rayQueryEXT query;
+	rayQueryInitializeEXT(query, tlas, RT_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT,
+			0xFF, origin, 0.001, direction, max_distance);
+	while (rayQueryProceedEXT(query)) {
+		if (rayQueryGetIntersectionTypeEXT(query, false) != gl_RayQueryCandidateIntersectionTriangleEXT) {
+			continue;
+		}
+		if (ray_query_candidate_accepts(query, origin, direction)) {
+			rayQueryConfirmIntersectionEXT(query);
+		}
+	}
+	return rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
 }
 
 // clang-format off
