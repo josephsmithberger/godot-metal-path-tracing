@@ -28,6 +28,7 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
+#include "servers/rendering/renderer_rd/forward_clustered/pathtracing_presentation.h"
 #include "servers/rendering/renderer_rd/forward_clustered/render_raytracing.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h"
 #include "tests/test_macros.h"
@@ -62,6 +63,41 @@ TEST_CASE("[MetalRT] C13 masks unsupported Metal scene variants") {
 	CHECK((sanitized & SceneShader::RT_FLAG_SER_ENABLED) == 0);
 	CHECK(((sanitized >> SceneShader::RT_SAMPLE_COUNT_SHIFT) & SceneShader::RT_SAMPLE_COUNT_MASK) == 4);
 	CHECK(((sanitized >> SceneShader::RT_MAX_BOUNCES_SHIFT) & SceneShader::RT_MAX_BOUNCES_MASK) == 2);
+}
+
+TEST_CASE("[MetalRT] C17 resets temporal presentation history on discontinuities") {
+	using namespace RendererSceneRenderImplementation;
+	PathtracingPresentationHistory history;
+	const Transform3D camera;
+	const Projection projection = Projection::create_perspective(70.0, 1.0, 0.05, 100.0);
+
+	uint32_t reasons = history.begin_frame(10, 1.0 / 60.0, camera, camera, projection, projection);
+	CHECK((reasons & PT_PRESENTATION_HISTORY_RESET_CONTEXT) != 0);
+	CHECK((reasons & ~PT_PRESENTATION_HISTORY_RESET_CONTEXT) == 0);
+
+	reasons = history.begin_frame(11, 1.0 / 60.0, camera, camera, projection, projection);
+	CHECK(reasons == PT_PRESENTATION_HISTORY_RESET_NONE);
+
+	reasons = history.begin_frame(14, 1.0 / 60.0, camera, camera, projection, projection);
+	CHECK((reasons & PT_PRESENTATION_HISTORY_RESET_FRAME_GAP) != 0);
+
+	Transform3D cut_camera;
+	cut_camera.origin = Vector3(10.0, 0.0, 0.0);
+	reasons = history.begin_frame(15, 1.0 / 60.0, cut_camera, camera, projection, projection);
+	CHECK((reasons & PT_PRESENTATION_HISTORY_RESET_CAMERA_CUT) != 0);
+
+	const Projection cut_projection = Projection::create_perspective(50.0, 1.0, 0.05, 100.0);
+	reasons = history.begin_frame(16, 1.0 / 60.0, cut_camera, cut_camera, cut_projection, projection);
+	CHECK((reasons & PT_PRESENTATION_HISTORY_RESET_PROJECTION_CUT) != 0);
+
+	reasons = history.begin_frame(17, 0.5, cut_camera, cut_camera, cut_projection, cut_projection);
+	CHECK((reasons & PT_PRESENTATION_HISTORY_RESET_LONG_FRAME) != 0);
+}
+
+TEST_CASE("[MetalRT] C17 keeps NVIDIA SER disabled on the Metal compute lane") {
+	const uint32_t requested = SceneShader::rt_flags_pack(SceneShader::RT_FLAG_SER_ENABLED, 1, 1);
+	const uint32_t sanitized = SceneShader::sanitize_compute_rt_flags(requested);
+	CHECK((sanitized & SceneShader::RT_FLAG_SER_ENABLED) == 0);
 }
 
 TEST_CASE("[MetalRT] C14 preserves front-face winding across mirrored transforms") {
