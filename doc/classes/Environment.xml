@@ -204,8 +204,8 @@
 			Selects a debug visualization channel to display instead of the final path-traced image. Useful for inspecting individual G-buffer inputs and intermediate shading data. Set to [constant RT_DEBUG_DISABLED] to show the normal rendered result.
 			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
 		</member>
-		<member name="pathtracing_denoiser" type="int" setter="set_pathtracing_denoiser" getter="get_pathtracing_denoiser" enum="RenderingServer.PathtracingDenoiser" default="1">
-			The denoiser used to reduce noise in the path-traced image. [constant RenderingServer.PT_DENOISER_DLSS_RAY_RECONSTRUCTION] uses NVIDIA DLSS Ray Reconstruction for high-quality temporal denoising and requires an NVIDIA RTX GPU. Use [constant RenderingServer.PT_DENOISER_NONE] to disable denoising.
+		<member name="pathtracing_denoiser" type="int" setter="set_pathtracing_denoiser" getter="get_pathtracing_denoiser" enum="RenderingServer.PathtracingDenoiser" default="0">
+			The denoiser used to reduce noise in the path-traced image. The editor only lists denoisers supported by the current rendering driver, device, and runtime libraries. Loading an unsupported saved choice falls back to [constant RenderingServer.PT_DENOISER_NONE] and reports one warning. [constant RenderingServer.PT_DENOISER_DLSS_RAY_RECONSTRUCTION] requires a supported NVIDIA RTX GPU and working Streamline runtime.
 			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
 		</member>
 		<member name="pathtracing_enabled" type="bool" setter="set_pathtracing_enabled" getter="is_pathtracing_enabled" default="false">

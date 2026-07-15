@@ -38,6 +38,7 @@
 #include "servers/rendering/renderer_rd/effects/motion_vectors_store.h"
 #include "servers/rendering/renderer_rd/effects/ss_effects.h"
 #include "servers/rendering/renderer_rd/effects/taa.h"
+#include "servers/rendering/renderer_rd/forward_clustered/pathtracing_presentation.h"
 #include "servers/rendering/renderer_rd/forward_clustered/render_raytracing.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_forward_clustered.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
@@ -99,13 +100,17 @@ public:
 
 	class RenderBufferDataForwardClustered : public RenderBufferCustomDataRD {
 		GDCLASS(RenderBufferDataForwardClustered, RenderBufferCustomDataRD)
+		friend class RenderForwardClustered;
 
 	private:
 		RenderSceneBuffersRD *render_buffers = nullptr;
 		RendererRD::FSR2Context *fsr2_context = nullptr;
 		RendererRD::DLSSContext *dlss_context = nullptr;
+		PathtracingPresentationHistory fsr2_presentation_history;
+		PathtracingPresentationHistory dlss_presentation_history;
 #ifdef METAL_MFXTEMPORAL_ENABLED
 		RendererRD::MFXTemporalContext *mfx_temporal_context = nullptr;
+		PathtracingPresentationHistory mfx_presentation_history;
 #endif
 
 	public:

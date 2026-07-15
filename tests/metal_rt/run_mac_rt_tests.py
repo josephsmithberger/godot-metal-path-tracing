@@ -25,6 +25,7 @@ RUNTIME_GATE_PROJECT = REPO_ROOT / "tests" / "metal_rt"
 EDITOR_SCENE_PROJECT = RUNTIME_GATE_PROJECT / "editor"
 EDITOR_SCENE_FIXTURE = "res://fixtures/e0_hg0.tscn"
 EDITOR_SCENE_VERIFY_SCRIPT = RUNTIME_GATE_PROJECT / "verify_editor_scene.py"
+PRESENTATION_VERIFY_SCRIPT = RUNTIME_GATE_PROJECT / "verify_presentation.py"
 GEOMETRY_SCENE_FIXTURE = "res://fixtures/e1_geometry.tscn"
 GEOMETRY_SCENE_VERIFY_SCRIPT = RUNTIME_GATE_PROJECT / "verify_geometry_scene.py"
 MATERIAL_SCENE_FIXTURE = "res://fixtures/e2_materials.tscn"
@@ -313,6 +314,16 @@ def make_commands(
             "GODOT_MRT_EDITOR_CAPTURE": "1",
             "GODOT_MRT_FIXTURE": "e0_hg0",
         }
+        c17_editor_command = [
+            str(binary),
+            "--editor",
+            "--verbose",
+            "--path",
+            str(EDITOR_SCENE_PROJECT),
+            EDITOR_SCENE_FIXTURE,
+            "--quit-after",
+            "1200",
+        ]
         scene_markers = (
             "METAL_RT_EDITOR_ROUTE=compute_ray_query",
             "METAL_RT_DENOISER=none",
@@ -361,6 +372,37 @@ def make_commands(
                     "METAL_RT_FIXTURE_REVISION=e0-hg0-v1",
                 ),
                 forbidden_log_patterns=("METAL_RT_C13_EDITOR_HG0=passed",),
+            ),
+            command_record(
+                "editor-scene-c17-presentation",
+                c17_editor_command,
+                requires_passed="editor-scene-forced-fallback" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                environment={
+                    **editor_environment,
+                    "GODOT_MRT_CAPTURE_LABEL": "c17",
+                    "GODOT_MRT_C17_PRESENTATION": "1",
+                },
+                required_log_patterns=(
+                    "METAL_RT_EDITOR_ROUTE=compute_ray_query",
+                    "METAL_RT_DENOISER_DEFAULT=none",
+                    "METAL_RT_SER=disabled",
+                    "METAL_RT_PRESENTATION=native,fsr1,fsr2",
+                    "METAL_RT_TEMPORAL_SEQUENCE=passed",
+                    "METAL_RT_C17_MAC_UX=passed",
+                    "MetalRT C17 temporal presentation history reset: context",
+                    "camera_cut",
+                    "The saved path-tracing denoiser is unavailable",
+                ),
+                forbidden_log_patterns=METAL_VALIDATION_FORBIDDEN_PATTERNS,
+                required_log_counts={"The saved path-tracing denoiser is unavailable": 1},
+            ),
+            command_record(
+                "editor-scene-c17-verify",
+                [sys.executable, str(PRESENTATION_VERIFY_SCRIPT), str(artifact_dir)],
+                requires_passed="editor-scene-c17-presentation" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                required_log_patterns=("METAL_RT_C17_PRESENTATION_VERIFY=passed",),
             ),
         ])
 

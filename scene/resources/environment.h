@@ -199,7 +199,7 @@ private:
 	PathtracingDebugMode pathtracing_debug_mode = RT_DEBUG_DISABLED;
 	int pathtracing_samples_per_pixel = 1;
 	int pathtracing_max_bounces = 3;
-	RSE::PathtracingDenoiser pathtracing_denoiser = RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION;
+	RSE::PathtracingDenoiser pathtracing_denoiser = RSE::PT_DENOISER_NONE;
 	void _update_pathtracing();
 
 	// Glow
@@ -400,6 +400,8 @@ public:
 	int get_pathtracing_max_bounces() const;
 	void set_pathtracing_denoiser(RSE::PathtracingDenoiser p_denoiser);
 	RSE::PathtracingDenoiser get_pathtracing_denoiser() const;
+	static RSE::PathtracingDenoiser sanitize_pathtracing_denoiser(RSE::PathtracingDenoiser p_denoiser, bool p_dlss_rr_supported);
+	static String get_pathtracing_denoiser_property_hint(bool p_dlss_rr_supported);
 
 	// Glow
 	void set_glow_enabled(bool p_enabled);

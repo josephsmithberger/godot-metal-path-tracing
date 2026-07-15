@@ -5,6 +5,8 @@ const FIXTURE_REVISION := "e0-hg0-v1"
 const CAPTURE_SIZE := Vector2i(64, 64)
 const BEAUTY_FRAME := 120
 const INSTANCE_ID_FRAME := 150
+const C17_MODE_WARMUP_FRAMES := 75
+const C17_TRANSITION_WARMUP_FRAMES := 60
 
 @onready var camera: Camera3D = $Camera
 @onready var environment: Environment = $WorldEnvironment.environment
@@ -15,6 +17,16 @@ var artifact_dir := ""
 var capture_label := "cold"
 var capture_viewport: Viewport
 var capture_camera: Camera3D
+var c17_enabled := false
+var c17_phase := ""
+var c17_phase_frame := 0
+var c17_mode_index := 0
+var c17_modes: Array[Dictionary] = []
+var c17_captures: Dictionary = {}
+var c17_events: Array[String] = []
+var c17_temporal_mode: Dictionary = {}
+var c17_original_window_size := Vector2i.ZERO
+var c17_secondary_viewport: SubViewport
 
 
 func _ready() -> void:
@@ -42,11 +54,22 @@ func _ready() -> void:
 	capture_label = OS.get_environment("GODOT_MRT_CAPTURE_LABEL")
 	if capture_label.is_empty():
 		capture_label = "cold"
+	c17_enabled = OS.get_environment("GODOT_MRT_C17_PRESENTATION") == "1"
+	if c17_enabled:
+		process_mode = Node.PROCESS_MODE_ALWAYS
+		if not _validate_c17_ux():
+			return
+		_build_c17_modes()
+		c17_original_window_size = DisplayServer.window_get_size()
+		c17_phase = "matrix"
 	set_process(capture_enabled and not artifact_dir.is_empty())
 
 
 func _process(_delta: float) -> void:
 	if not capture_enabled:
+		return
+	if c17_enabled:
+		_process_c17()
 		return
 	_configure_capture_camera()
 	capture_frame += 1
@@ -60,6 +83,203 @@ func _process(_delta: float) -> void:
 		print("METAL_RT_FIXTURE_REVISION=%s" % FIXTURE_REVISION)
 		print("METAL_RT_CAPTURE_LABEL=%s" % capture_label)
 		get_tree().quit()
+
+
+func _validate_c17_ux() -> bool:
+	var default_environment := Environment.new()
+	if default_environment.pathtracing_denoiser != RenderingServer.PT_DENOISER_NONE:
+		return _fail_c17("A new Environment did not default to the None denoiser.")
+	if RenderingServer.is_pathtracing_denoiser_supported(RenderingServer.PT_DENOISER_DLSS_RAY_RECONSTRUCTION):
+		return _fail_c17("Metal unexpectedly advertised DLSS Ray Reconstruction.")
+
+	var denoiser_hint := ""
+	for property: Dictionary in default_environment.get_property_list():
+		if property.get("name") == "pathtracing_denoiser":
+			denoiser_hint = property.get("hint_string", "")
+			break
+	if denoiser_hint != "None":
+		return _fail_c17("The Metal inspector denoiser hint was '%s', expected 'None'." % denoiser_hint)
+
+	var windows_environment: Environment = load("res://fixtures/c17_windows_dlss_rr.tres")
+	if windows_environment == null:
+		return _fail_c17("The cross-platform DLSS-RR Environment fixture did not load.")
+	if windows_environment.pathtracing_denoiser != RenderingServer.PT_DENOISER_NONE:
+		return _fail_c17("The Windows DLSS-RR fixture did not fall back to None on Metal.")
+
+	DirAccess.make_dir_recursive_absolute(artifact_dir)
+	var sanitized_path := artifact_dir.path_join("c17_sanitized_environment.tres")
+	var save_error := ResourceSaver.save(windows_environment, sanitized_path)
+	if save_error != OK:
+		return _fail_c17("The sanitized Environment could not be serialized: %s" % error_string(save_error))
+	var serialized := FileAccess.get_file_as_string(sanitized_path)
+	if "pathtracing_denoiser = 1" in serialized:
+		return _fail_c17("The sanitized Environment serialized the unsupported DLSS-RR value.")
+	return true
+
+
+func _build_c17_modes() -> void:
+	c17_modes = [
+		{"name": "native", "mode": Viewport.SCALING_3D_MODE_BILINEAR, "scale": 1.0, "temporal": false},
+		{"name": "fsr1", "mode": Viewport.SCALING_3D_MODE_FSR, "scale": 0.67, "temporal": false},
+		{"name": "fsr2", "mode": Viewport.SCALING_3D_MODE_FSR2, "scale": 0.67, "temporal": true},
+	]
+	var rendering_device := RenderingServer.get_rendering_device()
+	if rendering_device != null and rendering_device.has_feature(RenderingDevice.SUPPORTS_METALFX_SPATIAL):
+		c17_modes.push_back({"name": "metalfx_spatial", "mode": Viewport.SCALING_3D_MODE_METALFX_SPATIAL, "scale": 0.67, "temporal": false})
+	if rendering_device != null and rendering_device.has_feature(RenderingDevice.SUPPORTS_METALFX_TEMPORAL):
+		c17_modes.push_back({"name": "metalfx_temporal", "mode": Viewport.SCALING_3D_MODE_METALFX_TEMPORAL, "scale": 0.67, "temporal": true})
+	c17_temporal_mode = c17_modes[2]
+	for mode: Dictionary in c17_modes:
+		if mode.name == "metalfx_temporal":
+			c17_temporal_mode = mode
+
+
+func _process_c17() -> void:
+	c17_phase_frame += 1
+	match c17_phase:
+		"matrix":
+			if c17_phase_frame == 1:
+				_apply_c17_mode(c17_modes[c17_mode_index], capture_viewport)
+			if c17_phase_frame >= C17_MODE_WARMUP_FRAMES:
+				_capture_c17("presentation_%s" % c17_modes[c17_mode_index].name, capture_viewport)
+				c17_mode_index += 1
+				c17_phase_frame = 0
+				if c17_mode_index >= c17_modes.size():
+					c17_phase = "before_cut"
+					_apply_c17_mode(c17_temporal_mode, capture_viewport)
+		"before_cut":
+			if c17_phase_frame >= C17_TRANSITION_WARMUP_FRAMES:
+				_capture_c17("before_camera_cut", capture_viewport)
+				capture_camera.fov = 62.0
+				capture_camera.look_at_from_position(Vector3(-7.0, 5.0, -6.0), Vector3(0.0, 0.65, 0.0))
+				_record_c17_event("camera_cut")
+				c17_phase = "after_cut"
+				c17_phase_frame = 0
+		"after_cut":
+			if c17_phase_frame >= C17_TRANSITION_WARMUP_FRAMES:
+				_capture_c17("after_camera_cut", capture_viewport)
+				_configure_capture_camera()
+				DisplayServer.window_set_size(c17_original_window_size + Vector2i(160, 96))
+				_record_c17_event("resize")
+				c17_phase = "after_resize"
+				c17_phase_frame = 0
+		"after_resize":
+			if c17_phase_frame >= C17_TRANSITION_WARMUP_FRAMES:
+				_capture_c17("after_resize", capture_viewport)
+				get_tree().paused = true
+				_record_c17_event("editor_pause")
+				c17_phase = "paused"
+				c17_phase_frame = 0
+		"paused":
+			if c17_phase_frame >= 20:
+				get_tree().paused = false
+				_record_c17_event("editor_resume")
+				c17_phase = "after_resume"
+				c17_phase_frame = 0
+		"after_resume":
+			if c17_phase_frame >= C17_TRANSITION_WARMUP_FRAMES:
+				_capture_c17("after_pause_resume", capture_viewport)
+				_create_c17_secondary_viewport()
+				_record_c17_event("viewport_switch")
+				c17_phase = "secondary_viewport"
+				c17_phase_frame = 0
+		"secondary_viewport":
+			if c17_phase_frame >= C17_MODE_WARMUP_FRAMES:
+				_capture_c17("secondary_viewport", c17_secondary_viewport)
+				_record_c17_event("viewport_return")
+				c17_phase = "viewport_return"
+				c17_phase_frame = 0
+		"viewport_return":
+			if c17_phase_frame >= C17_TRANSITION_WARMUP_FRAMES:
+				_capture_c17("after_viewport_return", capture_viewport)
+				_finish_c17()
+
+
+func _apply_c17_mode(mode: Dictionary, viewport: Viewport) -> void:
+	viewport.scaling_3d_mode = mode.mode
+	viewport.scaling_3d_scale = mode.scale
+	_record_c17_event("presentation_%s" % mode.name)
+
+
+func _create_c17_secondary_viewport() -> void:
+	c17_secondary_viewport = SubViewport.new()
+	c17_secondary_viewport.size = Vector2i(320, 320)
+	c17_secondary_viewport.world_3d = get_world_3d()
+	c17_secondary_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	add_child(c17_secondary_viewport)
+	var secondary_camera := Camera3D.new()
+	c17_secondary_viewport.add_child(secondary_camera)
+	secondary_camera.fov = 48.0
+	secondary_camera.look_at_from_position(Vector3(5.2, 3.8, 6.8), Vector3(0.0, 0.65, 0.0))
+	secondary_camera.make_current()
+	_apply_c17_mode(c17_temporal_mode, c17_secondary_viewport)
+
+
+func _capture_c17(kind: String, viewport: Viewport) -> void:
+	DirAccess.make_dir_recursive_absolute(artifact_dir)
+	var captured := viewport.get_texture().get_image()
+	if captured == null or captured.is_empty():
+		_fail_c17("C17 capture '%s' was empty." % kind)
+		return
+	captured.convert(Image.FORMAT_RGBA8)
+	captured.resize(CAPTURE_SIZE.x, CAPTURE_SIZE.y, Image.INTERPOLATE_LANCZOS)
+	var filename := "c17_%s.png" % kind
+	var path := artifact_dir.path_join(filename)
+	var error := captured.save_png(path)
+	if error != OK:
+		_fail_c17("Failed to save C17 capture %s: %s" % [path, error_string(error)])
+		return
+	c17_captures[kind] = FileAccess.get_sha256(path)
+
+
+func _record_c17_event(event: String) -> void:
+	c17_events.push_back(event)
+	print("METAL_RT_C17_EVENT=%s" % event)
+
+
+func _finish_c17() -> void:
+	get_tree().paused = false
+	DisplayServer.window_set_size(c17_original_window_size)
+	var mode_names: Array[String] = []
+	for mode: Dictionary in c17_modes:
+		mode_names.push_back(mode.name)
+	var manifest := {
+		"schema_version": 1,
+		"fixture": "e0_hg0",
+		"fixture_revision": FIXTURE_REVISION,
+		"renderer": "forward_plus",
+		"rendering_driver": "metal",
+		"resolution": [CAPTURE_SIZE.x, CAPTURE_SIZE.y],
+		"denoiser": "none",
+		"native_denoising": "unavailable",
+		"ser": "disabled",
+		"presentation_modes": mode_names,
+		"temporal_test_mode": c17_temporal_mode.name,
+		"events": c17_events,
+		"captures": c17_captures,
+		"sanitized_environment": "c17_sanitized_environment.tres",
+		"device": RenderingServer.get_video_adapter_name(),
+		"os_version": OS.get_version(),
+		"architecture": Engine.get_architecture_name(),
+	}
+	var manifest_path := artifact_dir.path_join("c17_presentation_manifest.json")
+	var file := FileAccess.open(manifest_path, FileAccess.WRITE)
+	if file == null:
+		_fail_c17("Failed to create the C17 presentation manifest.")
+		return
+	file.store_string(JSON.stringify(manifest, "  ") + "\n")
+	print("METAL_RT_DENOISER_DEFAULT=none")
+	print("METAL_RT_SER=disabled")
+	print("METAL_RT_PRESENTATION=%s" % ",".join(mode_names))
+	print("METAL_RT_TEMPORAL_SEQUENCE=passed")
+	print("METAL_RT_C17_MAC_UX=passed")
+	get_tree().quit()
+
+
+func _fail_c17(message: String) -> bool:
+	push_error("METAL_RT_C17_MAC_UX=failed %s" % message)
+	get_tree().quit(1)
+	return false
 
 
 func _capture(kind: String) -> void:

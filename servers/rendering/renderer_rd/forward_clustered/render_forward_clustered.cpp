@@ -49,6 +49,35 @@ using namespace RendererSceneRenderImplementation;
 
 #define FADE_ALPHA_PASS_THRESHOLD 0.999
 
+static void _print_pathtracing_presentation_history_reset(uint32_t p_reasons) {
+	if (p_reasons == PT_PRESENTATION_HISTORY_RESET_NONE) {
+		return;
+	}
+	String reasons;
+	auto append_reason = [&reasons](const char *p_reason) {
+		if (!reasons.is_empty()) {
+			reasons += ",";
+		}
+		reasons += p_reason;
+	};
+	if (p_reasons & PT_PRESENTATION_HISTORY_RESET_CONTEXT) {
+		append_reason("context");
+	}
+	if (p_reasons & PT_PRESENTATION_HISTORY_RESET_FRAME_GAP) {
+		append_reason("frame_gap");
+	}
+	if (p_reasons & PT_PRESENTATION_HISTORY_RESET_CAMERA_CUT) {
+		append_reason("camera_cut");
+	}
+	if (p_reasons & PT_PRESENTATION_HISTORY_RESET_PROJECTION_CUT) {
+		append_reason("projection_cut");
+	}
+	if (p_reasons & PT_PRESENTATION_HISTORY_RESET_LONG_FRAME) {
+		append_reason("long_frame");
+	}
+	print_verbose("MetalRT C17 temporal presentation history reset: " + reasons);
+}
+
 void RenderForwardClustered::RenderBufferDataForwardClustered::ensure_specular() {
 	ERR_FAIL_NULL(render_buffers);
 
@@ -232,6 +261,12 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::free_data() {
 	if (!render_sdfgi_uniform_set.is_null() && RD::get_singleton()->uniform_set_is_valid(render_sdfgi_uniform_set)) {
 		RD::get_singleton()->free_rid(render_sdfgi_uniform_set);
 	}
+
+	fsr2_presentation_history = {};
+	dlss_presentation_history = {};
+#ifdef METAL_MFXTEMPORAL_ENABLED
+	mfx_presentation_history = {};
+#endif
 }
 
 void RenderForwardClustered::RenderBufferDataForwardClustered::configure(RenderSceneBuffersRD *p_render_buffers) {
@@ -2819,6 +2854,13 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	if (rb_data.is_valid() && (using_upscaling || using_taa)) {
 		if (scale_type == SCALE_FSR2) {
 			rb_data->ensure_fsr2(fsr2_effect);
+			const uint32_t history_reset_reasons = rb_data->fsr2_presentation_history.begin_frame(
+					RSG::rasterizer->get_frame_number(), time_step,
+					p_render_data->scene_data->cam_transform, p_render_data->scene_data->prev_cam_transform,
+					p_render_data->scene_data->cam_projection, p_render_data->scene_data->prev_cam_projection);
+			if (scene_features.rt) {
+				_print_pathtracing_presentation_history_reset(history_reset_reasons);
+			}
 
 			RID exposure;
 			if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
@@ -2848,7 +2890,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				params.fovy = fovy;
 				params.jitter = jitter;
 				params.delta_time = float(time_step);
-				params.reset_accumulation = false; // FIXME: The engine does not provide a way to reset the accumulation.
+				params.reset_accumulation = history_reset_reasons != PT_PRESENTATION_HISTORY_RESET_NONE;
 
 				Projection correction;
 				correction.set_depth_correction(true, true, false);
@@ -2867,6 +2909,13 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		} else if (scale_type == SCALE_DLSS) {
 			RENDER_TIMESTAMP("DLSS");
 			rb_data->ensure_dlss(dlss_effect);
+			const uint32_t history_reset_reasons = rb_data->dlss_presentation_history.begin_frame(
+					RSG::rasterizer->get_frame_number(), time_step,
+					p_render_data->scene_data->cam_transform, p_render_data->scene_data->prev_cam_transform,
+					p_render_data->scene_data->cam_projection, p_render_data->scene_data->prev_cam_projection);
+			if (scene_features.rt) {
+				_print_pathtracing_presentation_history_reset(history_reset_reasons);
+			}
 
 			RID exposure;
 			if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
@@ -2895,7 +2944,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				params.fovy = fovy;
 				params.jitter = jitter;
 				params.delta_time = float(time_step);
-				params.reset_accumulation = false; // FIXME: The engine does not provide a way to reset the accumulation.
+				params.reset_accumulation = history_reset_reasons != PT_PRESENTATION_HISTORY_RESET_NONE;
 
 				// Enable DLSS Ray Reconstruction if raytracing buffers are available
 				if (rb_data->dlss_rr_has_buffers()) {
@@ -2923,7 +2972,14 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			}
 		} else if (scale_type == SCALE_MFX) {
 #ifdef METAL_MFXTEMPORAL_ENABLED
-			bool reset = rb_data->ensure_mfx_temporal(mfx_temporal_effect);
+			rb_data->ensure_mfx_temporal(mfx_temporal_effect);
+			const uint32_t history_reset_reasons = rb_data->mfx_presentation_history.begin_frame(
+					RSG::rasterizer->get_frame_number(), time_step,
+					p_render_data->scene_data->cam_transform, p_render_data->scene_data->prev_cam_transform,
+					p_render_data->scene_data->cam_projection, p_render_data->scene_data->prev_cam_projection);
+			if (scene_features.rt) {
+				_print_pathtracing_presentation_history_reset(history_reset_reasons);
+			}
 
 			RID exposure;
 			if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
@@ -2943,7 +2999,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				params.exposure = exposure;
 				params.dst = rb->get_upscaled_texture(v);
 				params.jitter_offset = jitter;
-				params.reset = reset;
+				params.reset = history_reset_reasons != PT_PRESENTATION_HISTORY_RESET_NONE;
 
 				rb->set_upscaler_ready(true);
 				mfx_temporal_effect->process(rb_data->get_mfx_temporal_context(), params);

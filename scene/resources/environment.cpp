@@ -642,12 +642,27 @@ int Environment::get_pathtracing_max_bounces() const {
 }
 
 void Environment::set_pathtracing_denoiser(RSE::PathtracingDenoiser p_denoiser) {
-	pathtracing_denoiser = p_denoiser;
+	const bool dlss_rr_supported = RS::get_singleton()->is_pathtracing_denoiser_supported(RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION);
+	pathtracing_denoiser = sanitize_pathtracing_denoiser(p_denoiser, dlss_rr_supported);
+	if (pathtracing_denoiser != p_denoiser) {
+		WARN_PRINT_ONCE("The saved path-tracing denoiser is unavailable with the current rendering driver, device, or runtime libraries. Falling back to None. Choose a supported denoiser before saving this Environment on this device.");
+	}
 	_update_pathtracing();
 }
 
 RSE::PathtracingDenoiser Environment::get_pathtracing_denoiser() const {
 	return pathtracing_denoiser;
+}
+
+RSE::PathtracingDenoiser Environment::sanitize_pathtracing_denoiser(RSE::PathtracingDenoiser p_denoiser, bool p_dlss_rr_supported) {
+	if (p_denoiser == RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION && p_dlss_rr_supported) {
+		return p_denoiser;
+	}
+	return RSE::PT_DENOISER_NONE;
+}
+
+String Environment::get_pathtracing_denoiser_property_hint(bool p_dlss_rr_supported) {
+	return p_dlss_rr_supported ? "None,DLSS Ray Reconstruction" : "None";
 }
 
 void Environment::_update_pathtracing() {
@@ -1164,6 +1179,11 @@ void Environment::_update_adjustment() {
 // Private methods, constructor and destructor
 
 void Environment::_validate_property(PropertyInfo &p_property) const {
+	if (p_property.name == "pathtracing_denoiser") {
+		const bool dlss_rr_supported = RS::get_singleton()->is_pathtracing_denoiser_supported(RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION);
+		p_property.hint_string = get_pathtracing_denoiser_property_hint(dlss_rr_supported);
+		return;
+	}
 	if (!Engine::get_singleton()->is_editor_hint()) {
 		return;
 	}

@@ -36,6 +36,7 @@
 #include "core/object/class_db.h"
 #include "core/os/os.h"
 #include "core/variant/typed_array.h"
+#include "drivers/streamline/streamline.h"
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/rendering_server_types.h"
 #include "servers/rendering/shader_language.h"
@@ -2092,6 +2093,18 @@ String RenderingServer::get_current_rendering_method() const {
 	return ::OS::get_singleton()->get_current_rendering_method();
 }
 
+bool RenderingServer::is_pathtracing_denoiser_supported(RSE::PathtracingDenoiser p_denoiser) const {
+	switch (p_denoiser) {
+		case RSE::PT_DENOISER_NONE:
+			return true;
+		case RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION: {
+			Streamline *streamline = Streamline::get_singleton();
+			return streamline && streamline->get_capability(STREAMLINE_CAPABILITY_DLSS_RR);
+		}
+	}
+	return false;
+}
+
 Vector<uint8_t> _convert_surface_version_1_to_surface_version_2(uint64_t p_format, Vector<uint8_t> p_vertex_data, uint32_t p_vertex_count, uint32_t p_old_stride, uint32_t p_vertex_size, uint32_t p_normal_size, uint32_t p_position_stride, uint32_t p_normal_tangent_stride) {
 	Vector<uint8_t> new_vertex_data;
 	new_vertex_data.resize(p_vertex_data.size());
@@ -3534,6 +3547,7 @@ void RenderingServer::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("get_current_rendering_driver_name"), &RenderingServer::get_current_rendering_driver_name);
 	ClassDB::bind_method(D_METHOD("get_current_rendering_method"), &RenderingServer::get_current_rendering_method);
+	ClassDB::bind_method(D_METHOD("is_pathtracing_denoiser_supported", "denoiser"), &RenderingServer::is_pathtracing_denoiser_supported);
 
 	ClassDB::bind_method(D_METHOD("make_sphere_mesh", "latitudes", "longitudes", "radius"), &RenderingServer::make_sphere_mesh);
 	ClassDB::bind_method(D_METHOD("get_test_cube"), &RenderingServer::get_test_cube);

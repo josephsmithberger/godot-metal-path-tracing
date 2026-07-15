@@ -92,3 +92,8 @@ non-indexed surfaces, deformed meshes, MultiMesh, negative scale, and scene
 mutation. Its current contract and E1 fixture are documented in
 [`scene_geometry.md`](scene_geometry.md); the exclusions above remain the
 historical boundary of the C13 test itself.
+
+C17 retains `None` as the supported Mac denoising strategy, filters the
+inspector by runtime capability, and validates the presentation/upscaler
+matrix and temporal transitions. See
+[`mac_ux_presentation.md`](mac_ux_presentation.md).

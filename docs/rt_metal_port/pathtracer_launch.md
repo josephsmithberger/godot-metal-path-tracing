@@ -144,11 +144,12 @@ manifest, visual diff, numeric metrics, and self-hosted CI lane. See
 ## Remaining work toward full scene integration
 
 C13 supplies the compute re-expression for opaque, static HG0
-`StandardMaterial3D` scenes. Full parity still requires custom hit groups
-(HG1+), alpha policy, deformed and instanced geometry lifetime, broader light
-and environment coverage, native denoising/presentation, and export coverage.
-Those remain separate follow-up chunks so this first editor lane has an honest,
-testable boundary.
+`StandardMaterial3D` scenes. C14-C16 add scene geometry, material dispatch,
+alpha testing, and procedural intersections. C17 makes denoiser selection
+capability-aware and validates native/upscaled presentation while retaining
+`None` as the documented Mac denoising strategy; see
+[`mac_ux_presentation.md`](mac_ux_presentation.md). Export coverage remains a
+separate follow-up.
 
 The C11 runtime gate and fallback are complete; see
 [`runtime_gating.md`](runtime_gating.md).

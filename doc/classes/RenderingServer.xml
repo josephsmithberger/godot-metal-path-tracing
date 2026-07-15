@@ -2134,6 +2134,13 @@
 				Returns [code]true[/code] if our code is currently executing on the rendering thread.
 			</description>
 		</method>
+		<method name="is_pathtracing_denoiser_supported" qualifiers="const">
+			<return type="bool" />
+			<param index="0" name="denoiser" type="int" enum="RenderingServer.PathtracingDenoiser" />
+			<description>
+				Returns [code]true[/code] if the path-tracing [param denoiser] is available with the current rendering driver, device, and runtime libraries. [constant PT_DENOISER_NONE] is always supported. DLSS Ray Reconstruction requires a supported NVIDIA device and a working Streamline runtime, and is unavailable with the Metal rendering driver.
+			</description>
+		</method>
 		<method name="light_area_set_normalize_energy">
 			<return type="void" />
 			<param index="0" name="light" type="RID" />
