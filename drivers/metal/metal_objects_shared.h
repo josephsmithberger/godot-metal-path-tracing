@@ -546,8 +546,15 @@ _FORCE_INLINE_ static MTL::Stages convert_src_pipeline_stages_to_metal(BitField<
 	}
 
 	// Compute stage.
-	if (p_stages & RDD::PIPELINE_STAGE_COMPUTE_SHADER_BIT) {
+	// Raytracing executes through a compute encoder on Metal, so it maps to the
+	// dispatch stage as well.
+	if (p_stages & (RDD::PIPELINE_STAGE_COMPUTE_SHADER_BIT | RDD::PIPELINE_STAGE_RAY_TRACING_SHADER_BIT)) {
 		mtlStages |= MTL::StageDispatch;
+	}
+
+	// Acceleration structure builds use a dedicated encoder and stage.
+	if (p_stages & RDD::PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT) {
+		mtlStages |= MTL::StageAccelerationStructure;
 	}
 
 	// Blit stage (transfer operations).
@@ -585,8 +592,15 @@ _FORCE_INLINE_ static MTL::Stages convert_dst_pipeline_stages_to_metal(BitField<
 	}
 
 	// Compute stage.
-	if (p_stages & RDD::PIPELINE_STAGE_COMPUTE_SHADER_BIT) {
+	// Raytracing executes through a compute encoder on Metal, so it maps to the
+	// dispatch stage as well.
+	if (p_stages & (RDD::PIPELINE_STAGE_COMPUTE_SHADER_BIT | RDD::PIPELINE_STAGE_RAY_TRACING_SHADER_BIT)) {
 		mtlStages |= MTL::StageDispatch;
+	}
+
+	// Acceleration structure builds use a dedicated encoder and stage.
+	if (p_stages & RDD::PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT) {
+		mtlStages |= MTL::StageAccelerationStructure;
 	}
 
 	// Blit stage (transfer operations).

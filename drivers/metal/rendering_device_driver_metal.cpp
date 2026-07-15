@@ -1421,6 +1421,13 @@ RDD::UniformSetID RenderingDeviceDriverMetal::uniform_set_create(VectorView<Boun
 			if (stage.has_flag(RDD::SHADER_STAGE_COMPUTE_BIT)) {
 				*sru |= stage_resource_usage(RDD::SHADER_STAGE_COMPUTE, usage);
 			}
+			// Raytracing stages execute on Metal's compute lane, so their resources
+			// must be tracked as compute usage; otherwise they are never declared to
+			// the compute encoder and hazard tracking cannot order the trace dispatch
+			// against passes that consume its output.
+			if (stage & (RDD::SHADER_STAGE_RAYGEN_BIT | RDD::SHADER_STAGE_ANY_HIT_BIT | RDD::SHADER_STAGE_CLOSEST_HIT_BIT | RDD::SHADER_STAGE_MISS_BIT | RDD::SHADER_STAGE_INTERSECTION_BIT)) {
+				*sru |= stage_resource_usage(RDD::SHADER_STAGE_COMPUTE, usage);
+			}
 		};
 #define ADD_USAGE(res, stage, usage) \
 	if (!use_barriers) { \
