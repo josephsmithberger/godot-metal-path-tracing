@@ -7,7 +7,7 @@
 // Required bindings (before this file):
 //   tlas, payload, scene_data_block, geometries[], motion_indices[], materials[], motion_transforms[], bindless_textures[],
 //   SAMPLER_* (12 material samplers), rt_params, rt_depth_image,
-//   DLSS-RR images (ifdef DLSS_RR_ENABLED)
+//   denoiser guide images (ifdef DENOISER_GUIDES_ENABLED)
 
 // ============================================================================
 // HIT DATA
@@ -490,19 +490,20 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	vec3 diffuseReflectance = baseColorToDiffuseReflectance(brdf_mat.baseColor, brdf_mat.metalness);
 
 	// =================================================================
-	// DLSS Ray Reconstruction output (primary ray, sample 0 only)
+	// Denoiser guide output (primary ray, sample 0 only)
 	// =================================================================
-#ifdef DLSS_RR_ENABLED
+#ifdef DENOISER_GUIDES_ENABLED
 	if (total_bounces == 0u && is_sample_zero(ps.packed_bounces_flags)) {
 		ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
 
 		vec3 diffuse_albedo = DLSSRR_computeDiffuseAlbedo(m.albedo, m.metalness);
-		imageStore(dlss_rr_diffuse_albedo, pixel, vec4(diffuse_albedo, 1.0));
+		imageStore(denoiser_diffuse_albedo, pixel, vec4(diffuse_albedo, 1.0));
 
 		vec3 specular_albedo = DLSSRR_computeSpecularAlbedo(m.albedo, m.metalness, brdf_mat.dielectricF0, m.roughness, NdotV);
-		imageStore(dlss_rr_specular_albedo, pixel, vec4(clamp(specular_albedo, vec3(0.0), vec3(1.0)), 1.0)); // match UNORM8 like before - fixes some issues with garbling..
+		imageStore(denoiser_specular_albedo, pixel, vec4(clamp(specular_albedo, vec3(0.0), vec3(1.0)), 1.0));
 
-		imageStore(dlss_rr_normal_roughness, pixel, vec4(N, m.roughness));
+		imageStore(denoiser_normal_roughness, pixel, vec4(N, m.roughness));
+		imageStore(denoiser_roughness, pixel, vec4(m.roughness));
 
 		// Specular hit distance via inline ray query (only for smooth surfaces).
 		float spec_hit_dist = -1.0;
@@ -527,7 +528,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 				spec_hit_dist = rayQueryGetIntersectionTEXT(spec_rq, true);
 			}
 		}
-		imageStore(dlss_rr_specular_hit_dist, pixel, vec4(spec_hit_dist));
+		imageStore(denoiser_specular_hit_dist, pixel, vec4(spec_hit_dist));
 	}
 #endif
 

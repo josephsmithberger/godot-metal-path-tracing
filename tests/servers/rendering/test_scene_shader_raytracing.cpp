@@ -52,13 +52,13 @@ TEST_CASE("[MetalRT] C13 selects the editor route only when its scene shader is 
 TEST_CASE("[MetalRT] C13 masks unsupported Metal scene variants") {
 	uint32_t flags = SceneShader::rt_flags_pack(
 			SceneShader::RT_FLAG_DEBUG_VIS_ENABLED |
-					SceneShader::RT_FLAG_DLSS_RR_ENABLED |
+					SceneShader::RT_FLAG_DENOISER_GUIDES_ENABLED |
 					SceneShader::RT_FLAG_FOG_ENABLED |
 					SceneShader::RT_FLAG_SER_ENABLED,
 			4, 3);
 	uint32_t sanitized = SceneShader::sanitize_compute_rt_flags(flags);
 	CHECK((sanitized & SceneShader::RT_FLAG_DEBUG_VIS_ENABLED) == 0);
-	CHECK((sanitized & SceneShader::RT_FLAG_DLSS_RR_ENABLED) == 0);
+	CHECK((sanitized & SceneShader::RT_FLAG_DENOISER_GUIDES_ENABLED) != 0);
 	CHECK((sanitized & SceneShader::RT_FLAG_FOG_ENABLED) == 0);
 	CHECK((sanitized & SceneShader::RT_FLAG_SER_ENABLED) == 0);
 	CHECK(((sanitized >> SceneShader::RT_SAMPLE_COUNT_SHIFT) & SceneShader::RT_SAMPLE_COUNT_MASK) == 4);
@@ -98,6 +98,21 @@ TEST_CASE("[MetalRT] C17 keeps NVIDIA SER disabled on the Metal compute lane") {
 	const uint32_t requested = SceneShader::rt_flags_pack(SceneShader::RT_FLAG_SER_ENABLED, 1, 1);
 	const uint32_t sanitized = SceneShader::sanitize_compute_rt_flags(requested);
 	CHECK((sanitized & SceneShader::RT_FLAG_SER_ENABLED) == 0);
+}
+
+TEST_CASE("[MetalRT] MetalFX denoising enables path-tracing guide output") {
+	float params[16] = {};
+	params[RSE::PT_PARAM_SAMPLE_COUNT] = 1.0f;
+	params[RSE::PT_PARAM_MAX_BOUNCES] = 1.0f;
+	params[RSE::PT_PARAM_DENOISER] = (float)RSE::PT_DENOISER_METALFX;
+
+	uint32_t flags = SceneShader::compute_rt_flags(params, false);
+	CHECK((flags & SceneShader::RT_FLAG_DENOISER_GUIDES_ENABLED) != 0);
+	CHECK((SceneShader::sanitize_compute_rt_flags(flags) & SceneShader::RT_FLAG_DENOISER_GUIDES_ENABLED) != 0);
+
+	params[RSE::PT_PARAM_DENOISER] = (float)RSE::PT_DENOISER_NONE;
+	flags = SceneShader::compute_rt_flags(params, false);
+	CHECK((flags & SceneShader::RT_FLAG_DENOISER_GUIDES_ENABLED) == 0);
 }
 
 TEST_CASE("[MetalRT] C14 preserves front-face winding across mirrored transforms") {

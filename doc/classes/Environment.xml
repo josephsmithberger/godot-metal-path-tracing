@@ -205,7 +205,7 @@
 			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
 		</member>
 		<member name="pathtracing_denoiser" type="int" setter="set_pathtracing_denoiser" getter="get_pathtracing_denoiser" enum="RenderingServer.PathtracingDenoiser" default="0">
-			The denoiser used to reduce noise in the path-traced image. The editor only lists denoisers supported by the current rendering driver, device, and runtime libraries. Loading an unsupported saved choice falls back to [constant RenderingServer.PT_DENOISER_NONE] and reports one warning. [constant RenderingServer.PT_DENOISER_DLSS_RAY_RECONSTRUCTION] requires a supported NVIDIA RTX GPU and working Streamline runtime.
+			The denoiser used to reduce noise in the path-traced image. The editor only lists denoisers supported by the current rendering driver, device, and runtime libraries. Loading an unsupported saved choice falls back to [constant RenderingServer.PT_DENOISER_NONE] and reports one warning. [constant RenderingServer.PT_DENOISER_DLSS_RAY_RECONSTRUCTION] requires a supported NVIDIA RTX GPU and working Streamline runtime. [constant RenderingServer.PT_DENOISER_METALFX] requires MetalFX denoised upscaling support and combines denoising with the viewport's internal-to-target resolution scaling.
 			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
 		</member>
 		<member name="pathtracing_enabled" type="bool" setter="set_pathtracing_enabled" getter="is_pathtracing_enabled" default="false">

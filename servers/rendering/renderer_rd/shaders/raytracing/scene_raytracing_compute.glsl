@@ -416,7 +416,17 @@ void main() {
 					vec2 previous_uv = project_uv(far_world, prev_vp_unjittered);
 					imageStore(rt_velocity_image, ivec2(pixel), vec4(previous_uv - current_uv, 0.0, 0.0));
 				}
-				radiance += throughput * sample_environment(ray_direction);
+				vec3 sky_color = sample_environment(ray_direction);
+#ifdef DENOISER_GUIDES_ENABLED
+				if (sample_index == 0u && bounce == 0u) {
+					imageStore(denoiser_diffuse_albedo, ivec2(pixel), vec4(sky_color, 1.0));
+					imageStore(denoiser_specular_albedo, ivec2(pixel), vec4(0.0));
+					imageStore(denoiser_normal_roughness, ivec2(pixel), vec4(-ray_direction, 0.0));
+					imageStore(denoiser_roughness, ivec2(pixel), vec4(0.0));
+					imageStore(denoiser_specular_hit_dist, ivec2(pixel), vec4(-1.0));
+				}
+#endif
+				radiance += throughput * sky_color;
 				break;
 			}
 
@@ -461,6 +471,29 @@ void main() {
 			brdf_material.emissive = material.emissive;
 			brdf_material.transmissivness = 0.0;
 			brdf_material.opacity = 1.0;
+
+#ifdef DENOISER_GUIDES_ENABLED
+			if (sample_index == 0u && bounce == 0u) {
+				float NdotV = max(dot(shading_normal, view_direction), 0.0001);
+				vec3 diffuse_albedo = DLSSRR_computeDiffuseAlbedo(material.albedo, material.metalness);
+				vec3 specular_albedo = DLSSRR_computeSpecularAlbedo(material.albedo, material.metalness,
+						brdf_material.dielectricF0, material.roughness, NdotV);
+				imageStore(denoiser_diffuse_albedo, ivec2(pixel), vec4(diffuse_albedo, 1.0));
+				imageStore(denoiser_specular_albedo, ivec2(pixel), vec4(clamp(specular_albedo, vec3(0.0), vec3(1.0)), 1.0));
+				imageStore(denoiser_normal_roughness, ivec2(pixel), vec4(shading_normal, material.roughness));
+				imageStore(denoiser_roughness, ivec2(pixel), vec4(material.roughness));
+
+				float specular_hit_distance = -1.0;
+				if (material.roughness < MAX_DENOISER_SPECULAR_HIT_THRESHOLD) {
+					ComputeHit specular_hit;
+					vec3 specular_direction = reflect(-view_direction, shading_normal);
+					if (trace_material(offset_ray_origin(hit_data.hit_pos, shading_normal), specular_direction, 10000.0, specular_hit)) {
+						specular_hit_distance = specular_hit.t;
+					}
+				}
+				imageStore(denoiser_specular_hit_dist, ivec2(pixel), vec4(specular_hit_distance));
+			}
+#endif
 
 			uint light_count = uint(get_rt_param(RT_PARAM_LIGHT_COUNT));
 			if (light_count > 0u) {

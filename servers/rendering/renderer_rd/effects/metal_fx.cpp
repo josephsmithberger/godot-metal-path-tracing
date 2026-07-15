@@ -160,6 +160,9 @@ MFXTemporalContext *MFXTemporalEffect::create_context(CreateParams p_params) con
 }
 
 void MFXTemporalEffect::process(RendererRD::MFXTemporalContext *p_ctx, RendererRD::MFXTemporalEffect::Params p_params) {
+	ERR_FAIL_NULL(p_ctx);
+	ERR_FAIL_NULL(p_ctx->scaler);
+
 	CallbackArgs *userdata = args_allocator.alloc(
 			this,
 			RDD::TextureID(RD::get_singleton()->get_driver_resource(RDC::DRIVER_RESOURCE_TEXTURE, p_params.src)),
@@ -170,12 +173,17 @@ void MFXTemporalEffect::process(RendererRD::MFXTemporalContext *p_ctx, RendererR
 			RDD::TextureID(RD::get_singleton()->get_driver_resource(RDC::DRIVER_RESOURCE_TEXTURE, p_params.dst)),
 			*p_ctx,
 			p_params.reset);
-	RD::CallbackResource res[3] = {
+	RD::CallbackResource res[5] = {
 		{ .rid = p_params.src, .usage = RD::CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE },
 		{ .rid = p_params.depth, .usage = RD::CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE },
+		{ .rid = p_params.motion, .usage = RD::CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE },
 		{ .rid = p_params.dst, .usage = RD::CALLBACK_RESOURCE_USAGE_STORAGE_IMAGE_READ_WRITE },
 	};
-	RD::get_singleton()->driver_callback_add((RDD::DriverCallback)MFXTemporalEffect::callback, userdata, VectorView<RD::CallbackResource>(res, 3));
+	uint32_t resource_count = 4;
+	if (p_params.exposure.is_valid()) {
+		res[resource_count++] = { .rid = p_params.exposure, .usage = RD::CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE };
+	}
+	RD::get_singleton()->driver_callback_add((RDD::DriverCallback)MFXTemporalEffect::callback, userdata, VectorView<RD::CallbackResource>(res, resource_count));
 }
 
 void MFXTemporalEffect::callback(RDD *p_driver, RDD::CommandBufferID p_command_buffer, CallbackArgs *p_userdata) {
@@ -201,6 +209,140 @@ void MFXTemporalEffect::callback(RDD *p_driver, RDD::CommandBufferID p_command_b
 	MTLFX::TemporalScaler *s = static_cast<MTLFX::TemporalScaler *>(scaler);
 	MTL3::MDCommandBuffer *cmd = (MTL3::MDCommandBuffer *)(p_command_buffer.id);
 	s->encodeToCommandBuffer(cmd->get_command_buffer());
+	obj->retain_resource(scaler);
+
+	CallbackArgs::free(&p_userdata);
+}
+
+#endif
+
+#ifdef METAL_MFXDENOISED_ENABLED
+
+#pragma mark - Temporal Denoised Scaler
+
+static simd::float4x4 _projection_to_simd(const Projection &p_projection) {
+	return simd::float4x4(
+			(simd::float4){ p_projection.columns[0].x, p_projection.columns[0].y, p_projection.columns[0].z, p_projection.columns[0].w },
+			(simd::float4){ p_projection.columns[1].x, p_projection.columns[1].y, p_projection.columns[1].z, p_projection.columns[1].w },
+			(simd::float4){ p_projection.columns[2].x, p_projection.columns[2].y, p_projection.columns[2].z, p_projection.columns[2].w },
+			(simd::float4){ p_projection.columns[3].x, p_projection.columns[3].y, p_projection.columns[3].z, p_projection.columns[3].w });
+}
+
+MFXDenoisedContext::~MFXDenoisedContext() {
+	if (scaler) {
+		scaler->release();
+	}
+}
+
+MFXDenoisedEffect::MFXDenoisedEffect() {}
+MFXDenoisedEffect::~MFXDenoisedEffect() {}
+
+MFXDenoisedContext *MFXDenoisedEffect::create_context(CreateParams p_params) const {
+	DEV_ASSERT(RD::get_singleton()->has_feature(RD::SUPPORTS_METALFX_DENOISED));
+
+	RenderingDeviceDriverMetal *rdd = (RenderingDeviceDriverMetal *)RD::get_singleton()->get_device_driver();
+	PixelFormats &pf = rdd->get_pixel_formats();
+	MTL::Device *dev = rdd->get_device();
+
+	NS::SharedPtr<MTLFX::TemporalDenoisedScalerDescriptor> desc = NS::TransferPtr(MTLFX::TemporalDenoisedScalerDescriptor::alloc()->init());
+	desc->setInputWidth((NS::UInteger)p_params.input_size.width);
+	desc->setInputHeight((NS::UInteger)p_params.input_size.height);
+	desc->setOutputWidth((NS::UInteger)p_params.output_size.width);
+	desc->setOutputHeight((NS::UInteger)p_params.output_size.height);
+
+	desc->setColorTextureFormat((MTL::PixelFormat)pf.getMTLPixelFormat(p_params.input_format));
+	desc->setDepthTextureFormat((MTL::PixelFormat)pf.getMTLPixelFormat(p_params.depth_format));
+	desc->setMotionTextureFormat((MTL::PixelFormat)pf.getMTLPixelFormat(p_params.motion_format));
+	desc->setDiffuseAlbedoTextureFormat((MTL::PixelFormat)pf.getMTLPixelFormat(p_params.diffuse_albedo_format));
+	desc->setSpecularAlbedoTextureFormat((MTL::PixelFormat)pf.getMTLPixelFormat(p_params.specular_albedo_format));
+	desc->setNormalTextureFormat((MTL::PixelFormat)pf.getMTLPixelFormat(p_params.normal_format));
+	desc->setRoughnessTextureFormat((MTL::PixelFormat)pf.getMTLPixelFormat(p_params.roughness_format));
+	desc->setSpecularHitDistanceTextureFormat((MTL::PixelFormat)pf.getMTLPixelFormat(p_params.specular_hit_distance_format));
+	desc->setSpecularHitDistanceTextureEnabled(true);
+	desc->setAutoExposureEnabled(false);
+	desc->setOutputTextureFormat((MTL::PixelFormat)pf.getMTLPixelFormat(p_params.output_format));
+
+	MFXDenoisedContext *context = memnew(MFXDenoisedContext);
+	context->scaler = desc->newTemporalDenoisedScaler(dev);
+	if (!context->scaler) {
+		memdelete(context);
+		return nullptr;
+	}
+
+	context->scaler->setMotionVectorScaleX(p_params.motion_vector_scale.x);
+	context->scaler->setMotionVectorScaleY(p_params.motion_vector_scale.y);
+	context->scaler->setDepthReversed(true);
+	return context;
+}
+
+void MFXDenoisedEffect::process(MFXDenoisedContext *p_ctx, Params p_params) {
+	ERR_FAIL_NULL(p_ctx);
+	ERR_FAIL_NULL(p_ctx->scaler);
+
+	auto texture_id = [](RID p_rid) {
+		return RDD::TextureID(RD::get_singleton()->get_driver_resource(RDC::DRIVER_RESOURCE_TEXTURE, p_rid));
+	};
+
+	CallbackArgs *userdata = args_allocator.alloc(
+			this,
+			p_ctx->scaler,
+			texture_id(p_params.src),
+			texture_id(p_params.depth),
+			texture_id(p_params.motion),
+			p_params.exposure.is_valid() ? texture_id(p_params.exposure) : RDD::TextureID(),
+			texture_id(p_params.diffuse_albedo),
+			texture_id(p_params.specular_albedo),
+			texture_id(p_params.normal),
+			texture_id(p_params.roughness),
+			texture_id(p_params.specular_hit_distance),
+			texture_id(p_params.dst),
+			p_params.jitter_offset,
+			p_params.camera_projection,
+			p_params.camera_transform,
+			p_params.reset);
+
+	RD::CallbackResource resources[10] = {
+		{ .rid = p_params.src, .usage = RD::CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE },
+		{ .rid = p_params.depth, .usage = RD::CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE },
+		{ .rid = p_params.motion, .usage = RD::CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE },
+		{ .rid = p_params.diffuse_albedo, .usage = RD::CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE },
+		{ .rid = p_params.specular_albedo, .usage = RD::CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE },
+		{ .rid = p_params.normal, .usage = RD::CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE },
+		{ .rid = p_params.roughness, .usage = RD::CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE },
+		{ .rid = p_params.specular_hit_distance, .usage = RD::CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE },
+		{ .rid = p_params.dst, .usage = RD::CALLBACK_RESOURCE_USAGE_STORAGE_IMAGE_READ_WRITE },
+	};
+	uint32_t resource_count = 9;
+	if (p_params.exposure.is_valid()) {
+		resources[resource_count++] = { .rid = p_params.exposure, .usage = RD::CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE };
+	}
+	RD::get_singleton()->driver_callback_add((RDD::DriverCallback)MFXDenoisedEffect::callback, userdata, VectorView<RD::CallbackResource>(resources, resource_count));
+}
+
+void MFXDenoisedEffect::callback(RDD *p_driver, RDD::CommandBufferID p_command_buffer, CallbackArgs *p_userdata) {
+	MDCommandBufferBase *obj = (MDCommandBufferBase *)(p_command_buffer.id);
+	obj->end();
+
+	MTLFX::TemporalDenoisedScalerBase *scaler = p_userdata->scaler;
+	scaler->setShouldResetHistory(p_userdata->reset);
+	scaler->setColorTexture(reinterpret_cast<MTL::Texture *>(p_userdata->src.id));
+	scaler->setDepthTexture(reinterpret_cast<MTL::Texture *>(p_userdata->depth.id));
+	scaler->setMotionTexture(reinterpret_cast<MTL::Texture *>(p_userdata->motion.id));
+	scaler->setExposureTexture(reinterpret_cast<MTL::Texture *>(p_userdata->exposure.id));
+	scaler->setDiffuseAlbedoTexture(reinterpret_cast<MTL::Texture *>(p_userdata->diffuse_albedo.id));
+	scaler->setSpecularAlbedoTexture(reinterpret_cast<MTL::Texture *>(p_userdata->specular_albedo.id));
+	scaler->setNormalTexture(reinterpret_cast<MTL::Texture *>(p_userdata->normal.id));
+	scaler->setRoughnessTexture(reinterpret_cast<MTL::Texture *>(p_userdata->roughness.id));
+	scaler->setSpecularHitDistanceTexture(reinterpret_cast<MTL::Texture *>(p_userdata->specular_hit_distance.id));
+	scaler->setOutputTexture(reinterpret_cast<MTL::Texture *>(p_userdata->dst.id));
+	scaler->setJitterOffsetX(p_userdata->jitter_offset.x);
+	scaler->setJitterOffsetY(p_userdata->jitter_offset.y);
+	scaler->setWorldToViewMatrix(_projection_to_simd(Projection(p_userdata->camera_transform.affine_inverse())));
+	scaler->setViewToClipMatrix(_projection_to_simd(p_userdata->camera_projection));
+
+	MTLFX::TemporalDenoisedScaler *denoised_scaler = static_cast<MTLFX::TemporalDenoisedScaler *>(scaler);
+	MTL3::MDCommandBuffer *cmd = (MTL3::MDCommandBuffer *)(p_command_buffer.id);
+	denoised_scaler->encodeToCommandBuffer(cmd->get_command_buffer());
 	obj->retain_resource(scaler);
 
 	CallbackArgs::free(&p_userdata);

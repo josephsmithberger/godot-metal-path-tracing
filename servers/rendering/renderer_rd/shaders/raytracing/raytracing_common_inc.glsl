@@ -6,7 +6,7 @@
 // Specialization constant (bits 0-20: flags, 21-28: samples, 29-31: bounces).
 layout(constant_id = 0) const uint RT_FLAGS = 0u;
 
-#define RT_FLAG_DLSS_RR_ENABLED (1u << 1)
+#define RT_FLAG_DENOISER_GUIDES_ENABLED (1u << 1)
 #define RT_FLAG_FOG_ENABLED (1u << 2)
 
 #define RT_SAMPLE_COUNT_SHIFT 21u
@@ -49,11 +49,12 @@ vec2 project_uv(vec3 world_pos, mat4 vp) {
 	return clip.xy / clip.w * 0.5 + 0.5;
 }
 
-#ifdef DLSS_RR_ENABLED
-layout(set = 0, binding = 9, rgba16f) uniform image2D dlss_rr_diffuse_albedo;
-layout(set = 0, binding = 10, rgba16f) uniform image2D dlss_rr_specular_albedo;
-layout(set = 0, binding = 11, rgba16f) uniform image2D dlss_rr_normal_roughness;
-layout(set = 0, binding = 12, r16f) uniform image2D dlss_rr_specular_hit_dist;
+#ifdef DENOISER_GUIDES_ENABLED
+layout(set = 0, binding = 9, rgba8) uniform image2D denoiser_diffuse_albedo;
+layout(set = 0, binding = 10, rgba16f) uniform image2D denoiser_specular_albedo;
+layout(set = 0, binding = 11, rgba8_snorm) uniform image2D denoiser_normal_roughness;
+layout(set = 0, binding = 12, r16f) uniform image2D denoiser_specular_hit_dist;
+layout(set = 0, binding = 29, r16f) uniform image2D denoiser_roughness;
 #endif
 
 // Binding 14 is reserved for GlobalShaderUniformData (declared above).

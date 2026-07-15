@@ -3125,7 +3125,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 
 		// rt_params layout (see RaytracingParamIndex enum):
 		// [0] = VIS_MODE, [1] = SAMPLE_COUNT, [2] = MAX_BOUNCES,
-		// [3] = DLSS_RR_ENABLED, [14] = LIGHT_COUNT, [15] = FRAME_INDEX
+		// [3] = DENOISER, [14] = LIGHT_COUNT, [15] = FRAME_INDEX
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FRAME_INDEX] = float(p_state->frame_counter++);
 
 		// Unjittered VP for motion vectors (matches raster convention).
@@ -3206,7 +3206,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		uniforms.push_back(u);
 	}
 
-	// Bindings 9-12: DLSS Ray Reconstruction output buffers (only in DLSS RR shader variant).
+	// Bindings 9-12 and 29: path-tracing denoiser guide buffers.
 	bool dlss_rr_enabled = rb_data->dlss_rr_has_buffers();
 	if (dlss_rr_enabled) {
 		// Binding 9: DLSS RR Diffuse Albedo
@@ -3242,6 +3242,15 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			u.binding = 12;
 			u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
 			u.append_id(rb_data->dlss_rr_get_specular_hit_dist());
+			uniforms.push_back(u);
+		}
+
+		// Binding 29: Roughness (MetalFX consumes it separately from normals).
+		{
+			RD::Uniform u;
+			u.binding = 29;
+			u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
+			u.append_id(rb_data->dlss_rr_get_roughness());
 			uniforms.push_back(u);
 		}
 	}

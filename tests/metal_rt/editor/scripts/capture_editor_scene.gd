@@ -91,14 +91,18 @@ func _validate_c17_ux() -> bool:
 		return _fail_c17("A new Environment did not default to the None denoiser.")
 	if RenderingServer.is_pathtracing_denoiser_supported(RenderingServer.PT_DENOISER_DLSS_RAY_RECONSTRUCTION):
 		return _fail_c17("Metal unexpectedly advertised DLSS Ray Reconstruction.")
+	var metalfx_supported := RenderingServer.is_pathtracing_denoiser_supported(RenderingServer.PT_DENOISER_METALFX)
 
 	var denoiser_hint := ""
 	for property: Dictionary in default_environment.get_property_list():
 		if property.get("name") == "pathtracing_denoiser":
 			denoiser_hint = property.get("hint_string", "")
 			break
-	if denoiser_hint != "None":
-		return _fail_c17("The Metal inspector denoiser hint was '%s', expected 'None'." % denoiser_hint)
+	var expected_hint := "None:0"
+	if metalfx_supported:
+		expected_hint += ",MetalFX Denoised Upscaling:2"
+	if denoiser_hint != expected_hint:
+		return _fail_c17("The Metal inspector denoiser hint was '%s', expected '%s'." % [denoiser_hint, expected_hint])
 
 	var windows_environment: Environment = load("res://fixtures/c17_windows_dlss_rr.tres")
 	if windows_environment == null:
@@ -128,9 +132,19 @@ func _build_c17_modes() -> void:
 		c17_modes.push_back({"name": "metalfx_spatial", "mode": Viewport.SCALING_3D_MODE_METALFX_SPATIAL, "scale": 0.67, "temporal": false})
 	if rendering_device != null and rendering_device.has_feature(RenderingDevice.SUPPORTS_METALFX_TEMPORAL):
 		c17_modes.push_back({"name": "metalfx_temporal", "mode": Viewport.SCALING_3D_MODE_METALFX_TEMPORAL, "scale": 0.67, "temporal": true})
+	if rendering_device != null and rendering_device.has_feature(RenderingDevice.SUPPORTS_METALFX_DENOISED):
+		c17_modes.push_back({
+			"name": "metalfx_denoised",
+			"mode": Viewport.SCALING_3D_MODE_BILINEAR,
+			"scale": 0.67,
+			"temporal": true,
+			"denoiser": RenderingServer.PT_DENOISER_METALFX,
+		})
 	c17_temporal_mode = c17_modes[2]
 	for mode: Dictionary in c17_modes:
 		if mode.name == "metalfx_temporal":
+			c17_temporal_mode = mode
+		if mode.name == "metalfx_denoised":
 			c17_temporal_mode = mode
 
 
@@ -196,6 +210,7 @@ func _process_c17() -> void:
 
 
 func _apply_c17_mode(mode: Dictionary, viewport: Viewport) -> void:
+	environment.pathtracing_denoiser = mode.get("denoiser", RenderingServer.PT_DENOISER_NONE)
 	viewport.scaling_3d_mode = mode.mode
 	viewport.scaling_3d_scale = mode.scale
 	_record_c17_event("presentation_%s" % mode.name)
@@ -250,8 +265,8 @@ func _finish_c17() -> void:
 		"renderer": "forward_plus",
 		"rendering_driver": "metal",
 		"resolution": [CAPTURE_SIZE.x, CAPTURE_SIZE.y],
-		"denoiser": "none",
-		"native_denoising": "unavailable",
+		"denoiser": "metalfx" if RenderingServer.is_pathtracing_denoiser_supported(RenderingServer.PT_DENOISER_METALFX) else "none",
+		"native_denoising": "metalfx" if RenderingServer.is_pathtracing_denoiser_supported(RenderingServer.PT_DENOISER_METALFX) else "unavailable",
 		"ser": "disabled",
 		"presentation_modes": mode_names,
 		"temporal_test_mode": c17_temporal_mode.name,

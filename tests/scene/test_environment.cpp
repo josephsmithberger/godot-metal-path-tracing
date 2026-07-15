@@ -43,7 +43,7 @@ TEST_FORCE_LINK(test_environment)
 
 namespace TestEnvironment {
 
-TEST_CASE("[MetalRT] C17 uses a capability-safe path-tracing denoiser default and hint") {
+TEST_CASE("[MetalRT] path-tracing denoisers use capability-safe values and hints") {
 	Ref<Environment> environment;
 	environment.instantiate();
 	CHECK(environment->get_pathtracing_denoiser() == RSE::PT_DENOISER_NONE);
@@ -53,18 +53,23 @@ TEST_CASE("[MetalRT] C17 uses a capability-safe path-tracing denoiser default an
 	CHECK(default_is_valid);
 	CHECK(int(default_value) == int(RSE::PT_DENOISER_NONE));
 
-	CHECK(Environment::get_pathtracing_denoiser_property_hint(false) == "None");
-	CHECK(Environment::get_pathtracing_denoiser_property_hint(true) == "None,DLSS Ray Reconstruction");
-	CHECK(Environment::sanitize_pathtracing_denoiser(RSE::PT_DENOISER_NONE, false) == RSE::PT_DENOISER_NONE);
-	CHECK(Environment::sanitize_pathtracing_denoiser(RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION, false) == RSE::PT_DENOISER_NONE);
-	CHECK(Environment::sanitize_pathtracing_denoiser(RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION, true) == RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION);
+	CHECK(Environment::get_pathtracing_denoiser_property_hint(false, false) == "None:0");
+	CHECK(Environment::get_pathtracing_denoiser_property_hint(true, false) == "None:0,DLSS Ray Reconstruction:1");
+	CHECK(Environment::get_pathtracing_denoiser_property_hint(false, true) == "None:0,MetalFX Denoised Upscaling:2");
+	CHECK(Environment::get_pathtracing_denoiser_property_hint(true, true) == "None:0,DLSS Ray Reconstruction:1,MetalFX Denoised Upscaling:2");
+	CHECK(Environment::sanitize_pathtracing_denoiser(RSE::PT_DENOISER_NONE, false, false) == RSE::PT_DENOISER_NONE);
+	CHECK(Environment::sanitize_pathtracing_denoiser(RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION, false, false) == RSE::PT_DENOISER_NONE);
+	CHECK(Environment::sanitize_pathtracing_denoiser(RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION, true, false) == RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION);
+	CHECK(Environment::sanitize_pathtracing_denoiser(RSE::PT_DENOISER_METALFX, false, false) == RSE::PT_DENOISER_NONE);
+	CHECK(Environment::sanitize_pathtracing_denoiser(RSE::PT_DENOISER_METALFX, false, true) == RSE::PT_DENOISER_METALFX);
 
 	List<PropertyInfo> property_list;
 	environment->get_property_list(&property_list);
 	for (const PropertyInfo &property : property_list) {
 		if (property.name == "pathtracing_denoiser") {
 			const bool dlss_rr_supported = RenderingServer::get_singleton()->is_pathtracing_denoiser_supported(RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION);
-			CHECK(property.hint_string == Environment::get_pathtracing_denoiser_property_hint(dlss_rr_supported));
+			const bool metalfx_supported = RenderingServer::get_singleton()->is_pathtracing_denoiser_supported(RSE::PT_DENOISER_METALFX);
+			CHECK(property.hint_string == Environment::get_pathtracing_denoiser_property_hint(dlss_rr_supported, metalfx_supported));
 			return;
 		}
 	}
@@ -84,7 +89,7 @@ TEST_CASE("[MetalRT] C17 serializes the deterministic None denoiser") {
 	CHECK(loaded->get_pathtracing_denoiser() == RSE::PT_DENOISER_NONE);
 }
 
-TEST_CASE("[MetalRT] C17 rejects DLSS Ray Reconstruction on Metal") {
+TEST_CASE("[MetalRT] Metal exposes only supported native path-tracing denoisers") {
 	RenderingServer *rendering_server = RenderingServer::get_singleton();
 	REQUIRE(rendering_server != nullptr);
 	CHECK(rendering_server->is_pathtracing_denoiser_supported(RSE::PT_DENOISER_NONE));
@@ -95,6 +100,10 @@ TEST_CASE("[MetalRT] C17 rejects DLSS Ray Reconstruction on Metal") {
 		environment.instantiate();
 		environment->set_pathtracing_denoiser(RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION);
 		CHECK(environment->get_pathtracing_denoiser() == RSE::PT_DENOISER_NONE);
+
+		const bool metalfx_supported = rendering_server->is_pathtracing_denoiser_supported(RSE::PT_DENOISER_METALFX);
+		environment->set_pathtracing_denoiser(RSE::PT_DENOISER_METALFX);
+		CHECK(environment->get_pathtracing_denoiser() == (metalfx_supported ? RSE::PT_DENOISER_METALFX : RSE::PT_DENOISER_NONE));
 	}
 }
 

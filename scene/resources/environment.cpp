@@ -643,7 +643,8 @@ int Environment::get_pathtracing_max_bounces() const {
 
 void Environment::set_pathtracing_denoiser(RSE::PathtracingDenoiser p_denoiser) {
 	const bool dlss_rr_supported = RS::get_singleton()->is_pathtracing_denoiser_supported(RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION);
-	pathtracing_denoiser = sanitize_pathtracing_denoiser(p_denoiser, dlss_rr_supported);
+	const bool metalfx_supported = RS::get_singleton()->is_pathtracing_denoiser_supported(RSE::PT_DENOISER_METALFX);
+	pathtracing_denoiser = sanitize_pathtracing_denoiser(p_denoiser, dlss_rr_supported, metalfx_supported);
 	if (pathtracing_denoiser != p_denoiser) {
 		WARN_PRINT_ONCE("The saved path-tracing denoiser is unavailable with the current rendering driver, device, or runtime libraries. Falling back to None. Choose a supported denoiser before saving this Environment on this device.");
 	}
@@ -654,15 +655,25 @@ RSE::PathtracingDenoiser Environment::get_pathtracing_denoiser() const {
 	return pathtracing_denoiser;
 }
 
-RSE::PathtracingDenoiser Environment::sanitize_pathtracing_denoiser(RSE::PathtracingDenoiser p_denoiser, bool p_dlss_rr_supported) {
+RSE::PathtracingDenoiser Environment::sanitize_pathtracing_denoiser(RSE::PathtracingDenoiser p_denoiser, bool p_dlss_rr_supported, bool p_metalfx_supported) {
 	if (p_denoiser == RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION && p_dlss_rr_supported) {
+		return p_denoiser;
+	}
+	if (p_denoiser == RSE::PT_DENOISER_METALFX && p_metalfx_supported) {
 		return p_denoiser;
 	}
 	return RSE::PT_DENOISER_NONE;
 }
 
-String Environment::get_pathtracing_denoiser_property_hint(bool p_dlss_rr_supported) {
-	return p_dlss_rr_supported ? "None,DLSS Ray Reconstruction" : "None";
+String Environment::get_pathtracing_denoiser_property_hint(bool p_dlss_rr_supported, bool p_metalfx_supported) {
+	String hint = "None:0";
+	if (p_dlss_rr_supported) {
+		hint += ",DLSS Ray Reconstruction:1";
+	}
+	if (p_metalfx_supported) {
+		hint += ",MetalFX Denoised Upscaling:2";
+	}
+	return hint;
 }
 
 void Environment::_update_pathtracing() {
@@ -1181,7 +1192,8 @@ void Environment::_update_adjustment() {
 void Environment::_validate_property(PropertyInfo &p_property) const {
 	if (p_property.name == "pathtracing_denoiser") {
 		const bool dlss_rr_supported = RS::get_singleton()->is_pathtracing_denoiser_supported(RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION);
-		p_property.hint_string = get_pathtracing_denoiser_property_hint(dlss_rr_supported);
+		const bool metalfx_supported = RS::get_singleton()->is_pathtracing_denoiser_supported(RSE::PT_DENOISER_METALFX);
+		p_property.hint_string = get_pathtracing_denoiser_property_hint(dlss_rr_supported, metalfx_supported);
 		return;
 	}
 	if (!Engine::get_singleton()->is_editor_hint()) {
@@ -1527,7 +1539,7 @@ void Environment::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_debug_mode", PROPERTY_HINT_ENUM, "Disabled,Mirror Reflection,Geometry Normals,Final Normals,Normal Map,Tangent,Bitangent,UV,Albedo,ORM,Diffuse Albedo,Specular Albedo,Normal+Roughness,Specular Hit Dist,Metalness,Roughness,View Normals,Diffuse+Specular,Fresnel F0,Front/Back Face,Depth,Emissive,BRDF Rejection,Instance ID,Primitive ID,Material ID,Hit Kind"), "set_pathtracing_debug_mode", "get_pathtracing_debug_mode");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_samples_per_pixel", PROPERTY_HINT_RANGE, "1,16,1"), "set_pathtracing_samples_per_pixel", "get_pathtracing_samples_per_pixel");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_max_bounces", PROPERTY_HINT_RANGE, "1,8,1"), "set_pathtracing_max_bounces", "get_pathtracing_max_bounces");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_denoiser", PROPERTY_HINT_ENUM, "None,DLSS Ray Reconstruction"), "set_pathtracing_denoiser", "get_pathtracing_denoiser");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_denoiser", PROPERTY_HINT_ENUM, "None:0,DLSS Ray Reconstruction:1,MetalFX Denoised Upscaling:2"), "set_pathtracing_denoiser", "get_pathtracing_denoiser");
 
 	// Glow
 

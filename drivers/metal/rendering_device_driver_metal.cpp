@@ -3057,6 +3057,8 @@ bool RenderingDeviceDriverMetal::has_feature(Features p_feature) {
 			return device_properties->features.metal_fx_spatial;
 		case SUPPORTS_METALFX_TEMPORAL:
 			return device_properties->features.metal_fx_temporal;
+		case SUPPORTS_METALFX_DENOISED:
+			return device_properties->features.metal_fx_denoised;
 		case SUPPORTS_HDR_OUTPUT:
 			return true;
 		case SUPPORTS_IMAGE_ATOMIC_32_BIT:

@@ -146,10 +146,10 @@ manifest, visual diff, numeric metrics, and self-hosted CI lane. See
 C13 supplies the compute re-expression for opaque, static HG0
 `StandardMaterial3D` scenes. C14-C16 add scene geometry, material dispatch,
 alpha testing, and procedural intersections. C17 makes denoiser selection
-capability-aware and validates native/upscaled presentation while retaining
-`None` as the documented Mac denoising strategy; see
-[`mac_ux_presentation.md`](mac_ux_presentation.md). Export coverage remains a
-separate follow-up.
+capability-aware and validates native/upscaled presentation. Compatible Apple
+GPU and OS combinations can now select MetalFX temporal denoised upscaling;
+see [`metalfx_denoised_upscaling.md`](metalfx_denoised_upscaling.md). Export
+coverage remains a separate follow-up.
 
 The C11 runtime gate and fallback are complete; see
 [`runtime_gating.md`](runtime_gating.md).

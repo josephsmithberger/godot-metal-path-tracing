@@ -49,6 +49,7 @@
 #define RB_TEX_DLSS_RR_DIFFUSE_ALBEDO SNAME("diffuse_albedo")
 #define RB_TEX_DLSS_RR_SPECULAR_ALBEDO SNAME("specular_albedo")
 #define RB_TEX_DLSS_RR_NORMAL_ROUGHNESS SNAME("normal_roughness")
+#define RB_TEX_DLSS_RR_ROUGHNESS SNAME("roughness")
 #define RB_TEX_DLSS_RR_SPECULAR_HIT_DIST SNAME("specular_hit_dist")
 
 class RenderDataRD;
