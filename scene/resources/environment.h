@@ -400,8 +400,8 @@ public:
 	int get_pathtracing_max_bounces() const;
 	void set_pathtracing_denoiser(RSE::PathtracingDenoiser p_denoiser);
 	RSE::PathtracingDenoiser get_pathtracing_denoiser() const;
-	static RSE::PathtracingDenoiser sanitize_pathtracing_denoiser(RSE::PathtracingDenoiser p_denoiser, bool p_dlss_rr_supported);
-	static String get_pathtracing_denoiser_property_hint(bool p_dlss_rr_supported);
+	static RSE::PathtracingDenoiser sanitize_pathtracing_denoiser(RSE::PathtracingDenoiser p_denoiser, bool p_dlss_rr_supported, bool p_metalfx_supported);
+	static String get_pathtracing_denoiser_property_hint(bool p_dlss_rr_supported, bool p_metalfx_supported);
 
 	// Glow
 	void set_glow_enabled(bool p_enabled);

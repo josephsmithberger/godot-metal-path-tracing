@@ -193,15 +193,16 @@ void main() {
 		sky_color = mix(sky_color, fog_color, scene_data_block.data.fog_sky_affect);
 	}
 
-#ifdef DLSS_RR_ENABLED
+#ifdef DENOISER_GUIDES_ENABLED
 	{
 		uint total_bounces = get_total_bounces(ps.packed_bounces_flags);
 		if (total_bounces == 0u && is_sample_zero(ps.packed_bounces_flags)) {
 			ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
-			imageStore(dlss_rr_diffuse_albedo, pixel, vec4(sky_color, 1.0));
-			imageStore(dlss_rr_specular_albedo, pixel, vec4(0.0));
-			imageStore(dlss_rr_normal_roughness, pixel, vec4(-gl_WorldRayDirectionEXT, 0.0));
-			imageStore(dlss_rr_specular_hit_dist, pixel, vec4(-1.0));
+			imageStore(denoiser_diffuse_albedo, pixel, vec4(sky_color, 1.0));
+			imageStore(denoiser_specular_albedo, pixel, vec4(0.0));
+			imageStore(denoiser_normal_roughness, pixel, vec4(-gl_WorldRayDirectionEXT, 0.0));
+			imageStore(denoiser_roughness, pixel, vec4(0.0));
+			imageStore(denoiser_specular_hit_dist, pixel, vec4(-1.0));
 		}
 	}
 #endif

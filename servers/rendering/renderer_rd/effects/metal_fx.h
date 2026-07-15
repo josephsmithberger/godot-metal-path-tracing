@@ -32,6 +32,7 @@
 
 #if defined(METAL_ENABLED) && !defined(VISIONOS_ENABLED)
 #define METAL_MFXTEMPORAL_ENABLED
+#define METAL_MFXDENOISED_ENABLED
 #endif
 
 #ifdef METAL_ENABLED
@@ -44,6 +45,7 @@
 namespace MTLFX {
 class SpatialScalerBase;
 class TemporalScalerBase;
+class TemporalDenoisedScalerBase;
 } //namespace MTLFX
 
 namespace RendererRD {
@@ -169,6 +171,119 @@ public:
 	};
 
 	void process(MFXTemporalContext *p_ctx, Params p_params);
+};
+
+#endif
+
+#ifdef METAL_MFXDENOISED_ENABLED
+
+struct MFXDenoisedContext {
+	MTLFX::TemporalDenoisedScalerBase *scaler = nullptr;
+	MFXDenoisedContext() = default;
+	~MFXDenoisedContext();
+};
+
+class MFXDenoisedEffect {
+	struct CallbackArgs {
+		MFXDenoisedEffect *owner = nullptr;
+		MTLFX::TemporalDenoisedScalerBase *scaler = nullptr;
+		RDD::TextureID src;
+		RDD::TextureID depth;
+		RDD::TextureID motion;
+		RDD::TextureID exposure;
+		RDD::TextureID diffuse_albedo;
+		RDD::TextureID specular_albedo;
+		RDD::TextureID normal;
+		RDD::TextureID roughness;
+		RDD::TextureID specular_hit_distance;
+		RDD::TextureID dst;
+		Vector2 jitter_offset;
+		Projection camera_projection;
+		Transform3D camera_transform;
+		bool reset = false;
+
+		CallbackArgs(
+				MFXDenoisedEffect *p_owner,
+				MTLFX::TemporalDenoisedScalerBase *p_scaler,
+				RDD::TextureID p_src,
+				RDD::TextureID p_depth,
+				RDD::TextureID p_motion,
+				RDD::TextureID p_exposure,
+				RDD::TextureID p_diffuse_albedo,
+				RDD::TextureID p_specular_albedo,
+				RDD::TextureID p_normal,
+				RDD::TextureID p_roughness,
+				RDD::TextureID p_specular_hit_distance,
+				RDD::TextureID p_dst,
+				Vector2 p_jitter_offset,
+				Projection p_camera_projection,
+				Transform3D p_camera_transform,
+				bool p_reset) :
+				owner(p_owner),
+				scaler(p_scaler),
+				src(p_src),
+				depth(p_depth),
+				motion(p_motion),
+				exposure(p_exposure),
+				diffuse_albedo(p_diffuse_albedo),
+				specular_albedo(p_specular_albedo),
+				normal(p_normal),
+				roughness(p_roughness),
+				specular_hit_distance(p_specular_hit_distance),
+				dst(p_dst),
+				jitter_offset(p_jitter_offset),
+				camera_projection(p_camera_projection),
+				camera_transform(p_camera_transform),
+				reset(p_reset) {}
+
+		static void free(CallbackArgs **p_args) {
+			(*p_args)->owner->args_allocator.free(*p_args);
+			*p_args = nullptr;
+		}
+	};
+
+	PagedAllocator<CallbackArgs, true, 16> args_allocator;
+
+	static void callback(RDD *p_driver, RDD::CommandBufferID p_command_buffer, CallbackArgs *p_userdata);
+
+public:
+	struct CreateParams {
+		Vector2i input_size;
+		Vector2i output_size;
+		RDD::DataFormat input_format;
+		RDD::DataFormat depth_format;
+		RDD::DataFormat motion_format;
+		RDD::DataFormat diffuse_albedo_format;
+		RDD::DataFormat specular_albedo_format;
+		RDD::DataFormat normal_format;
+		RDD::DataFormat roughness_format;
+		RDD::DataFormat specular_hit_distance_format;
+		RDD::DataFormat output_format;
+		Vector2 motion_vector_scale;
+	};
+
+	struct Params {
+		RID src;
+		RID depth;
+		RID motion;
+		RID exposure;
+		RID diffuse_albedo;
+		RID specular_albedo;
+		RID normal;
+		RID roughness;
+		RID specular_hit_distance;
+		RID dst;
+		Vector2 jitter_offset;
+		Projection camera_projection;
+		Transform3D camera_transform;
+		bool reset = false;
+	};
+
+	MFXDenoisedContext *create_context(CreateParams p_params) const;
+	void process(MFXDenoisedContext *p_ctx, Params p_params);
+
+	MFXDenoisedEffect();
+	~MFXDenoisedEffect();
 };
 
 #endif

@@ -88,8 +88,6 @@ def verify(artifact_dir: Path) -> int:
         "renderer": "forward_plus",
         "rendering_driver": "metal",
         "resolution": [64, 64],
-        "denoiser": "none",
-        "native_denoising": "unavailable",
         "ser": "disabled",
     }
     mismatches = [
@@ -103,8 +101,23 @@ def verify(artifact_dir: Path) -> int:
     modes = manifest.get("presentation_modes")
     if not isinstance(modes, list) or not {"native", "fsr1", "fsr2"}.issubset(modes):
         raise VerificationError(f"presentation matrix is incomplete: {modes!r}")
+
+    denoiser = manifest.get("denoiser")
+    native_denoising = manifest.get("native_denoising")
+    if denoiser == "metalfx":
+        if native_denoising != "metalfx" or "metalfx_denoised" not in modes:
+            raise VerificationError(
+                "MetalFX denoising was advertised without its presentation capture: "
+                f"native_denoising={native_denoising!r}, modes={modes!r}"
+            )
+    elif denoiser == "none":
+        if native_denoising != "unavailable":
+            raise VerificationError(f"unexpected native denoising state: {native_denoising!r}")
+    else:
+        raise VerificationError(f"invalid denoiser contract: {denoiser!r}")
+
     temporal_mode = manifest.get("temporal_test_mode")
-    if temporal_mode not in {"fsr2", "metalfx_temporal"}:
+    if temporal_mode not in {"fsr2", "metalfx_temporal", "metalfx_denoised"}:
         raise VerificationError(f"invalid temporal test mode: {temporal_mode!r}")
 
     expected_events = {

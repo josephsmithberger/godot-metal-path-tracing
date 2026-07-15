@@ -474,9 +474,10 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
 	bool can_use_storage = _render_buffers_can_be_storage();
 
 	RSE::ViewportScaling3DMode scale_mode = rb->get_scaling_3d_mode();
-	bool use_upscaled_texture = rb->has_upscaled_texture() && (scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR2 || scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL || scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_DLSS);
+	bool temporal_upscaler_active = rb->get_temporal_upscaler_override() || scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR2 || scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL || scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_DLSS;
+	bool use_upscaled_texture = rb->has_upscaled_texture() && temporal_upscaler_active;
 	SpatialUpscaler *spatial_upscaler = nullptr;
-	if (can_use_effects) {
+	if (can_use_effects && !rb->get_temporal_upscaler_override()) {
 		if (scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR) {
 			spatial_upscaler = fsr;
 		} else if (scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_SPATIAL) {
@@ -487,7 +488,6 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
 	}
 
 	// SMAA causes issues when enabled with temporal upscalers.
-	bool temporal_upscaler_active = scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_DLSS || scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR2 || scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL;
 	bool use_fxaa = rb->get_screen_space_aa() == RSE::VIEWPORT_SCREEN_SPACE_AA_FXAA;
 	bool use_smaa = smaa && rb->get_screen_space_aa() == RSE::VIEWPORT_SCREEN_SPACE_AA_SMAA && !temporal_upscaler_active;
 	// If doing bilinear or nearest scaling + FXAA / SMAA, the framebuffer must be scaled in a framebuffer copy after AA is applied.

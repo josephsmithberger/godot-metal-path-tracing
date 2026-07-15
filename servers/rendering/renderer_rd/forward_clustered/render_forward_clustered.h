@@ -112,6 +112,10 @@ public:
 		RendererRD::MFXTemporalContext *mfx_temporal_context = nullptr;
 		PathtracingPresentationHistory mfx_presentation_history;
 #endif
+#ifdef METAL_MFXDENOISED_ENABLED
+		RendererRD::MFXDenoisedContext *mfx_denoised_context = nullptr;
+		PathtracingPresentationHistory mfx_denoised_presentation_history;
+#endif
 
 	public:
 		ClusterBuilderRD *cluster_builder = nullptr;
@@ -165,6 +169,10 @@ public:
 		bool ensure_mfx_temporal(RendererRD::MFXTemporalEffect *p_effect);
 		RendererRD::MFXTemporalContext *get_mfx_temporal_context() const { return mfx_temporal_context; }
 #endif
+#ifdef METAL_MFXDENOISED_ENABLED
+		bool ensure_mfx_denoised(RendererRD::MFXDenoisedEffect *p_effect);
+		RendererRD::MFXDenoisedContext *get_mfx_denoised_context() const { return mfx_denoised_context; }
+#endif
 
 		// Raytracing support
 		void rt_ensure_textures();
@@ -180,7 +188,13 @@ public:
 		RID dlss_rr_get_diffuse_albedo() const { return render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_DIFFUSE_ALBEDO); }
 		RID dlss_rr_get_specular_albedo() const { return render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_SPECULAR_ALBEDO); }
 		RID dlss_rr_get_normal_roughness() const { return render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_NORMAL_ROUGHNESS); }
+		RID dlss_rr_get_roughness() const { return render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_ROUGHNESS); }
 		RID dlss_rr_get_specular_hit_dist() const { return render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_SPECULAR_HIT_DIST); }
+		RID dlss_rr_get_diffuse_albedo(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_DIFFUSE_ALBEDO, p_layer, 0); }
+		RID dlss_rr_get_specular_albedo(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_SPECULAR_ALBEDO, p_layer, 0); }
+		RID dlss_rr_get_normal_roughness(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_NORMAL_ROUGHNESS, p_layer, 0); }
+		RID dlss_rr_get_roughness(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_ROUGHNESS, p_layer, 0); }
+		RID dlss_rr_get_specular_hit_dist(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_SPECULAR_HIT_DIST, p_layer, 0); }
 
 		RID get_color_only_fb();
 		RID get_color_pass_fb(uint32_t p_color_pass_flags);
@@ -826,6 +840,9 @@ private:
 
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	RendererRD::MFXTemporalEffect *mfx_temporal_effect = nullptr;
+#endif
+#ifdef METAL_MFXDENOISED_ENABLED
+	RendererRD::MFXDenoisedEffect *mfx_denoised_effect = nullptr;
 #endif
 	RendererRD::MotionVectorsStore *motion_vectors_store = nullptr;
 

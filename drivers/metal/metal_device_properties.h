@@ -115,6 +115,7 @@ struct API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0)) MetalFeatures {
 	bool use_argument_buffers = true; /**< If true, argument buffers are can be used instead of slot binding, if available. */
 	bool metal_fx_spatial = false; /**< If true, Metal FX spatial functions are supported. */
 	bool metal_fx_temporal = false; /**< If true, Metal FX temporal functions are supported. */
+	bool metal_fx_denoised = false; /**< If true, MetalFX temporal denoised scaling is supported. */
 	bool supports_gpu_address = false; /**< If true, referencing a GPU address in a shader is supported. */
 	bool supports_image_atomic_32_bit = false; /**< If true, 32-bit atomic operations on images are supported by the GPU. */
 	bool supports_image_atomic_64_bit = false; /**< If true, 64-bit atomic operations on images are supported by the GPU. */

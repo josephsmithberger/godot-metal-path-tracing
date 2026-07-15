@@ -6,7 +6,13 @@ This document aims to describe the Metal rendering device implementation in Godo
 
 * Use placement heaps
 * Explicit hazard tracking
-* [MetalFX] upscaling support?
+
+## MetalFX
+
+The Metal rendering device supports spatial and temporal upscaling. On devices
+that report [MetalFX] temporal denoised-scaler support, the path tracer can also
+combine denoising and upscaling with signed world-space normal, roughness,
+albedo, motion, depth, and specular hit-distance guides.
 
 ## Acknowledgments
 

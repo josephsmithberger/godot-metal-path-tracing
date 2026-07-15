@@ -2101,6 +2101,10 @@ bool RenderingServer::is_pathtracing_denoiser_supported(RSE::PathtracingDenoiser
 			Streamline *streamline = Streamline::get_singleton();
 			return streamline && streamline->get_capability(STREAMLINE_CAPABILITY_DLSS_RR);
 		}
+		case RSE::PT_DENOISER_METALFX: {
+			RenderingDevice *rendering_device = RenderingDevice::get_singleton();
+			return rendering_device && rendering_device->has_feature(RenderingDevice::SUPPORTS_METALFX_DENOISED);
+		}
 	}
 	return false;
 }
@@ -3201,6 +3205,7 @@ void RenderingServer::_bind_methods() {
 
 	BIND_ENUM_CONSTANT(RSE::PT_DENOISER_NONE);
 	BIND_ENUM_CONSTANT(RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION);
+	BIND_ENUM_CONSTANT(RSE::PT_DENOISER_METALFX);
 
 	BIND_ENUM_CONSTANT(RSE::SUB_SURFACE_SCATTERING_QUALITY_DISABLED);
 	BIND_ENUM_CONSTANT(RSE::SUB_SURFACE_SCATTERING_QUALITY_LOW);

@@ -60,7 +60,7 @@ public:
 		return SceneRoute::UNAVAILABLE;
 	}
 	static uint32_t sanitize_compute_rt_flags(uint32_t p_rt_flags) {
-		return p_rt_flags & ~(RT_FLAG_DEBUG_VIS_ENABLED | RT_FLAG_DLSS_RR_ENABLED | RT_FLAG_SER_ENABLED | RT_FLAG_FOG_ENABLED);
+		return p_rt_flags & ~(RT_FLAG_DEBUG_VIS_ENABLED | RT_FLAG_SER_ENABLED | RT_FLAG_FOG_ENABLED);
 	}
 	struct ComputeMaterialVariantKey {
 		uint32_t rt_flags = 0;
@@ -106,7 +106,7 @@ public:
 	enum RaytracingFlags {
 		RT_FLAG_NONE = 0,
 		RT_FLAG_DEBUG_VIS_ENABLED = (1 << 0),
-		RT_FLAG_DLSS_RR_ENABLED = (1 << 1),
+		RT_FLAG_DENOISER_GUIDES_ENABLED = (1 << 1),
 		RT_FLAG_FOG_ENABLED = (1 << 2),
 		RT_FLAG_SER_ENABLED = (1 << 3),
 	};
@@ -494,8 +494,8 @@ private:
 	void _bundle_resize_for_slots(PipelineBundle &r_bundle);
 	bool _build_initial_bundle(uint32_t p_rt_flags, PipelineBundle &r_bundle);
 	bool _build_compute_bundle(uint32_t p_rt_flags, PipelineBundle &r_bundle);
-	RID _compile_compute_material_variant(const LocalVector<uint8_t> &p_active_slots, String &r_error);
-	String _build_compute_material_source(const LocalVector<uint8_t> &p_active_slots);
+	RID _compile_compute_material_variant(const LocalVector<uint8_t> &p_active_slots, uint32_t p_rt_flags, String &r_error);
+	String _build_compute_material_source(const LocalVector<uint8_t> &p_active_slots, uint32_t p_rt_flags);
 	String _build_compute_material_function(uint32_t p_slot_index, const CustomShaderEntry &p_entry) const;
 	String _build_compute_procedural_function(uint32_t p_slot_index, const CustomShaderEntry &p_entry) const;
 	static void _replace_identifier(String &r_source, const String &p_identifier, const String &p_replacement);

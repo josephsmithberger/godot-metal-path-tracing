@@ -25,4 +25,6 @@ window/stretch/mode="canvas_items"
 [rendering]
 
 renderer/rendering_method.mobile="forward_plus"
+scaling_3d/mode=4
+scaling_3d/mode.macos=4
 pathtracer/use_shader_execution_reordering=false

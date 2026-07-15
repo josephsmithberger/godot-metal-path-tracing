@@ -61,7 +61,7 @@ struct RaygenShaderOption {
 // Variant index is a uint32 bitmask: bit i selects RAYGEN_SHADER_OPTIONS[i].
 // Add entries here to grow the raygen permutation set (2^N variants).
 static constexpr RaygenShaderOption RAYGEN_SHADER_OPTIONS[] = {
-	{ SceneShaderRaytracing::RT_FLAG_DLSS_RR_ENABLED, "#define DLSS_RR_ENABLED\n" },
+	{ SceneShaderRaytracing::RT_FLAG_DENOISER_GUIDES_ENABLED, "#define DENOISER_GUIDES_ENABLED\n" },
 	{ SceneShaderRaytracing::RT_FLAG_SER_ENABLED, "#define USE_SER\n" },
 };
 
@@ -681,8 +681,8 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(const float *p_env_params, bool
 		}
 		sample_count = MAX(1u, (uint32_t)p_env_params[RT_PARAM_SAMPLE_COUNT]);
 		max_bounces = MAX(1u, MIN(8u, (uint32_t)p_env_params[RT_PARAM_MAX_BOUNCES]));
-		if ((uint32_t)p_env_params[RT_PARAM_DENOISER] == RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION) {
-			flags |= RT_FLAG_DLSS_RR_ENABLED;
+		if ((uint32_t)p_env_params[RT_PARAM_DENOISER] != RSE::PT_DENOISER_NONE) {
+			flags |= RT_FLAG_DENOISER_GUIDES_ENABLED;
 		}
 	}
 
@@ -847,7 +847,8 @@ const SceneShaderRaytracing::PipelineBundle &SceneShaderRaytracing::ensure_pipel
 	if (compute_scene_lane) {
 		ERR_FAIL_COND_V(!compute_shader_version.is_valid(), EMPTY_BUNDLE);
 		PipelineBundle &bundle = pipeline_bundles[p_rt_flags];
-		bundle.base_shader = compute_shader.version_get_shader(compute_shader_version, 0);
+		const int compute_variant = (p_rt_flags & RT_FLAG_DENOISER_GUIDES_ENABLED) != 0 ? 1 : 0;
+		bundle.base_shader = compute_shader.version_get_shader(compute_shader_version, compute_variant);
 		if (!bundle.base_shader.is_valid() || !_build_compute_bundle(p_rt_flags, bundle)) {
 			return EMPTY_BUNDLE;
 		}
@@ -1091,8 +1092,9 @@ String SceneShaderRaytracing::_build_compute_procedural_function(uint32_t p_slot
 	return source;
 }
 
-String SceneShaderRaytracing::_build_compute_material_source(const LocalVector<uint8_t> &p_active_slots) {
-	Vector<String> sources = compute_shader.version_build_variant_stage_sources(compute_shader_version, 0);
+String SceneShaderRaytracing::_build_compute_material_source(const LocalVector<uint8_t> &p_active_slots, uint32_t p_rt_flags) {
+	const int compute_variant = (p_rt_flags & RT_FLAG_DENOISER_GUIDES_ENABLED) != 0 ? 1 : 0;
+	Vector<String> sources = compute_shader.version_build_variant_stage_sources(compute_shader_version, compute_variant);
 	if (sources.size() <= RD::SHADER_STAGE_COMPUTE || sources[RD::SHADER_STAGE_COMPUTE].is_empty()) {
 		return String();
 	}
@@ -1132,8 +1134,8 @@ String SceneShaderRaytracing::_build_compute_material_source(const LocalVector<u
 	return source;
 }
 
-RID SceneShaderRaytracing::_compile_compute_material_variant(const LocalVector<uint8_t> &p_active_slots, String &r_error) {
-	String source = _build_compute_material_source(p_active_slots);
+RID SceneShaderRaytracing::_compile_compute_material_variant(const LocalVector<uint8_t> &p_active_slots, uint32_t p_rt_flags, String &r_error) {
+	String source = _build_compute_material_source(p_active_slots, p_rt_flags);
 	if (source.is_empty()) {
 		r_error = "custom shader uses unsupported stage-global helpers or the compute template is unavailable";
 		return RID();
@@ -1187,7 +1189,7 @@ bool SceneShaderRaytracing::_build_compute_bundle(uint32_t p_rt_flags, PipelineB
 		trial_slots[i] = 1;
 		String compile_error;
 		compute_variant_compile_count++;
-		RID trial_shader = _compile_compute_material_variant(trial_slots, compile_error);
+		RID trial_shader = _compile_compute_material_variant(trial_slots, p_rt_flags, compile_error);
 		if (!trial_shader.is_valid()) {
 			compute_variant_failure_count++;
 			staged_states[i] = HGState::Failed;
@@ -1907,6 +1909,7 @@ void SceneShaderRaytracing::init(const String p_defines) {
 	if (compute_scene_lane) {
 		Vector<String> compute_modes;
 		compute_modes.push_back("\n");
+		compute_modes.push_back("\n#define DENOISER_GUIDES_ENABLED\n");
 		compute_shader.initialize(compute_modes, p_defines);
 	} else {
 		// Raygen: one mode per bitmask of RAYGEN_SHADER_OPTIONS.

@@ -196,6 +196,12 @@ void MetalDeviceProperties::init_features(MTL::Device *p_device) {
 		features.metal_fx_temporal = false;
 #endif
 	}
+
+#ifdef METAL_MFXDENOISED_ENABLED
+	if (__builtin_available(macOS 26.0, iOS 18.0, *)) {
+		features.metal_fx_denoised = MTLFX::TemporalDenoisedScalerDescriptor::supportsDevice(p_device);
+	}
+#endif
 }
 
 void MetalDeviceProperties::init_limits(MTL::Device *p_device) {

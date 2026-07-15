@@ -175,6 +175,14 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::dlss_rr_ensure_bu
 			usage_bits,
 			RD::TEXTURE_SAMPLES_1);
 
+	// Roughness: MetalFX consumes roughness separately from the signed world-space normal texture.
+	render_buffers->create_texture(
+			RB_SCOPE_DLSS_RR,
+			RB_TEX_DLSS_RR_ROUGHNESS,
+			RD::DATA_FORMAT_R16_SFLOAT,
+			usage_bits,
+			RD::TEXTURE_SAMPLES_1);
+
 	// Specular Hit Distance: Single channel distance (R16F is sufficient)
 	render_buffers->create_texture(
 			RB_SCOPE_DLSS_RR,
@@ -220,6 +228,30 @@ bool RenderForwardClustered::RenderBufferDataForwardClustered::ensure_mfx_tempor
 }
 #endif
 
+#ifdef METAL_MFXDENOISED_ENABLED
+bool RenderForwardClustered::RenderBufferDataForwardClustered::ensure_mfx_denoised(RendererRD::MFXDenoisedEffect *p_effect) {
+	if (mfx_denoised_context) {
+		return true;
+	}
+
+	RendererRD::MFXDenoisedEffect::CreateParams params;
+	params.input_size = render_buffers->get_internal_size();
+	params.output_size = render_buffers->get_target_size();
+	params.input_format = render_buffers->get_base_data_format();
+	params.depth_format = render_buffers->get_depth_format(false, false, render_buffers->get_can_be_storage());
+	params.motion_format = render_buffers->get_velocity_format();
+	params.diffuse_albedo_format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
+	params.specular_albedo_format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
+	params.normal_format = RD::DATA_FORMAT_R8G8B8A8_SNORM;
+	params.roughness_format = RD::DATA_FORMAT_R16_SFLOAT;
+	params.specular_hit_distance_format = RD::DATA_FORMAT_R16_SFLOAT;
+	params.output_format = render_buffers->get_base_data_format();
+	params.motion_vector_scale = render_buffers->get_internal_size();
+	mfx_denoised_context = p_effect->create_context(params);
+	return mfx_denoised_context != nullptr;
+}
+#endif
+
 void RenderForwardClustered::RenderBufferDataForwardClustered::free_data() {
 	// JIC, should already have been cleared
 	if (render_buffers) {
@@ -253,6 +285,13 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::free_data() {
 	}
 #endif
 
+#ifdef METAL_MFXDENOISED_ENABLED
+	if (mfx_denoised_context) {
+		memdelete(mfx_denoised_context);
+		mfx_denoised_context = nullptr;
+	}
+#endif
+
 	if (dlss_context) {
 		memdelete(dlss_context);
 		dlss_context = nullptr;
@@ -266,6 +305,9 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::free_data() {
 	dlss_presentation_history = {};
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	mfx_presentation_history = {};
+#endif
+#ifdef METAL_MFXDENOISED_ENABLED
+	mfx_denoised_presentation_history = {};
 #endif
 }
 
@@ -1995,6 +2037,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		SCALE_NONE,
 		SCALE_FSR2,
 		SCALE_MFX,
+		SCALE_MFX_DENOISED,
 		SCALE_DLSS,
 	} scale_type = SCALE_NONE;
 
@@ -2015,6 +2058,19 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		default:
 			break;
 	}
+
+	rb->set_temporal_upscaler_override(false);
+	rb->set_upscaler_ready(false);
+#ifdef METAL_MFXDENOISED_ENABLED
+	if (scene_features.rt && p_render_data->environment.is_valid() && RD::get_singleton()->has_feature(RD::SUPPORTS_METALFX_DENOISED)) {
+		const float *environment_params = RendererEnvironmentStorage::get_singleton()->environment_get_pathtracing_params_ptr(p_render_data->environment);
+		if (environment_params && (uint32_t)environment_params[RSE::PT_PARAM_DENOISER] == RSE::PT_DENOISER_METALFX) {
+			scale_type = SCALE_MFX_DENOISED;
+			using_taa = false;
+			rb->set_temporal_upscaler_override(true);
+		}
+	}
+#endif
 
 	bool using_upscaling = scale_type != SCALE_NONE;
 
@@ -2195,8 +2251,8 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		rt_flags = SceneShaderRaytracing::compute_rt_flags(env_params, fog_enabled);
 		rt_flags = raytracing->get_shader()->sanitize_rt_flags(rt_flags);
 
-		const bool dlss_rr_enabled = (rt_flags & SceneShaderRaytracing::RT_FLAG_DLSS_RR_ENABLED) != 0;
-		if (dlss_rr_enabled) {
+		const bool denoiser_guides_enabled = (rt_flags & SceneShaderRaytracing::RT_FLAG_DENOISER_GUIDES_ENABLED) != 0;
+		if (denoiser_guides_enabled) {
 			rb_data->dlss_rr_ensure_buffers();
 			scene_features.set(SCENE_FEATURE_DEPTH_RECONSTRUCT);
 		} else if (rb_data->dlss_rr_has_buffers()) {
@@ -2607,13 +2663,13 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			static bool c13_markers_printed = false;
 			if (!c13_markers_printed) {
 				print_line("METAL_RT_EDITOR_ROUTE=compute_ray_query");
-				print_line("METAL_RT_DENOISER=none");
+				print_line(vformat("METAL_RT_DENOISER=%s", scale_type == SCALE_MFX_DENOISED ? "metalfx" : "none"));
 				print_line("METAL_RT_C13_EDITOR_HG0=passed");
 				print_line("METAL_RT_C15_MATERIAL_DISPATCH=passed");
 				print_line("METAL_RT_ALPHA_TEST=passed");
 				c13_markers_printed = true;
 			}
-			WARN_PRINT_ONCE("Metal path tracing C16 supports triangle and procedural AABB geometry with opaque, alpha-scissored, double-sided, textured, and generated/inlined custom material/intersection bodies. Transparent blending, stage-global custom helpers, native denoising, and SER remain disabled.");
+			WARN_PRINT_ONCE("Metal path tracing supports triangle and procedural AABB geometry with opaque, alpha-scissored, double-sided, textured, and generated/inlined custom material/intersection bodies. Transparent blending, stage-global custom helpers, and SER remain disabled.");
 		}
 
 		RD::get_singleton()->draw_command_end_label();
@@ -2970,6 +3026,57 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				rb->set_upscaler_ready(dlss_effect->is_ready(rb_data->get_dlss_context()));
 				dlss_effect->upscale(params);
 			}
+		} else if (scale_type == SCALE_MFX_DENOISED) {
+#ifdef METAL_MFXDENOISED_ENABLED
+			if (!rb_data->dlss_rr_has_buffers() || !rb_data->ensure_mfx_denoised(mfx_denoised_effect)) {
+				ERR_PRINT_ONCE("MetalFX denoised upscaling could not create a compatible context. Presenting this frame without native denoising.");
+				rb->set_temporal_upscaler_override(false);
+			} else {
+				static bool metalfx_denoised_marker_printed = false;
+				if (!metalfx_denoised_marker_printed) {
+					print_line("METAL_RT_DENOISER=metalfx");
+					metalfx_denoised_marker_printed = true;
+				}
+
+				const uint32_t history_reset_reasons = rb_data->mfx_denoised_presentation_history.begin_frame(
+						RSG::rasterizer->get_frame_number(), time_step,
+						p_render_data->scene_data->cam_transform, p_render_data->scene_data->prev_cam_transform,
+						p_render_data->scene_data->cam_projection, p_render_data->scene_data->prev_cam_projection);
+				_print_pathtracing_presentation_history_reset(history_reset_reasons);
+
+				RID exposure;
+				if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
+					exposure = luminance->get_current_luminance_buffer(rb);
+				}
+
+				RD::get_singleton()->draw_command_begin_label("MetalFX Denoised Upscaling");
+				RENDER_TIMESTAMP("MetalFX Denoised Upscaling");
+				Vector2 jitter = p_render_data->scene_data->taa_jitter * 0.5f;
+				jitter *= Vector2(1.0, -1.0);
+
+				for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+					RendererRD::MFXDenoisedEffect::Params params;
+					params.src = rb->get_internal_texture(v);
+					params.depth = rb->get_depth_texture(v);
+					params.motion = rb->get_velocity_buffer(false, v);
+					params.exposure = exposure;
+					params.diffuse_albedo = rb_data->dlss_rr_get_diffuse_albedo(v);
+					params.specular_albedo = rb_data->dlss_rr_get_specular_albedo(v);
+					params.normal = rb_data->dlss_rr_get_normal_roughness(v);
+					params.roughness = rb_data->dlss_rr_get_roughness(v);
+					params.specular_hit_distance = rb_data->dlss_rr_get_specular_hit_dist(v);
+					params.dst = rb->get_upscaled_texture(v);
+					params.jitter_offset = jitter;
+					params.camera_projection = p_render_data->scene_data->cam_projection;
+					params.camera_transform = p_render_data->scene_data->cam_transform;
+					params.reset = history_reset_reasons != PT_PRESENTATION_HISTORY_RESET_NONE;
+					mfx_denoised_effect->process(rb_data->get_mfx_denoised_context(), params);
+				}
+
+				rb->set_upscaler_ready(true);
+				RD::get_singleton()->draw_command_end_label();
+			}
+#endif
 		} else if (scale_type == SCALE_MFX) {
 #ifdef METAL_MFXTEMPORAL_ENABLED
 			rb_data->ensure_mfx_temporal(mfx_temporal_effect);
@@ -5848,6 +5955,9 @@ RenderForwardClustered::RenderForwardClustered() {
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	mfx_temporal_effect = memnew(RendererRD::MFXTemporalEffect);
 #endif
+#ifdef METAL_MFXDENOISED_ENABLED
+	mfx_denoised_effect = memnew(RendererRD::MFXDenoisedEffect);
+#endif
 
 	// Raytracing will be initialized lazily when rt_set_enabled(true) is called
 }
@@ -5879,6 +5989,13 @@ RenderForwardClustered::~RenderForwardClustered() {
 		mfx_temporal_effect = nullptr;
 	}
 
+#endif
+
+#ifdef METAL_MFXDENOISED_ENABLED
+	if (mfx_denoised_effect) {
+		memdelete(mfx_denoised_effect);
+		mfx_denoised_effect = nullptr;
+	}
 #endif
 
 	if (dlss_effect) {
