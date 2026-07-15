@@ -1256,13 +1256,35 @@ static void pack_uniform(const ShaderLanguage::ShaderNode::Uniform &u, const Var
 // Procedural geometry processing
 // ---------------------------------------------------------------------------
 
-void RenderRaytracing::update_procedural_blas(RTProceduralState *p_state, LocalVector<RID> &r_dirty_blas_list) {
-	// Pack AABB data into a byte buffer.
-	Vector<uint8_t> aabb_bytes;
-	uint32_t aabb_count = 1;
+bool RenderRaytracing::update_procedural_blas(RTProceduralState *p_state, LocalVector<RID> &r_dirty_blas_list, LocalVector<RID> &r_dirty_blas_update_list) {
+	ERR_FAIL_NULL_V(p_state, false);
 
-	if (p_state->aabb_data.size() >= 6 && (p_state->aabb_data.size() % 6) == 0) {
-		aabb_count = p_state->aabb_data.size() / 6;
+	RTProceduralBoundsValidation validation;
+	String validation_error;
+	Span<const float> explicit_bounds(p_state->aabb_data.ptr(), p_state->aabb_data.size());
+	if (!rt_procedural_bounds_validate(explicit_bounds, p_state->culling_aabb, validation, validation_error)) {
+		// Never leave the last valid BLAS visible after an invalid live edit.
+		if (p_state->blas.is_valid()) {
+			RD::get_singleton()->free_rid(p_state->blas);
+			p_state->blas = RID();
+		}
+		if (p_state->gpu_buffer.is_valid()) {
+			RD::get_singleton()->free_rid(p_state->gpu_buffer);
+			p_state->gpu_buffer = RID();
+		}
+		p_state->gpu_buffer_capacity = 0;
+		p_state->gpu_buffer_address = 0;
+		p_state->aabb_count = 0;
+		p_state->blas_built_once = false;
+		WARN_PRINT_ONCE(vformat("Path tracing omitted invalid procedural AABB geometry: %s. Valid triangle and procedural instances remain enabled.", validation_error));
+		return false;
+	}
+
+	// Pack the validated AABB data into the backend's shared min/max layout.
+	Vector<uint8_t> aabb_bytes;
+	const uint32_t aabb_count = validation.count;
+
+	if (validation.source == RTProceduralBoundsSource::EXPLICIT) {
 		aabb_bytes.resize(p_state->aabb_data.size() * sizeof(float));
 		memcpy(aabb_bytes.ptrw(), p_state->aabb_data.ptr(), aabb_bytes.size());
 	} else {
@@ -1283,6 +1305,7 @@ void RenderRaytracing::update_procedural_blas(RTProceduralState *p_state, LocalV
 		if (p_state->blas.is_valid()) {
 			RD::get_singleton()->free_rid(p_state->blas);
 			p_state->blas = RID();
+			p_state->blas_built_once = false;
 		}
 		if (p_state->gpu_buffer.is_valid()) {
 			RD::get_singleton()->free_rid(p_state->gpu_buffer);
@@ -1299,14 +1322,17 @@ void RenderRaytracing::update_procedural_blas(RTProceduralState *p_state, LocalV
 	}
 
 	if (needs_new_blas) {
-		ERR_FAIL_COND(!p_state->gpu_buffer.is_valid());
+		ERR_FAIL_COND_V(!p_state->gpu_buffer.is_valid(), false);
 
 		RD::AccelerationStructureGeometry geom;
 		geom.type = RD::AccelerationStructureGeometry::TYPE_AABBS;
 		geom.geometry.aabbs.buffer = p_state->gpu_buffer;
 		geom.geometry.aabbs.count = aabb_count;
 		geom.geometry.aabbs.stride = 24; // VkAabbPositionsKHR: two float3 (min, max).
-		p_state->blas = RD::get_singleton()->blas_create({ &geom, 1 }, RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
+		p_state->blas = RD::get_singleton()->blas_create({ &geom, 1 },
+				RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT |
+						RD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT);
+		p_state->blas_built_once = false;
 	}
 
 	// BDA for shader access.
@@ -1317,8 +1343,16 @@ void RenderRaytracing::update_procedural_blas(RTProceduralState *p_state, LocalV
 	}
 
 	if (p_state->blas.is_valid()) {
-		r_dirty_blas_list.push_back(p_state->blas);
+		if (p_state->blas_built_once) {
+			r_dirty_blas_update_list.push_back(p_state->blas);
+			p_state->refit_count++;
+		} else {
+			r_dirty_blas_list.push_back(p_state->blas);
+			p_state->blas_built_once = true;
+			p_state->build_count++;
+		}
 	}
+	return p_state->blas.is_valid();
 }
 
 // ---------------------------------------------------------------------------
@@ -2249,7 +2283,6 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	// Builds bundle if needed; live_ready_mask drives TLAS inclusion below.
 	SceneShaderRaytracing *rt_shader_singleton = SceneShaderRaytracing::get_singleton();
 	rt_shader_singleton->ensure_pipeline_bundle(p_rt_flags);
-	const bool hg0_compute_lane = rt_shader_singleton->uses_compute_scene_lane();
 
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
@@ -2302,10 +2335,6 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 		// Handle procedural RT instances (intersection shaders).
 		if (inst->rt_procedural) {
-			if (hg0_compute_lane) {
-				WARN_PRINT_ONCE("Metal path tracing keeps procedural AABB geometry on the C16 fallback path; the instance was omitted from the TLAS.");
-				continue;
-			}
 			SceneShaderRaytracing *rt_shader = SceneShaderRaytracing::get_singleton();
 			RTProceduralState *ps = inst->rt_procedural;
 
@@ -2330,12 +2359,14 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			if (ps->dirty) {
 #ifdef TOOLS_ENABLED
 				uint32_t pre_proc_build_size = dirty_blas_list.size();
+				uint32_t pre_proc_refit_size = dirty_blas_update_list.size();
 #endif
-				update_procedural_blas(ps, dirty_blas_list);
+				update_procedural_blas(ps, dirty_blas_list, dirty_blas_update_list);
 				ps->dirty = false;
 #ifdef TOOLS_ENABLED
 				if (collect_render_info) {
 					rt_blas_builds += dirty_blas_list.size() - pre_proc_build_size;
+					rt_blas_refits += dirty_blas_update_list.size() - pre_proc_refit_size;
 				}
 #endif
 			}
@@ -2372,6 +2403,13 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 						RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 				instance_flags.push_back(inst_flags);
 				instance_masks.push_back(0xFF);
+
+#ifdef TOOLS_ENABLED
+				if (collect_render_info) {
+					tlas_instance_count++;
+					tlas_primitive_count += ps->aabb_count;
+				}
+#endif
 			}
 			continue;
 		}

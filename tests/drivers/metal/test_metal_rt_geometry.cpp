@@ -279,6 +279,153 @@ TEST_CASE_PENDING("[MetalRT][GPU] C14 rebuilds real scene geometry through twent
 	print_line(vformat("METAL_RT_C14_ITERATIONS=20 METAL_RT_AS_REFIT_COUNT=%d METAL_RT_PEAK_AS_BYTES=%d", as_refit_count, peak_as_bytes));
 }
 
+TEST_CASE_PENDING("[MetalRT][GPU] C16 refits procedural AABBs in mixed geometry through twenty lifetime iterations") {
+	NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+	NS::SharedPtr<MTL::Device> device = NS::TransferPtr(MTL::CreateSystemDefaultDevice());
+	if (!device || !device->supportsRaytracing()) {
+		MESSAGE("SKIP_REASON=missing_metal_rt_feature");
+		return;
+	}
+	if (!__builtin_available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
+		MESSAGE("SKIP_REASON=missing_metal_rt_feature");
+		return;
+	}
+
+	NS::SharedPtr<MTL::CommandQueue> queue = NS::TransferPtr(device->newCommandQueue());
+	REQUIRE(queue);
+
+	struct Float3 {
+		float x;
+		float y;
+		float z;
+	};
+	struct AABBRecord {
+		Float3 min;
+		Float3 max;
+	};
+	static_assert(sizeof(AABBRecord) == 24);
+
+	const Float3 triangle_vertices[] = {
+		{ -1.0f, -1.0f, 0.0f },
+		{ 1.0f, -1.0f, 0.0f },
+		{ 0.0f, 1.0f, 0.0f },
+	};
+	const AABBRecord initial_bounds[] = {
+		{ { -0.8f, -0.8f, -0.8f }, { 0.0f, 0.8f, 0.8f } },
+		{ { 0.0f, -0.8f, -0.8f }, { 0.8f, 0.8f, 0.8f } },
+	};
+
+	uint32_t procedural_build_count = 0;
+	uint32_t procedural_refit_count = 0;
+	uint32_t mixed_tlas_build_count = 0;
+	uint64_t peak_as_bytes = 0;
+
+	for (uint32_t iteration = 0; iteration < 20; iteration++) {
+		CAPTURE(iteration);
+		NS::SharedPtr<MTL::Buffer> triangle_buffer = NS::TransferPtr(device->newBuffer(triangle_vertices, sizeof(triangle_vertices), MTL::ResourceStorageModeShared));
+		NS::SharedPtr<MTL::Buffer> bounds_buffer = NS::TransferPtr(device->newBuffer(initial_bounds, sizeof(initial_bounds), MTL::ResourceStorageModeShared));
+		REQUIRE(triangle_buffer);
+		REQUIRE(bounds_buffer);
+
+		NS::SharedPtr<MTL::AccelerationStructureTriangleGeometryDescriptor> triangle_geometry = NS::TransferPtr(MTL::AccelerationStructureTriangleGeometryDescriptor::alloc()->init());
+		triangle_geometry->setVertexBuffer(triangle_buffer.get());
+		triangle_geometry->setVertexStride(sizeof(Float3));
+		triangle_geometry->setTriangleCount(1);
+		triangle_geometry->setOpaque(true);
+
+		NS::SharedPtr<MTL::AccelerationStructureBoundingBoxGeometryDescriptor> procedural_geometry = NS::TransferPtr(MTL::AccelerationStructureBoundingBoxGeometryDescriptor::alloc()->init());
+		procedural_geometry->setBoundingBoxBuffer(bounds_buffer.get());
+		procedural_geometry->setBoundingBoxStride(sizeof(AABBRecord));
+		procedural_geometry->setBoundingBoxCount(2);
+		procedural_geometry->setOpaque(false);
+
+		BitField<RDD::AccelerationStructureFlagBits> procedural_flags;
+		procedural_flags.set_flag(RDD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT);
+		procedural_flags.set_flag(RDD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
+		NS::SharedPtr<MTL::PrimitiveAccelerationStructureDescriptor> triangle_descriptor = make_blas_descriptor(triangle_geometry.get(), MTL::AccelerationStructureUsageNone);
+		NS::SharedPtr<MTL::PrimitiveAccelerationStructureDescriptor> procedural_descriptor = make_blas_descriptor(procedural_geometry.get(), MDAccelerationStructure::usage_from_flags(procedural_flags));
+
+		const MTL::AccelerationStructureSizes triangle_sizes = device->accelerationStructureSizes(triangle_descriptor.get());
+		const MTL::AccelerationStructureSizes procedural_sizes = device->accelerationStructureSizes(procedural_descriptor.get());
+		MDAccelerationStructure triangle_blas(MDAccelerationStructure::Type::BLAS, triangle_descriptor, triangle_sizes, {});
+		MDAccelerationStructure procedural_blas(MDAccelerationStructure::Type::BLAS, procedural_descriptor, procedural_sizes, procedural_flags);
+		REQUIRE(triangle_blas.allocate(device.get()));
+		REQUIRE(procedural_blas.allocate(device.get()));
+
+		NS::SharedPtr<MTL::Buffer> triangle_scratch = NS::TransferPtr(device->newBuffer(MAX(uint64_t(1), triangle_blas.scratch_size), MTL::ResourceStorageModePrivate));
+		NS::SharedPtr<MTL::Buffer> procedural_scratch = NS::TransferPtr(device->newBuffer(MAX(uint64_t(1), procedural_blas.scratch_size), MTL::ResourceStorageModePrivate));
+		REQUIRE(submit_build(queue.get(), triangle_blas, triangle_scratch.get()));
+		REQUIRE(submit_build(queue.get(), procedural_blas, procedural_scratch.get()));
+		procedural_build_count++;
+
+		AABBRecord *updated_bounds = static_cast<AABBRecord *>(bounds_buffer->contents());
+		updated_bounds[0].min.x -= 0.025f * float(iteration + 1);
+		updated_bounds[0].max.x += 0.025f * float(iteration + 1);
+		REQUIRE(submit_refit(queue.get(), procedural_blas, procedural_scratch.get()));
+		procedural_refit_count++;
+
+		NS::SharedPtr<MTL::InstanceAccelerationStructureDescriptor> tlas_descriptor = NS::TransferPtr(MTL::InstanceAccelerationStructureDescriptor::alloc()->init());
+		tlas_descriptor->setInstanceCount(2);
+		tlas_descriptor->setInstanceDescriptorStride(sizeof(MDAccelerationStructureInstance));
+		tlas_descriptor->setInstanceDescriptorType(MTL::AccelerationStructureInstanceDescriptorTypeUserID);
+		const MTL::AccelerationStructureSizes tlas_sizes = device->accelerationStructureSizes(tlas_descriptor.get());
+		MDAccelerationStructure tlas(MDAccelerationStructure::Type::TLAS, tlas_descriptor, tlas_sizes, {}, 2);
+		REQUIRE(tlas.allocate(device.get()));
+		NS::SharedPtr<MTL::Buffer> tlas_scratch = NS::TransferPtr(device->newBuffer(MAX(uint64_t(1), tlas.scratch_size), MTL::ResourceStorageModePrivate));
+		NS::SharedPtr<MTL::Buffer> instance_buffer = NS::TransferPtr(device->newBuffer(2 * sizeof(MDAccelerationStructureInstance), MTL::ResourceStorageModeShared));
+		REQUIRE(tlas_scratch);
+		REQUIRE(instance_buffer);
+
+		RDD::AccelerationStructureInstance instances[2];
+		instances[0].id = 0x12345;
+		instances[0].mask = 0xFF;
+		instances[0].hit_sbt_offset = 3;
+		instances[0].blas = RDD::AccelerationStructureID(&triangle_blas);
+		instances[1].id = 0x23456;
+		instances[1].mask = 0x7F;
+		instances[1].hit_sbt_offset = 9;
+		instances[1].transform.origin.x = 1.5;
+		instances[1].blas = RDD::AccelerationStructureID(&procedural_blas);
+
+		auto write_instances = [&](uint32_t p_count) {
+			for (uint32_t i = 0; i < p_count; i++) {
+				MDAccelerationStructureInstance record;
+				REQUIRE(record.write(instances[i]));
+				memcpy(static_cast<uint8_t *>(instance_buffer->contents()) + i * sizeof(record), &record, sizeof(record));
+			}
+		};
+
+		write_instances(2);
+		REQUIRE(tlas.prepare_tlas_build(instance_buffer.get(), 0, 2));
+		REQUIRE(submit_build(queue.get(), tlas, tlas_scratch.get()));
+		mixed_tlas_build_count++;
+
+		MDAccelerationStructureInstance records[2];
+		memcpy(records, instance_buffer->contents(), sizeof(records));
+		CHECK(records[0].user_id == 0x12345);
+		CHECK(records[1].user_id == 0x23456);
+		CHECK(records[0].intersection_function_table_offset == 3);
+		CHECK(records[1].intersection_function_table_offset == 9);
+
+		// Remove the procedural instance while retaining the valid triangle.
+		write_instances(1);
+		REQUIRE(tlas.prepare_tlas_build(instance_buffer.get(), 0, 1));
+		REQUIRE(submit_build(queue.get(), tlas, tlas_scratch.get()));
+		mixed_tlas_build_count++;
+		memcpy(records, instance_buffer->contents(), sizeof(MDAccelerationStructureInstance));
+		CHECK(records[0].user_id == 0x12345);
+
+		peak_as_bytes = MAX(peak_as_bytes, triangle_blas.acceleration_structure_size + procedural_blas.acceleration_structure_size + tlas.acceleration_structure_size);
+	}
+
+	CHECK(procedural_build_count == 20);
+	CHECK(procedural_refit_count == 20);
+	CHECK(mixed_tlas_build_count == 40);
+	print_line("METAL_RT_C16_PROCEDURAL_AS=passed");
+	print_line("METAL_RT_MIXED_GEOMETRY_LIFETIME=passed");
+	print_line(vformat("METAL_RT_C16_ITERATIONS=20 METAL_RT_PROCEDURAL_BUILDS=%d METAL_RT_PROCEDURAL_REFITS=%d METAL_RT_MIXED_TLAS_BUILDS=%d METAL_RT_PEAK_AS_BYTES=%d", procedural_build_count, procedural_refit_count, mixed_tlas_build_count, peak_as_bytes));
+}
+
 } // namespace TestMetalRTGeometry
 
 #endif // METAL_ENABLED

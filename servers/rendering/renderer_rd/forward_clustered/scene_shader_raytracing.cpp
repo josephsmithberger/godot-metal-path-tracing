@@ -601,9 +601,15 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 	r_entry.uniform_offsets = gen_code.uniform_offsets;
 	r_entry.uniforms = uniform_sink;
 	_finalize_uniforms_with_textures(r_entry, gen_code, uniform_sink, /*strip_intersection_globals=*/p_is_procedural);
-	if (compute_scene_lane && !p_is_procedural && !r_entry.fragment_globals.strip_edges().is_empty()) {
-		WARN_PRINT("RT: Metal material dispatch does not support stage-global custom helper functions. Inline the helper in fragment(), or guard it out of the RT shader path; the surface will be excluded until the shader source changes.");
-		return false;
+	if (compute_scene_lane) {
+		if (!r_entry.fragment_globals.strip_edges().is_empty()) {
+			WARN_PRINT_ONCE("RT: Metal material dispatch does not support stage-global custom helper functions. Inline the helper in fragment(), or guard it out of the RT shader path; the surface will be excluded until the shader source changes.");
+			return false;
+		}
+		if (p_is_procedural && !r_entry.intersection_globals.strip_edges().is_empty()) {
+			WARN_PRINT_ONCE("RT: Metal procedural dispatch does not support stage-global custom intersection helpers. Inline the helper in intersection(); the procedural instance will be excluded while valid triangle content remains enabled.");
+			return false;
+		}
 	}
 	return true;
 }
@@ -1007,6 +1013,84 @@ String SceneShaderRaytracing::_build_compute_material_function(uint32_t p_slot_i
 	return source;
 }
 
+String SceneShaderRaytracing::_build_compute_procedural_function(uint32_t p_slot_index, const CustomShaderEntry &p_entry) const {
+	if (!p_entry.is_procedural || p_entry.intersection_code.is_empty() ||
+			!p_entry.intersection_globals.strip_edges().is_empty()) {
+		return String();
+	}
+
+	String intersection_code = p_entry.intersection_code;
+	for (int ti = 0; ti < p_entry.texture_uniforms.size(); ti++) {
+		const TextureUniformInfo &tui = p_entry.texture_uniforms[ti];
+		String identifier = "m_" + tui.name;
+		String replacement = "bindless_textures[nonuniformEXT(material." + identifier + ")]";
+		_replace_identifier(intersection_code, identifier, replacement);
+	}
+
+	const String suffix = itos(p_slot_index);
+	String source;
+	source += "#define report_intersection(t_hit, kind) { \\\n";
+	source += "\tfloat _rt_report_t = (t_hit); \\\n";
+	source += "\tif (!isnan(_rt_report_t) && !isinf(_rt_report_t) && _rt_report_t >= m_T_MIN && _rt_report_t <= m_T_MAX) { \\\n";
+	source += "\t\trayQueryGenerateIntersectionEXT(query, _rt_report_t); \\\n";
+	source += "\t\tif (!procedural_hit.valid || _rt_report_t < procedural_hit.t) { \\\n";
+	source += "\t\t\tprocedural_hit.t = _rt_report_t; \\\n";
+	source += "\t\t\tprocedural_hit.geometry_idx = rt_geometry_idx; \\\n";
+	source += "\t\t\tprocedural_hit.primitive_idx = rt_primitive_idx; \\\n";
+	source += "\t\t\tprocedural_hit.hit_kind = (kind); \\\n";
+	source += "\t\t\tprocedural_hit.uv = m_HIT_UV; \\\n";
+	source += "\t\t\tprocedural_hit.normal = m_HIT_NORMAL; \\\n";
+	source += "\t\t\tprocedural_hit.tangent = m_HIT_TANGENT; \\\n";
+	source += "\t\t\tprocedural_hit.prev_position = m_PREV_POSITION; \\\n";
+	source += "\t\t\tprocedural_hit.prev_position_valid = !any(isnan(m_PREV_POSITION)) && !any(isinf(m_PREV_POSITION)); \\\n";
+	source += "\t\t\tprocedural_hit.valid = true; \\\n";
+	source += "\t\t} \\\n";
+	source += "\t} \\\n";
+	source += "}\n";
+	source += "bool intersect_custom_" + suffix + "(rayQueryEXT query, vec3 world_origin, vec3 world_direction, float max_distance, inout ComputeProceduralHit procedural_hit) {\n";
+	source += "\tuint rt_geometry_idx = rayQueryGetIntersectionInstanceCustomIndexEXT(query, false);\n";
+	source += "\tuint rt_primitive_idx = rayQueryGetIntersectionPrimitiveIndexEXT(query, false);\n";
+	source += "\tMaterialData rt_mat = materials[rt_geometry_idx];\n";
+	if (p_entry.uniform_total_size > 0) {
+		source += "\tRTCustomMaterialUniforms_" + suffix + " material = RTCustomMaterialUniforms_" + suffix + "(rt_mat.uniform_address);\n";
+	}
+	source += "\tvec2 m_HIT_UV = vec2(0.0);\n";
+	source += "\tvec3 m_HIT_NORMAL = vec3(0.0, 1.0, 0.0);\n";
+	source += "\tvec3 m_HIT_TANGENT = vec3(1.0, 0.0, 0.0);\n";
+	source += "\tvec3 m_PREV_POSITION = vec3(uintBitsToFloat(0x7FC00000u));\n";
+	source += "\tvec3 m_ORIGIN = rayQueryGetIntersectionObjectRayOriginEXT(query, false);\n";
+	source += "\tvec3 m_DIRECTION = rayQueryGetIntersectionObjectRayDirectionEXT(query, false);\n";
+	source += "\tvec3 m_WORLD_ORIGIN = world_origin;\n";
+	source += "\tvec3 m_WORLD_DIRECTION = world_direction;\n";
+	source += "\tfloat m_T_MIN = rayQueryGetRayTMinEXT(query);\n";
+	source += "\tfloat m_T_MAX = max_distance;\n";
+	source += "\tmat4 read_model_matrix = mat4(rayQueryGetIntersectionObjectToWorldEXT(query, false));\n";
+	source += "\tmat4 m_INV_MODEL_MATRIX = mat4(rayQueryGetIntersectionWorldToObjectEXT(query, false));\n";
+	source += "\tmat4 read_view_matrix = transpose(mat4(scene_data_block.data.view_matrix[0], scene_data_block.data.view_matrix[1], scene_data_block.data.view_matrix[2], vec4(0.0, 0.0, 0.0, 1.0)));\n";
+	source += "\tmat4 inv_view_matrix = transpose(mat4(scene_data_block.data.inv_view_matrix[0], scene_data_block.data.inv_view_matrix[1], scene_data_block.data.inv_view_matrix[2], vec4(0.0, 0.0, 0.0, 1.0)));\n";
+	source += "\tmat4 projection_matrix = scene_data_block.data.projection_matrix;\n";
+	source += "\tmat4 inv_projection_matrix = scene_data_block.data.inv_projection_matrix;\n";
+	source += "\tvec2 read_viewport_size = scene_data_block.data.viewport_size;\n";
+	source += "\tfloat m_Z_NEAR = scene_data_block.data.z_near;\n";
+	source += "\tfloat m_Z_FAR = scene_data_block.data.z_far;\n";
+	source += "\tfloat global_time = scene_data_block.data.time;\n";
+	source += "\tfloat global_prev_time = scene_data_block.prev_data.time;\n";
+	source += "\tGeometryData rt_geom = geometries[rt_geometry_idx];\n";
+	source += "\tvec3 m_AABB_MIN = vec3(0.0);\n";
+	source += "\tvec3 m_AABB_MAX = vec3(0.0);\n";
+	source += "\tif (rt_geom.vertex_address != 0ul) {\n";
+	source += "\t\tFloatBuffer aabb_buffer = FloatBuffer(rt_geom.vertex_address);\n";
+	source += "\t\tint aabb_base = int(rt_primitive_idx) * 6;\n";
+	source += "\t\tm_AABB_MIN = vec3(aabb_buffer.v[aabb_base + 0], aabb_buffer.v[aabb_base + 1], aabb_buffer.v[aabb_base + 2]);\n";
+	source += "\t\tm_AABB_MAX = vec3(aabb_buffer.v[aabb_base + 3], aabb_buffer.v[aabb_base + 4], aabb_buffer.v[aabb_base + 5]);\n";
+	source += "\t}\n";
+	source += "\t{\n" + intersection_code + "\n\t}\n";
+	source += "\treturn procedural_hit.valid;\n";
+	source += "}\n";
+	source += "#undef report_intersection\n";
+	return source;
+}
+
 String SceneShaderRaytracing::_build_compute_material_source(const LocalVector<uint8_t> &p_active_slots) {
 	Vector<String> sources = compute_shader.version_build_variant_stage_sources(compute_shader_version, 0);
 	if (sources.size() <= RD::SHADER_STAGE_COMPUTE || sources[RD::SHADER_STAGE_COMPUTE].is_empty()) {
@@ -1016,6 +1100,7 @@ String SceneShaderRaytracing::_build_compute_material_source(const LocalVector<u
 	String types;
 	String functions;
 	String cases;
+	String procedural_cases;
 	for (uint32_t i = 1; i < p_active_slots.size() && i < hit_group_slots.size(); i++) {
 		if (!p_active_slots[i]) {
 			continue;
@@ -1029,12 +1114,21 @@ String SceneShaderRaytracing::_build_compute_material_source(const LocalVector<u
 		}
 		functions += function;
 		cases += "case " + itos(i) + "u: return evaluate_custom_" + itos(i) + "(hit, hit_data, ray_direction);\n";
+		if (entry.is_procedural) {
+			String procedural_function = _build_compute_procedural_function(i, entry);
+			if (procedural_function.is_empty()) {
+				return String();
+			}
+			functions += procedural_function;
+			procedural_cases += "case " + itos(i) + "u: return intersect_custom_" + itos(i) + "(query, world_origin, world_direction, max_distance, procedural_hit);\n";
+		}
 	}
 
 	String source = sources[RD::SHADER_STAGE_COMPUTE];
 	source = source.replace("/* RT_COMPUTE_CUSTOM_TYPES */", types);
 	source = source.replace("/* RT_COMPUTE_CUSTOM_FUNCTIONS */", functions);
 	source = source.replace("/* RT_COMPUTE_CUSTOM_CASES */", cases);
+	source = source.replace("/* RT_COMPUTE_PROCEDURAL_CASES */", procedural_cases);
 	return source;
 }
 
@@ -1089,11 +1183,6 @@ bool SceneShaderRaytracing::_build_compute_bundle(uint32_t p_rt_flags, PipelineB
 				hit_group_slots[i].state != HGState::Ready) {
 			continue;
 		}
-		if (hit_group_slots[i].entry.is_procedural) {
-			staged_states[i] = HGState::Failed;
-			continue;
-		}
-
 		LocalVector<uint8_t> trial_slots(active_slots);
 		trial_slots[i] = 1;
 		String compile_error;

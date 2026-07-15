@@ -497,6 +497,7 @@ private:
 	RID _compile_compute_material_variant(const LocalVector<uint8_t> &p_active_slots, String &r_error);
 	String _build_compute_material_source(const LocalVector<uint8_t> &p_active_slots);
 	String _build_compute_material_function(uint32_t p_slot_index, const CustomShaderEntry &p_entry) const;
+	String _build_compute_procedural_function(uint32_t p_slot_index, const CustomShaderEntry &p_entry) const;
 	static void _replace_identifier(String &r_source, const String &p_identifier, const String &p_replacement);
 	void _kick_rebuild_if_idle();
 
