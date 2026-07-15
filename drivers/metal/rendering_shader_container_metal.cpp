@@ -737,6 +737,20 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 			ERR_FAIL_V_MSG(false, "Failed to compile stage " + String(RDC::SHADER_STAGE_NAMES[stage]) + ": " + e.what());
 		}
 
+		// Apple GPUs can corrupt values kept live across the primary and shadow
+		// intersection queries when SPIRV-Cross force-inlines direct lighting into
+		// the entry point. Keep the secondary traversal behind a function boundary.
+		static constexpr char direct_lighting_inline[] =
+				"static inline __attribute__((always_inline))\nfloat3 lights_evaluate_direct_lighting";
+		static constexpr char direct_lighting_noinline[] =
+				"static __attribute__((noinline))\nfloat3 lights_evaluate_direct_lighting";
+		if (source.find("raytracing::intersection_query") != std::string::npos) {
+			size_t position = source.find(direct_lighting_inline);
+			if (position != std::string::npos) {
+				source.replace(position, sizeof(direct_lighting_inline) - 1, direct_lighting_noinline);
+			}
+		}
+
 		ERR_FAIL_COND_V_MSG(compiler.get_entry_points_and_stages().size() != 1, false, "Expected a single entry point and stage.");
 
 		SmallVector<EntryPoint> entry_pts_stages = compiler.get_entry_points_and_stages();

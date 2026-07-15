@@ -271,31 +271,35 @@ bool ray_query_candidate_accepts(rayQueryEXT query, vec3 origin, vec3 direction)
 // RT_RAY_FLAGS keeps back-face culling aligned with the Vulkan lanes;
 // double-sided materials override it per instance via
 // ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT.
+// Primary traversal and shadow visibility share one per-invocation query. The
+// generated Metal kernel otherwise keeps both large intersection_query objects
+// live for the entire kernel and can corrupt values across query traversals.
+rayQueryEXT rt_query;
+
 bool trace_material(vec3 origin, vec3 direction, float max_distance, out ComputeHit hit) {
-	rayQueryEXT query;
 	ComputeProceduralHit procedural_hit;
 	procedural_hit.t = max_distance;
 	procedural_hit.valid = false;
-	rayQueryInitializeEXT(query, tlas, RT_RAY_FLAGS,
+	rayQueryInitializeEXT(rt_query, tlas, RT_RAY_FLAGS,
 			0xFF, origin, 0.001, direction, max_distance);
-	while (rayQueryProceedEXT(query)) {
-		uint candidate_type = rayQueryGetIntersectionTypeEXT(query, false);
+	while (rayQueryProceedEXT(rt_query)) {
+		uint candidate_type = rayQueryGetIntersectionTypeEXT(rt_query, false);
 		if (candidate_type == gl_RayQueryCandidateIntersectionTriangleEXT) {
-			if (ray_query_candidate_accepts(query, origin, direction)) {
-				rayQueryConfirmIntersectionEXT(query);
+			if (ray_query_candidate_accepts(rt_query, origin, direction)) {
+				rayQueryConfirmIntersectionEXT(rt_query);
 			}
 		} else if (candidate_type == gl_RayQueryCandidateIntersectionAABBEXT) {
-			evaluate_procedural_intersection(query, origin, direction, max_distance, procedural_hit);
+			evaluate_procedural_intersection(rt_query, origin, direction, max_distance, procedural_hit);
 		}
 	}
 
-	uint committed_type = rayQueryGetIntersectionTypeEXT(query, true);
+	uint committed_type = rayQueryGetIntersectionTypeEXT(rt_query, true);
 	if (committed_type == gl_RayQueryCommittedIntersectionTriangleEXT) {
-		load_query_committed_hit(query, hit);
+		load_query_committed_hit(rt_query, hit);
 		return true;
 	}
 	if (committed_type == gl_RayQueryCommittedIntersectionGeneratedEXT && procedural_hit.valid) {
-		load_query_committed_procedural_hit(query, procedural_hit, hit);
+		load_query_committed_procedural_hit(rt_query, procedural_hit, hit);
 		return true;
 	}
 	return false;
@@ -304,23 +308,22 @@ bool trace_material(vec3 origin, vec3 direction, float max_distance, out Compute
 // Shadow rays only need any confirmed hit, so they terminate on the first
 // alpha-accepted candidate instead of resolving the closest one.
 bool trace_shadow_blocked(vec3 origin, vec3 direction, float max_distance) {
-	rayQueryEXT query;
 	ComputeProceduralHit procedural_hit;
 	procedural_hit.t = max_distance;
 	procedural_hit.valid = false;
-	rayQueryInitializeEXT(query, tlas, RT_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT,
+	rayQueryInitializeEXT(rt_query, tlas, RT_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT,
 			0xFF, origin, 0.001, direction, max_distance);
-	while (rayQueryProceedEXT(query)) {
-		uint candidate_type = rayQueryGetIntersectionTypeEXT(query, false);
+	while (rayQueryProceedEXT(rt_query)) {
+		uint candidate_type = rayQueryGetIntersectionTypeEXT(rt_query, false);
 		if (candidate_type == gl_RayQueryCandidateIntersectionTriangleEXT) {
-			if (ray_query_candidate_accepts(query, origin, direction)) {
-				rayQueryConfirmIntersectionEXT(query);
+			if (ray_query_candidate_accepts(rt_query, origin, direction)) {
+				rayQueryConfirmIntersectionEXT(rt_query);
 			}
 		} else if (candidate_type == gl_RayQueryCandidateIntersectionAABBEXT) {
-			evaluate_procedural_intersection(query, origin, direction, max_distance, procedural_hit);
+			evaluate_procedural_intersection(rt_query, origin, direction, max_distance, procedural_hit);
 		}
 	}
-	uint committed_type = rayQueryGetIntersectionTypeEXT(query, true);
+	uint committed_type = rayQueryGetIntersectionTypeEXT(rt_query, true);
 	return committed_type == gl_RayQueryCommittedIntersectionTriangleEXT ||
 			committed_type == gl_RayQueryCommittedIntersectionGeneratedEXT;
 }
