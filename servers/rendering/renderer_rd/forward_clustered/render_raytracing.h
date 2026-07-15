@@ -30,11 +30,13 @@
 
 #pragma once
 
+#include "core/math/math_funcs.h"
 #include "core/math/transform_3d.h"
 #include "core/string/string_name.h"
 #include "core/templates/hash_map.h"
 #include "core/templates/local_vector.h"
 #include "core/templates/rid_owner.h"
+#include "core/templates/span.h"
 #include "core/templates/vector.h"
 #include "servers/rendering/renderer_rd/bindless_block.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/multimesh_merge.glsl.gen.h"
@@ -200,6 +202,61 @@ enum {
 	RT_GEOM_FLAG_DEFORMED = 4u,
 };
 
+enum class RTProceduralBoundsSource : uint8_t {
+	EXPLICIT,
+	FALLBACK,
+};
+
+struct RTProceduralBoundsValidation {
+	RTProceduralBoundsSource source = RTProceduralBoundsSource::FALLBACK;
+	uint32_t count = 0;
+};
+
+/// Validates the exact min/max float3 records consumed by Vulkan and Metal.
+/// An empty record span intentionally selects the instance's single fallback
+/// AABB; malformed, non-finite, flat, or inverted records reject only that
+/// procedural instance before any backend descriptor is created.
+_FORCE_INLINE_ bool rt_procedural_bounds_validate(Span<const float> p_bounds, const AABB &p_fallback, RTProceduralBoundsValidation &r_validation, String &r_error) {
+	r_validation = RTProceduralBoundsValidation();
+	r_error = String();
+
+	if (p_bounds.is_empty()) {
+		if (!p_fallback.is_finite()) {
+			r_error = "the fallback AABB contains a non-finite value";
+			return false;
+		}
+		if (p_fallback.size.x <= 0.0 || p_fallback.size.y <= 0.0 || p_fallback.size.z <= 0.0) {
+			r_error = "the fallback AABB must have positive volume";
+			return false;
+		}
+		r_validation.source = RTProceduralBoundsSource::FALLBACK;
+		r_validation.count = 1;
+		return true;
+	}
+
+	if ((p_bounds.size() % 6) != 0) {
+		r_error = "the explicit bounds array must contain complete float3 min/max pairs";
+		return false;
+	}
+
+	for (uint32_t i = 0; i < p_bounds.size(); i += 6) {
+		for (uint32_t component = 0; component < 6; component++) {
+			if (!Math::is_finite(p_bounds[i + component])) {
+				r_error = vformat("AABB %d contains a non-finite value", i / 6);
+				return false;
+			}
+		}
+		if (p_bounds[i + 0] >= p_bounds[i + 3] || p_bounds[i + 1] >= p_bounds[i + 4] || p_bounds[i + 2] >= p_bounds[i + 5]) {
+			r_error = vformat("AABB %d must have a strictly greater max than min on every axis", i / 6);
+			return false;
+		}
+	}
+
+	r_validation.source = RTProceduralBoundsSource::EXPLICIT;
+	r_validation.count = p_bounds.size() / 6;
+	return true;
+}
+
 /// Per-instance state for procedural RT geometry. Heap-allocated, only exists for procedural instances.
 struct RTProceduralState {
 	AABB culling_aabb;
@@ -211,6 +268,9 @@ struct RTProceduralState {
 	uint32_t gpu_buffer_capacity = 0; // Bytes, grow-only.
 	uint64_t gpu_buffer_address = 0; // BDA (0 = not exposed).
 	uint32_t aabb_count = 0;
+	bool blas_built_once = false;
+	uint32_t build_count = 0;
+	uint32_t refit_count = 0;
 };
 
 struct RTSurfaceData {
@@ -472,7 +532,7 @@ class RenderRaytracing {
 			LocalVector<RID> &r_dirty_blas_list,
 			LocalVector<RID> &r_dirty_blas_update_list,
 			RTSurfaceData *r_surf_data);
-	void update_procedural_blas(RTProceduralState *p_state, LocalVector<RID> &r_dirty_blas_list);
+	bool update_procedural_blas(RTProceduralState *p_state, LocalVector<RID> &r_dirty_blas_list, LocalVector<RID> &r_dirty_blas_update_list);
 	void build_acceleration_structures(RTViewportState *p_state, const LocalVector<RID> &p_dirty_blas_list, const LocalVector<RID> &p_dirty_blas_update_list);
 	void finalize_buffers(RTViewportState *p_state);
 	void prepare_frame();

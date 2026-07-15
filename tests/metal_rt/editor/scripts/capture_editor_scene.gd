@@ -21,7 +21,7 @@ func _ready() -> void:
 	if (
 		Engine.is_editor_hint()
 		and OS.get_environment("GODOT_MRT_EDITOR_CAPTURE") == "1"
-		and OS.get_environment("GODOT_MRT_FIXTURE") in ["e1_geometry", "e2_materials"]
+		and OS.get_environment("GODOT_MRT_FIXTURE") in ["e1_geometry", "e2_materials", "e3_procedural"]
 	):
 		var fixture := OS.get_environment("GODOT_MRT_FIXTURE")
 		EditorInterface.call_deferred("open_scene_from_path", "res://fixtures/%s.tscn" % fixture)

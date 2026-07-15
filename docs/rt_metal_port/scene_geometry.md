@@ -95,7 +95,8 @@ python3 tests/metal_rt/run_mac_rt_tests.py \
 The artifact bundle includes beauty, instance-ID, and primitive-ID images
 before and after mutation, exact reload diffs, the geometry matrix, device
 record, command logs, and metrics. C15 still owns alpha, double-sided/front-
-culled, and custom spatial material dispatch; C16 owns procedural AABBs.
+culled, and custom spatial material dispatch. C16 procedural AABBs are now
+documented in [`procedural_geometry.md`](procedural_geometry.md).
 
 ## Manual acceptance
 

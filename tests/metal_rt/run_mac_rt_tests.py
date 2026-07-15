@@ -19,7 +19,7 @@ from typing import Any
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[2]
 DEFAULT_ARTIFACT_ROOT = REPO_ROOT / "mac-rt-planning" / "artifacts"
-VALID_STAGES = ("preflight", "caps", "build", "smoke", "unit", "gpu", "image", "editor-scene", "geometry-scene", "material-scene", "fallback")
+VALID_STAGES = ("preflight", "caps", "build", "smoke", "unit", "gpu", "image", "editor-scene", "geometry-scene", "material-scene", "procedural-scene", "fallback")
 CAPS_PROBE_SOURCE = REPO_ROOT / "docs" / "rt_metal_port" / "capability_probe.mm"
 RUNTIME_GATE_PROJECT = REPO_ROOT / "tests" / "metal_rt"
 EDITOR_SCENE_PROJECT = RUNTIME_GATE_PROJECT / "editor"
@@ -29,6 +29,8 @@ GEOMETRY_SCENE_FIXTURE = "res://fixtures/e1_geometry.tscn"
 GEOMETRY_SCENE_VERIFY_SCRIPT = RUNTIME_GATE_PROJECT / "verify_geometry_scene.py"
 MATERIAL_SCENE_FIXTURE = "res://fixtures/e2_materials.tscn"
 MATERIAL_SCENE_VERIFY_SCRIPT = RUNTIME_GATE_PROJECT / "verify_material_scene.py"
+PROCEDURAL_SCENE_FIXTURE = "res://fixtures/e3_procedural.tscn"
+PROCEDURAL_SCENE_VERIFY_SCRIPT = RUNTIME_GATE_PROJECT / "verify_procedural_scene.py"
 IMAGE_DIFF_SCRIPT = RUNTIME_GATE_PROJECT / "image_diff.py"
 IMAGE_DIFF_TEST_SCRIPT = RUNTIME_GATE_PROJECT / "test_image_diff.py"
 IMAGE_REFERENCE = RUNTIME_GATE_PROJECT / "references" / "c10_pathtracer_launch_v1.png"
@@ -139,6 +141,7 @@ def command_record(
     environment: dict[str, str] | None = None,
     required_log_patterns: tuple[str, ...] = (),
     forbidden_log_patterns: tuple[str, ...] = (),
+    required_log_counts: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     environment = environment or {}
     displayed_command = ["env", *(f"{key}={value}" for key, value in sorted(environment.items())), *command]
@@ -157,6 +160,7 @@ def command_record(
         "detect_log_skip": detect_log_skip,
         "required_log_patterns": list(required_log_patterns),
         "forbidden_log_patterns": list(forbidden_log_patterns),
+        "required_log_counts": required_log_counts or {},
     }
 
 
@@ -179,7 +183,7 @@ def make_commands(
         ])
 
     if "caps" in stages or (
-        any(stage in stages for stage in ("gpu", "image", "editor-scene", "geometry-scene", "material-scene", "fallback")) and args.arch == "arm64"
+        any(stage in stages for stage in ("gpu", "image", "editor-scene", "geometry-scene", "material-scene", "procedural-scene", "fallback")) and args.arch == "arm64"
     ):
         probe_binary = artifact_dir / "capability_probe"
         commands.extend([
@@ -494,6 +498,81 @@ def make_commands(
             ),
         ])
 
+    if "procedural-scene" in stages:
+        procedural_command = [
+            str(binary),
+            "--editor",
+            "--path",
+            str(EDITOR_SCENE_PROJECT),
+            PROCEDURAL_SCENE_FIXTURE,
+            "--quit-after",
+            "1200",
+        ]
+        procedural_environment = {
+            **METAL_VALIDATION_ENVIRONMENT,
+            "GODOT_MRT_EDITOR_CAPTURE": "1",
+            "GODOT_MRT_FIXTURE": "e3_procedural",
+        }
+        procedural_markers = (
+            "METAL_RT_EDITOR_ROUTE=compute_ray_query",
+            "METAL_RT_C16_PROCEDURAL=passed",
+            "METAL_RT_CUSTOM_INTERSECTION=passed",
+            "METAL_RT_MIXED_GEOMETRY=passed",
+            "METAL_RT_PROCEDURAL_UPDATE=builds:3,refits:1,removed:1",
+            "METAL_RT_FIXTURE_REVISION=e3-procedural-v1",
+            "Path tracing omitted invalid procedural AABB geometry:",
+        )
+        commands.extend([
+            command_record(
+                "procedural-scene-cold",
+                procedural_command,
+                requires_passed="caps-probe" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                environment={**procedural_environment, "GODOT_MRT_CAPTURE_LABEL": "cold"},
+                required_log_patterns=procedural_markers,
+                forbidden_log_patterns=METAL_VALIDATION_FORBIDDEN_PATTERNS,
+                required_log_counts={"Path tracing omitted invalid procedural AABB geometry:": 1},
+            ),
+            command_record(
+                "procedural-scene-reload",
+                procedural_command,
+                requires_passed="procedural-scene-cold" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                environment={**procedural_environment, "GODOT_MRT_CAPTURE_LABEL": "reload"},
+                required_log_patterns=procedural_markers,
+                forbidden_log_patterns=METAL_VALIDATION_FORBIDDEN_PATTERNS,
+                required_log_counts={"Path tracing omitted invalid procedural AABB geometry:": 1},
+            ),
+            command_record(
+                "procedural-scene-verify",
+                [sys.executable, str(PROCEDURAL_SCENE_VERIFY_SCRIPT), str(artifact_dir)],
+                requires_passed="procedural-scene-reload" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                required_log_patterns=("METAL_RT_C16_FIXTURE_VERIFY=passed",),
+            ),
+            command_record(
+                "procedural-scene-forced-fallback",
+                procedural_command,
+                requires_passed="procedural-scene-verify" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                environment={
+                    **procedural_environment,
+                    "GODOT_MRT_CAPTURE_LABEL": "fallback",
+                    "GODOT_MTL_DISABLE_RAYTRACING": "1",
+                },
+                required_log_patterns=(
+                    "using non-RT rendering fallback",
+                    "C11_GATE=disabled:forced_disabled",
+                    "METAL_RT_FIXTURE_REVISION=e3-procedural-v1",
+                ),
+                forbidden_log_patterns=(
+                    "METAL_RT_C16_PROCEDURAL=passed",
+                    "METAL_RT_CUSTOM_INTERSECTION=passed",
+                    "METAL_RT_MIXED_GEOMETRY=passed",
+                ),
+            ),
+        ])
+
     if "fallback" in stages:
         gate_command = [
             str(binary),
@@ -582,12 +661,19 @@ def run_command(command: dict[str, Any], index: int, artifact_dir: Path, dry_run
         log_text = log_path.read_text(encoding="utf-8", errors="replace")
         missing_patterns = [pattern for pattern in command["required_log_patterns"] if pattern not in log_text]
         forbidden_patterns = [pattern for pattern in command["forbidden_log_patterns"] if pattern in log_text]
-        if missing_patterns or forbidden_patterns:
+        count_mismatches = [
+            f"{pattern!r} occurred {log_text.count(pattern)} time(s), expected {expected}"
+            for pattern, expected in command["required_log_counts"].items()
+            if log_text.count(pattern) != expected
+        ]
+        if missing_patterns or forbidden_patterns or count_mismatches:
             errors = []
             if missing_patterns:
                 errors.append(f"required log pattern(s) not found: {', '.join(missing_patterns)}")
             if forbidden_patterns:
                 errors.append(f"forbidden log pattern(s) found: {', '.join(forbidden_patterns)}")
+            if count_mismatches:
+                errors.append("log count mismatch: " + "; ".join(count_mismatches))
             message = f"ERROR: {'; '.join(errors)}\n"
             print(message, end="", file=sys.stderr)
             with log_path.open("a", encoding="utf-8", newline="\n") as log:

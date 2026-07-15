@@ -45,8 +45,10 @@ Compute-lane group rules (validated by `configure_shader_groups`):
 | Miss | None: miss logic is inlined at the trace call site |
 | Hit | Empty sentinel records only: hit logic is inlined; records keep stable indices for instance `hit_sbt_offset` resolution |
 
-Ray-query kernels use no intersection-function table; procedural hit groups
-remain rejected on this lane until a visible-function lowering exists.
+Ray-query kernels use no intersection-function table. This was the C10
+boundary; C16 later represents procedural hit groups by inlining their custom
+intersection bodies into the generated compute kernel, as documented in
+[`procedural_geometry.md`](procedural_geometry.md).
 
 ### Trace dispatch
 

@@ -2578,7 +2578,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				print_line("METAL_RT_ALPHA_TEST=passed");
 				c13_markers_printed = true;
 			}
-			WARN_PRINT_ONCE("Metal path tracing C15 supports opaque, alpha-scissored, double-sided, textured, and generated/inlined custom spatial materials on triangle geometry. Transparent blending, stage-global custom helpers, procedural geometry, native denoising, and SER remain disabled.");
+			WARN_PRINT_ONCE("Metal path tracing C16 supports triangle and procedural AABB geometry with opaque, alpha-scissored, double-sided, textured, and generated/inlined custom material/intersection bodies. Transparent blending, stage-global custom helpers, native denoising, and SER remain disabled.");
 		}
 
 		RD::get_singleton()->draw_command_end_label();

@@ -124,4 +124,67 @@ TEST_CASE("[MetalRT] C15 custom uniform and bindless texture writes stay within 
 	CHECK_FALSE(rt_material_buffer_write_fits(UINT32_MAX, 4, 32));
 }
 
+TEST_CASE("[MetalRT] C16 validates explicit and fallback procedural bounds") {
+	using namespace RendererSceneRenderImplementation;
+	const float valid_bounds[] = {
+		-1.0f,
+		-0.5f,
+		-2.0f,
+		1.0f,
+		0.5f,
+		2.0f,
+		2.0f,
+		1.0f,
+		-1.0f,
+		3.0f,
+		4.0f,
+		1.0f,
+	};
+	RTProceduralBoundsValidation validation;
+	String error;
+	REQUIRE(rt_procedural_bounds_validate(Span<const float>(valid_bounds), AABB(), validation, error));
+	CHECK(error.is_empty());
+	CHECK(validation.source == RTProceduralBoundsSource::EXPLICIT);
+	CHECK(validation.count == 2);
+
+	const AABB fallback(Vector3(-0.5, -1.0, -1.5), Vector3(1.0, 2.0, 3.0));
+	REQUIRE(rt_procedural_bounds_validate(Span<const float>(), fallback, validation, error));
+	CHECK(validation.source == RTProceduralBoundsSource::FALLBACK);
+	CHECK(validation.count == 1);
+
+	const float incomplete[] = { -1.0f, -1.0f, -1.0f, 1.0f, 1.0f };
+	CHECK_FALSE(rt_procedural_bounds_validate(Span<const float>(incomplete), fallback, validation, error));
+	CHECK(error.contains("complete"));
+
+	const float flat[] = { -1.0f, -1.0f, 0.0f, 1.0f, 1.0f, 0.0f };
+	CHECK_FALSE(rt_procedural_bounds_validate(Span<const float>(flat), fallback, validation, error));
+	CHECK(error.contains("strictly greater"));
+
+	const float inverted[] = { 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f };
+	CHECK_FALSE(rt_procedural_bounds_validate(Span<const float>(inverted), fallback, validation, error));
+	CHECK(error.contains("AABB 0"));
+
+	float non_finite[] = { -1.0f, -1.0f, -1.0f, Math::NaN, 1.0f, 1.0f };
+	CHECK_FALSE(rt_procedural_bounds_validate(Span<const float>(non_finite), fallback, validation, error));
+	CHECK(error.contains("non-finite"));
+
+	CHECK_FALSE(rt_procedural_bounds_validate(Span<const float>(), AABB(Vector3(), Vector3(1.0, 0.0, 1.0)), validation, error));
+	CHECK(error.contains("positive volume"));
+}
+
+TEST_CASE("[MetalRT] C16 procedural geometry ABI preserves IDs and hit attributes") {
+	using namespace RendererSceneRenderImplementation;
+	CHECK(sizeof(RT_GeometryData) == 128);
+	CHECK(offsetof(RT_GeometryData, flags) == 68);
+	CHECK(offsetof(RT_GeometryData, aabb_size_x) == 72);
+
+	RT_GeometryData geometry = {};
+	geometry.vertex_buffer_address = 0x0102030405060708ULL;
+	geometry.primitive_count = 3;
+	geometry.flags = RT_GEOM_FLAG_PROCEDURAL;
+	CHECK(geometry.vertex_buffer_address == 0x0102030405060708ULL);
+	CHECK(geometry.primitive_count == 3);
+	CHECK((geometry.flags & RT_GEOM_FLAG_PROCEDURAL) != 0);
+}
+
 } // namespace TestSceneShaderRaytracing

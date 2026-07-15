@@ -43,11 +43,12 @@ The pipeline-specific `MTLIntersectionFunctionTable` uses these rules:
 - each procedural hit group reserves one stable slot beginning at 1;
 - empty hit groups, used by the path tracer as sentinels, have no table slot.
 
-Procedural slots are deliberately reserved but not filled with Vulkan
+Procedural slots remain deliberately reserved but are not filled with Vulkan
 intersection shaders. SPIRV-Cross cannot lower those execution models, as C7
-proved. The C10 compute lane rejects hit groups that reference shaders
-(including intersection shaders); procedural dispatch stays a documented limit
-of the lane ([`pathtracer_launch.md`](pathtracer_launch.md)).
+proved. C16 closes the scene-lane gap by compiling `intersection()` bodies as
+ordinary functions in the monolithic ray-query compute shader; it does not use
+these compatibility table slots. See
+[`procedural_geometry.md`](procedural_geometry.md).
 
 ## Bind order
 
@@ -80,7 +81,7 @@ lane.
 | Opaque implementation-defined shader-group handle | Stable engine-defined 16-byte index record |
 | Raygen or miss shader-group function | Inlined branch in the ray-query compute kernel; no visible-function-table slot |
 | Triangle hit group | System opaque-triangle function at intersection-table slot 0 plus inlined hit logic |
-| Procedural hit group | Reserved intersection-table slot plus C10 compute lowering |
+| Procedural hit group | Reserved compatibility-table slot; C16 scene dispatch is inlined into the ray-query compute kernel |
 | Empty hit-group sentinel | Record with no function-table slot |
 | SBT device address | Compatibility buffer and byte offset retained by `RenderingDevice`; not a Metal function pointer |
 | SBT stride | Record stride validated by the driver; padding is ignored by the Metal mapping |

@@ -66,6 +66,13 @@ struct ComputeHit {
 	mat4 object_to_world;
 	mat4 world_to_object;
 	bool front_face;
+	bool procedural;
+	uint hit_kind;
+	vec2 procedural_uv;
+	vec3 procedural_normal;
+	vec3 procedural_tangent;
+	vec3 procedural_prev_position;
+	bool procedural_prev_position_valid;
 };
 
 struct ComputeHitData {
@@ -78,6 +85,19 @@ struct ComputeHitData {
 	uint geometry_idx;
 };
 
+struct ComputeProceduralHit {
+	float t;
+	uint geometry_idx;
+	uint primitive_idx;
+	uint hit_kind;
+	vec2 uv;
+	vec3 normal;
+	vec3 tangent;
+	vec3 prev_position;
+	bool prev_position_valid;
+	bool valid;
+};
+
 /* RT_COMPUTE_CUSTOM_TYPES */
 
 void load_query_candidate_hit(rayQueryEXT query, out ComputeHit hit) {
@@ -88,6 +108,7 @@ void load_query_candidate_hit(rayQueryEXT query, out ComputeHit hit) {
 	hit.object_to_world = mat4(rayQueryGetIntersectionObjectToWorldEXT(query, false));
 	hit.world_to_object = mat4(rayQueryGetIntersectionWorldToObjectEXT(query, false));
 	hit.front_face = rayQueryGetIntersectionFrontFaceEXT(query, false);
+	hit.procedural = false;
 }
 
 void load_query_committed_hit(rayQueryEXT query, out ComputeHit hit) {
@@ -98,12 +119,48 @@ void load_query_committed_hit(rayQueryEXT query, out ComputeHit hit) {
 	hit.object_to_world = mat4(rayQueryGetIntersectionObjectToWorldEXT(query, true));
 	hit.world_to_object = mat4(rayQueryGetIntersectionWorldToObjectEXT(query, true));
 	hit.front_face = rayQueryGetIntersectionFrontFaceEXT(query, true);
+	hit.procedural = false;
+	hit.hit_kind = hit.front_face ? 0xFEu : 0xFFu;
+}
+
+void load_query_committed_procedural_hit(rayQueryEXT query, ComputeProceduralHit procedural_hit, out ComputeHit hit) {
+	hit.t = rayQueryGetIntersectionTEXT(query, true);
+	hit.geometry_idx = rayQueryGetIntersectionInstanceCustomIndexEXT(query, true);
+	hit.primitive_idx = rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
+	hit.barycentrics = vec2(0.0);
+	hit.object_to_world = mat4(rayQueryGetIntersectionObjectToWorldEXT(query, true));
+	hit.world_to_object = mat4(rayQueryGetIntersectionWorldToObjectEXT(query, true));
+	mat3 normal_matrix = transpose(mat3(hit.world_to_object));
+	hit.front_face = dot(normalize(normal_matrix * procedural_hit.normal),
+							 -rayQueryGetWorldRayDirectionEXT(query)) > 0.0;
+	hit.procedural = true;
+	hit.hit_kind = procedural_hit.hit_kind;
+	hit.procedural_uv = procedural_hit.uv;
+	hit.procedural_normal = procedural_hit.normal;
+	hit.procedural_tangent = procedural_hit.tangent;
+	hit.procedural_prev_position = procedural_hit.prev_position;
+	hit.procedural_prev_position_valid = procedural_hit.prev_position_valid;
 }
 
 ComputeHitData compute_hit_data(ComputeHit hit, vec3 ray_origin, vec3 ray_direction) {
 	ComputeHitData result;
 	result.geometry_idx = hit.geometry_idx;
 	GeometryData geometry = geometries[hit.geometry_idx];
+	result.hit_pos = ray_origin + ray_direction * hit.t;
+
+	if (hit.procedural) {
+		result.uv = hit.procedural_uv;
+		result.color = vec4(1.0);
+		mat3 model_rotation = mat3(hit.object_to_world);
+		mat3 normal_matrix = transpose(mat3(hit.world_to_object));
+		result.geometry_normal = normalize(normal_matrix * hit.procedural_normal);
+		result.tangent = normalize(model_rotation * hit.procedural_tangent);
+		result.bitangent = normalize(cross(result.geometry_normal, result.tangent));
+		if (!hit.front_face) {
+			result.geometry_normal = -result.geometry_normal;
+		}
+		return result;
+	}
 
 	uint i0, i1, i2;
 	get_triangle_indices_ex(geometry, hit.primitive_idx, i0, i1, i2);
@@ -125,7 +182,6 @@ ComputeHitData compute_hit_data(ComputeHit hit, vec3 ray_origin, vec3 ray_direct
 		result.geometry_normal = -result.geometry_normal;
 	}
 
-	result.hit_pos = ray_origin + ray_direction * hit.t;
 	return result;
 }
 
@@ -174,6 +230,16 @@ MaterialResult evaluate_hg0(ComputeHitData hit) {
 
 /* RT_COMPUTE_CUSTOM_FUNCTIONS */
 
+bool evaluate_procedural_intersection(rayQueryEXT query, vec3 world_origin, vec3 world_direction, float max_distance, inout ComputeProceduralHit procedural_hit) {
+	uint geometry_idx = rayQueryGetIntersectionInstanceCustomIndexEXT(query, false);
+	MaterialData material = materials[geometry_idx];
+	switch (material.dispatch_index) {
+		/* RT_COMPUTE_PROCEDURAL_CASES */
+		default:
+			return false;
+	}
+}
+
 MaterialResult evaluate_material(ComputeHit hit, ComputeHitData hit_data, vec3 ray_direction) {
 	MaterialData material = materials[hit.geometry_idx];
 	switch (material.dispatch_index) {
@@ -207,39 +273,56 @@ bool ray_query_candidate_accepts(rayQueryEXT query, vec3 origin, vec3 direction)
 // ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT.
 bool trace_material(vec3 origin, vec3 direction, float max_distance, out ComputeHit hit) {
 	rayQueryEXT query;
+	ComputeProceduralHit procedural_hit;
+	procedural_hit.t = max_distance;
+	procedural_hit.valid = false;
 	rayQueryInitializeEXT(query, tlas, RT_RAY_FLAGS,
 			0xFF, origin, 0.001, direction, max_distance);
 	while (rayQueryProceedEXT(query)) {
-		if (rayQueryGetIntersectionTypeEXT(query, false) != gl_RayQueryCandidateIntersectionTriangleEXT) {
-			continue;
-		}
-		if (ray_query_candidate_accepts(query, origin, direction)) {
-			rayQueryConfirmIntersectionEXT(query);
+		uint candidate_type = rayQueryGetIntersectionTypeEXT(query, false);
+		if (candidate_type == gl_RayQueryCandidateIntersectionTriangleEXT) {
+			if (ray_query_candidate_accepts(query, origin, direction)) {
+				rayQueryConfirmIntersectionEXT(query);
+			}
+		} else if (candidate_type == gl_RayQueryCandidateIntersectionAABBEXT) {
+			evaluate_procedural_intersection(query, origin, direction, max_distance, procedural_hit);
 		}
 	}
 
-	if (rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
-		return false;
+	uint committed_type = rayQueryGetIntersectionTypeEXT(query, true);
+	if (committed_type == gl_RayQueryCommittedIntersectionTriangleEXT) {
+		load_query_committed_hit(query, hit);
+		return true;
 	}
-	load_query_committed_hit(query, hit);
-	return true;
+	if (committed_type == gl_RayQueryCommittedIntersectionGeneratedEXT && procedural_hit.valid) {
+		load_query_committed_procedural_hit(query, procedural_hit, hit);
+		return true;
+	}
+	return false;
 }
 
 // Shadow rays only need any confirmed hit, so they terminate on the first
 // alpha-accepted candidate instead of resolving the closest one.
 bool trace_shadow_blocked(vec3 origin, vec3 direction, float max_distance) {
 	rayQueryEXT query;
+	ComputeProceduralHit procedural_hit;
+	procedural_hit.t = max_distance;
+	procedural_hit.valid = false;
 	rayQueryInitializeEXT(query, tlas, RT_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT,
 			0xFF, origin, 0.001, direction, max_distance);
 	while (rayQueryProceedEXT(query)) {
-		if (rayQueryGetIntersectionTypeEXT(query, false) != gl_RayQueryCandidateIntersectionTriangleEXT) {
-			continue;
-		}
-		if (ray_query_candidate_accepts(query, origin, direction)) {
-			rayQueryConfirmIntersectionEXT(query);
+		uint candidate_type = rayQueryGetIntersectionTypeEXT(query, false);
+		if (candidate_type == gl_RayQueryCandidateIntersectionTriangleEXT) {
+			if (ray_query_candidate_accepts(query, origin, direction)) {
+				rayQueryConfirmIntersectionEXT(query);
+			}
+		} else if (candidate_type == gl_RayQueryCandidateIntersectionAABBEXT) {
+			evaluate_procedural_intersection(query, origin, direction, max_distance, procedural_hit);
 		}
 	}
-	return rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
+	uint committed_type = rayQueryGetIntersectionTypeEXT(query, true);
+	return committed_type == gl_RayQueryCommittedIntersectionTriangleEXT ||
+			committed_type == gl_RayQueryCommittedIntersectionGeneratedEXT;
 }
 
 // clang-format off
@@ -265,6 +348,9 @@ void write_primary_hit_outputs(uvec2 pixel, ComputeHit hit, ComputeHitData hit_d
 	int motion_index = motion_indices[hit.geometry_idx];
 	mat4 previous_model = motion_index >= 0 ? decode_prev_object_to_world(motion_index) : hit.object_to_world;
 	vec3 object_position = (hit.world_to_object * vec4(hit_data.hit_pos, 1.0)).xyz;
+	if (hit.procedural && hit.procedural_prev_position_valid) {
+		object_position = hit.procedural_prev_position;
+	}
 	vec3 previous_world_position = (previous_model * vec4(object_position, 1.0)).xyz;
 	vec2 current_uv = project_uv(hit_data.hit_pos, curr_vp_unjittered);
 	vec2 previous_uv = project_uv(previous_world_position, prev_vp_unjittered);
@@ -317,7 +403,7 @@ void main() {
 		[[dont_unroll]] for (uint bounce = 0u; bounce <= max_bounces; bounce++) {
 			ComputeHit hit;
 			if (!trace_material(ray_origin, ray_direction, 10000.0, hit)) {
-				if (visualization_mode == 23 || visualization_mode == 24 || visualization_mode == 25) {
+				if (visualization_mode == 23 || visualization_mode == 24 || visualization_mode == 25 || visualization_mode == 26) {
 					break;
 				}
 				if (sample_index == 0u && bounce == 0u) {
@@ -337,24 +423,24 @@ void main() {
 			}
 			if (visualization_mode == 23) {
 				uint encoded_id = pcg_hash(hit.geometry_idx + 1u);
-				radiance = vec3(0.2) + vec3(
-						float(encoded_id & 0xFFu),
-						float((encoded_id >> 8u) & 0xFFu),
-						float((encoded_id >> 16u) & 0xFFu)) * (0.8 / 255.0);
+				radiance = vec3(0.2) + vec3(float(encoded_id & 0xFFu), float((encoded_id >> 8u) & 0xFFu), float((encoded_id >> 16u) & 0xFFu)) * (0.8 / 255.0);
 				break;
 			} else if (visualization_mode == 24) {
 				uint encoded_id = pcg_hash(hit.primitive_idx + 1u);
-				radiance = vec3(0.2) + vec3(
-						float(encoded_id & 0xFFu),
-						float((encoded_id >> 8u) & 0xFFu),
-						float((encoded_id >> 16u) & 0xFFu)) * (0.8 / 255.0);
+				radiance = vec3(0.2) + vec3(float(encoded_id & 0xFFu), float((encoded_id >> 8u) & 0xFFu), float((encoded_id >> 16u) & 0xFFu)) * (0.8 / 255.0);
 				break;
 			} else if (visualization_mode == 25) {
 				uint encoded_id = pcg_hash(materials[hit.geometry_idx].material_id + 1u);
-				radiance = vec3(0.2) + vec3(
-						float(encoded_id & 0xFFu),
-						float((encoded_id >> 8u) & 0xFFu),
-						float((encoded_id >> 16u) & 0xFFu)) * (0.8 / 255.0);
+				radiance = vec3(0.2) + vec3(float(encoded_id & 0xFFu), float((encoded_id >> 8u) & 0xFFu), float((encoded_id >> 16u) & 0xFFu)) * (0.8 / 255.0);
+				break;
+			} else if (visualization_mode == 26) {
+				uint encoded_id = pcg_hash(hit.geometry_idx * 131u + hit.hit_kind + 1u);
+				vec3 identity = vec3(
+										float(encoded_id & 0xFFu),
+										float((encoded_id >> 8u) & 0xFFu),
+										float((encoded_id >> 16u) & 0xFFu)) /
+						255.0;
+				radiance = hit.procedural ? mix(vec3(0.75, 0.08, 0.08), identity, 0.35) : mix(vec3(0.08, 0.18, 0.75), identity, 0.35);
 				break;
 			}
 
@@ -410,7 +496,7 @@ void main() {
 			vec3 next_direction;
 			vec3 brdf_weight;
 			if (!evalIndirectCombinedBRDF(rand2(rng_state), shading_normal, hit_data.geometry_normal,
-					view_direction, brdf_material, brdf_type, next_direction, brdf_weight, vec4(0.0))) {
+						view_direction, brdf_material, brdf_type, next_direction, brdf_weight, vec4(0.0))) {
 				vec3 recovered_direction;
 				if (luminance(brdf_weight) == 0.0 ||
 						!recoverBelowHemisphereSample(next_direction, hit_data.geometry_normal, recovered_direction)) {

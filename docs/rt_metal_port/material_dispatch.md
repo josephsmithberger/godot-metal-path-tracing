@@ -1,8 +1,8 @@
 # Metal alpha and custom material dispatch (C15)
 
 Status: **Available** for the E2 material matrix. Human review of alpha edges,
-two-sided shading, texture sampling, and live editor updates is still required
-before widening the scope to C16.
+two-sided shading, texture sampling, and live editor updates is still required.
+C16 subsequently reuses this dispatch identity for procedural intersections.
 
 C15 uses generated/inlined material variants for the Metal compute ray-query
 lane. A Metal visible-function table was not selected: the existing Godot
@@ -88,8 +88,9 @@ C15 accepts direct custom vertex/fragment bodies with ordinary uniforms and
 2D textures. Stage-global custom helper functions need cross-material symbol
 namespacing and are deliberately rejected with an actionable diagnostic.
 Transparent blending, alpha-to-coverage/hash parity, screen/depth/normal
-texture reads, procedural AABBs, native denoising, and SER are not represented
-by this contract.
+texture reads, native denoising, and SER are not represented by this contract.
+Procedural AABBs are now covered separately by
+[`procedural_geometry.md`](procedural_geometry.md).
 
 ## Verification
 
