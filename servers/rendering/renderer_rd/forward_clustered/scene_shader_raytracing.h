@@ -109,6 +109,10 @@ public:
 		RT_FLAG_DENOISER_GUIDES_ENABLED = (1 << 1),
 		RT_FLAG_FOG_ENABLED = (1 << 2),
 		RT_FLAG_SER_ENABLED = (1 << 3),
+		// No material in the table can reject a traversal candidate; the
+		// compute-lane kernel compiles out the candidate alpha-test path and
+		// traverses with the opaque ray flag.
+		RT_FLAG_ALL_OPAQUE = (1 << 4),
 	};
 
 	constexpr static uint32_t RT_SAMPLE_COUNT_SHIFT = 21;

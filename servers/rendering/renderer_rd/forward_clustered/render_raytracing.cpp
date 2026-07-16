@@ -1734,12 +1734,21 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	// StandardMaterial3D cutouts use the same alpha-scissor parameter that its
 	// generated spatial shader writes. Custom shaders provide their threshold
 	// from the generated material evaluator instead.
+	// BaseMaterial3D stores the alpha_scissor_threshold param on every
+	// material (its constructor sets 0.5 unconditionally), but the generated
+	// shader only declares the uniform when the scissor transparency mode is
+	// active. Honor the param only when the shader declares it; otherwise
+	// every standard material would carry a spurious 0.5 threshold and the
+	// candidate alpha test would run on fully opaque scenes.
 	if (!mat_data->is_custom_shader) {
-		Variant alpha_scissor_var = material_storage->material_get_param(p_material_rid, "alpha_scissor_threshold");
-		if (alpha_scissor_var.get_type() == Variant::FLOAT) {
-			mat.alpha_scissor_threshold = CLAMP((float)alpha_scissor_var, 0.0f, 1.0f);
-			if (mat.alpha_scissor_threshold > 0.0f) {
-				mat.flags |= RT_MAT_FLAG_ALPHA_SCISSOR;
+		RendererRD::MaterialStorage::ShaderData *shader_data = material_storage->material_get_shader_data(p_material_rid);
+		if (shader_data != nullptr && shader_data->uniforms.has("alpha_scissor_threshold")) {
+			Variant alpha_scissor_var = material_storage->material_get_param(p_material_rid, "alpha_scissor_threshold");
+			if (alpha_scissor_var.get_type() == Variant::FLOAT) {
+				mat.alpha_scissor_threshold = CLAMP((float)alpha_scissor_var, 0.0f, 1.0f);
+				if (mat.alpha_scissor_threshold > 0.0f) {
+					mat.flags |= RT_MAT_FLAG_ALPHA_SCISSOR;
+				}
 			}
 		}
 	}
@@ -1857,6 +1866,26 @@ void RenderRaytracing::finalize_buffers(RTViewportState *p_state) {
 			geometry_data.ptr(), geometry_data.size() * sizeof(RT_GeometryData));
 	update_or_grow(p_state->material_buffer, p_state->material_buffer_capacity,
 			material_data.ptr(), material_data.size() * sizeof(RT_MaterialData));
+
+	// Mirrors the shader's candidate alpha test: a candidate can only be
+	// rejected when the material carries an alpha scissor or a non-HG0 custom
+	// dispatch. When no material can reject, RT_FLAG_ALL_OPAQUE lets the
+	// kernel fold the whole candidate-accept path out at pipeline compile.
+	const bool was_all_opaque = material_table_all_opaque;
+	material_table_all_opaque = true;
+	for (const RT_MaterialData &mat : material_data) {
+		if ((mat.flags & RT_MAT_FLAG_ALPHA_SCISSOR) != 0 ||
+				((mat.flags & RT_MAT_FLAG_CUSTOM_SHADER) != 0 && mat.dispatch_index != 0)) {
+			material_table_all_opaque = false;
+			if (OS::get_singleton()->get_environment("GODOT_RT_DUMP_OPAQUE") == "1") {
+				print_line(vformat("RT_OPAQUE_BLOCKER material_id=%d flags=0x%x dispatch=%d", mat.material_id, mat.flags, mat.dispatch_index));
+			}
+			break;
+		}
+	}
+	if (was_all_opaque != material_table_all_opaque && OS::get_singleton()->get_environment("GODOT_RT_DUMP_OPAQUE") == "1") {
+		print_line(vformat("RT_MATERIAL_TABLE all_opaque=%s materials=%d", material_table_all_opaque ? "true" : "false", material_data.size()));
+	}
 	update_or_grow(p_state->motion_index_buffer, p_state->motion_index_buffer_capacity,
 			motion_indices.ptr(), motion_indices.size() * sizeof(int32_t));
 	update_or_grow(p_state->motion_transform_buffer, p_state->motion_transform_buffer_capacity,

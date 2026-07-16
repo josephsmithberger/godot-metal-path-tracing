@@ -315,6 +315,13 @@ vec3 lights_evaluate_direct_lighting(
 			shadow_dist = max(0.0, t_center - dt);
 		}
 
+		// Backfacing early-out before paying the shadow ray: the BRDF below
+		// returns zero whenever NdotL <= 0 (Lbackfacing), so this only skips
+		// work that cannot contribute. The directional path already does this.
+		if (dot(N, L) <= 0.0) {
+			return vec3(0.0);
+		}
+
 		// Spot cone early-out.
 		float spot_atten = 1.0;
 		if (light.type == RT_LIGHT_TYPE_SPOT) {

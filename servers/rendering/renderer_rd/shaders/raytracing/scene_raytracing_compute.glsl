@@ -253,6 +253,12 @@ MaterialResult evaluate_material(ComputeHit hit, ComputeHitData hit_data, vec3 r
 // shader. Evaluate the selected inlined material before confirming each
 // candidate: this is the any-hit equivalent for alpha-scissored surfaces.
 bool ray_query_candidate_accepts(rayQueryEXT query, vec3 origin, vec3 direction) {
+	// Spec-constant fold: with an all-opaque material table no candidate can
+	// be rejected, so the inlined material evaluation below compiles out of
+	// both traversal loops entirely.
+	if ((RT_FLAGS & RT_FLAG_ALL_OPAQUE) != 0u) {
+		return true;
+	}
 	ComputeHit candidate;
 	load_query_candidate_hit(query, candidate);
 	MaterialData candidate_material = materials[candidate.geometry_idx];
@@ -278,11 +284,15 @@ bool ray_query_candidate_accepts(rayQueryEXT query, vec3 origin, vec3 direction)
 // step. Keep the two queries separate.
 rayQueryEXT rt_query;
 
+// With an all-opaque table, also traverse with the opaque ray flag so no
+// triangle candidate ever surfaces to the proceed loop. Spec-constant fold.
+#define RT_TRAVERSAL_FLAGS (((RT_FLAGS & RT_FLAG_ALL_OPAQUE) != 0u) ? (RT_RAY_FLAGS | gl_RayFlagsOpaqueEXT) : RT_RAY_FLAGS)
+
 bool trace_material(vec3 origin, vec3 direction, float max_distance, out ComputeHit hit) {
 	ComputeProceduralHit procedural_hit;
 	procedural_hit.t = max_distance;
 	procedural_hit.valid = false;
-	rayQueryInitializeEXT(rt_query, tlas, RT_RAY_FLAGS,
+	rayQueryInitializeEXT(rt_query, tlas, RT_TRAVERSAL_FLAGS,
 			0xFF, origin, 0.001, direction, max_distance);
 	while (rayQueryProceedEXT(rt_query)) {
 		uint candidate_type = rayQueryGetIntersectionTypeEXT(rt_query, false);
@@ -314,7 +324,7 @@ bool trace_shadow_blocked(vec3 origin, vec3 direction, float max_distance) {
 	procedural_hit.t = max_distance;
 	procedural_hit.valid = false;
 	rayQueryEXT shadow_query;
-	rayQueryInitializeEXT(shadow_query, tlas, RT_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT,
+	rayQueryInitializeEXT(shadow_query, tlas, RT_TRAVERSAL_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT,
 			0xFF, origin, 0.001, direction, max_distance);
 	while (rayQueryProceedEXT(shadow_query)) {
 		uint candidate_type = rayQueryGetIntersectionTypeEXT(shadow_query, false);
