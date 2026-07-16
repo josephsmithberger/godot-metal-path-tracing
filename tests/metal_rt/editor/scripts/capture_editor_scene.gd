@@ -5,11 +5,14 @@ const FIXTURE_REVISION := "e0-hg0-v1"
 const CAPTURE_SIZE := Vector2i(64, 64)
 const BEAUTY_FRAME := 120
 const INSTANCE_ID_FRAME := 150
+const BOX_RESIZE_START_FRAME := 10
+const BOX_RESIZE_ITERATIONS := 20
 const C17_MODE_WARMUP_FRAMES := 75
 const C17_TRANSITION_WARMUP_FRAMES := 60
 
 @onready var camera: Camera3D = $Camera
 @onready var environment: Environment = $WorldEnvironment.environment
+@onready var box_mesh: BoxMesh = $Box.mesh
 
 var capture_enabled := false
 var capture_frame := 0
@@ -17,6 +20,7 @@ var artifact_dir := ""
 var capture_label := "cold"
 var capture_viewport: Viewport
 var capture_camera: Camera3D
+var original_box_size := Vector3.ZERO
 var c17_enabled := false
 var c17_phase := ""
 var c17_phase_frame := 0
@@ -40,6 +44,7 @@ func _ready() -> void:
 		return
 	camera.look_at_from_position(Vector3(5.2, 3.8, 6.8), Vector3(0.0, 0.65, 0.0))
 	camera.make_current()
+	original_box_size = box_mesh.size
 	capture_viewport = get_viewport()
 	capture_camera = camera
 	if Engine.is_editor_hint():
@@ -73,6 +78,11 @@ func _process(_delta: float) -> void:
 		return
 	_configure_capture_camera()
 	capture_frame += 1
+	if capture_frame >= BOX_RESIZE_START_FRAME and capture_frame < BOX_RESIZE_START_FRAME + BOX_RESIZE_ITERATIONS:
+		var resize_step := capture_frame - BOX_RESIZE_START_FRAME + 1
+		box_mesh.size = original_box_size + Vector3(0.01 * resize_step, 0.0, 0.0)
+	elif capture_frame == BOX_RESIZE_START_FRAME + BOX_RESIZE_ITERATIONS:
+		box_mesh.size = original_box_size
 	if capture_frame == BEAUTY_FRAME:
 		_capture("beauty")
 		environment.pathtracing_debug_mode = Environment.RT_DEBUG_INSTANCE_ID

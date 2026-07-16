@@ -585,11 +585,15 @@ RTSurfaceData *RenderRaytracing::process_surface(
 	if (!entry->ptr) {
 		entry->ptr = memnew(RTSurfaceData);
 	} else if (entry->ptr->blas.is_valid()) {
-		if (entry->cached_rid_version == mesh_version) {
-			// Same mesh, surface data changed: BLAS is still live, free explicitly.
+		if (RD::get_singleton()->acceleration_structure_is_valid(entry->ptr->blas)) {
+			// A surface edit may replace its vertex or index buffer. RenderingDevice
+			// cascade-frees dependent BLAS RIDs when that happens, even though the
+			// mesh RID may stay unchanged. Only free the cached BLAS if it survived
+			// that dependency cleanup.
 			RD::get_singleton()->free_rid(entry->ptr->blas);
 		}
-		// Version mismatch: old mesh was deleted, BLAS already cascade-freed by RD.
+		// Whether freed above or by the dependency cascade, discard the handle
+		// before populating the replacement BLAS.
 		entry->ptr->blas = RID();
 	}
 
