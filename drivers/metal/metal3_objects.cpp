@@ -50,6 +50,7 @@
 
 #include "metal3_objects.h"
 
+#include "core/os/os.h"
 #include "drivers/metal/metal_utils.h"
 #include "drivers/metal/pixel_formats.h"
 #include "drivers/metal/rendering_device_driver_metal3.h"
@@ -1499,8 +1500,24 @@ void MDCommandBuffer::trace_rays(uint32_t p_width, uint32_t p_height, uint32_t p
 
 	_compute_set_dirty_state();
 
+	// GODOT_MTL_RT_TG=WxH overrides the reflected threadgroup shape for
+	// dispatch-shape experiments. The kernel derives its work solely from
+	// thread_position_in_grid and bounds-checks against the image size, so any
+	// covering shape is correct.
+	static const MTL::Size tg_override = []() {
+		Vector<String> parts = OS::get_singleton()->get_environment("GODOT_MTL_RT_TG").split("x");
+		if (parts.size() == 2) {
+			int64_t w = parts[0].to_int();
+			int64_t h = parts[1].to_int();
+			if (w > 0 && h > 0 && w * h <= 1024) {
+				return MTL::Size(w, h, 1);
+			}
+		}
+		return MTL::Size(0, 0, 0);
+	}();
+
 	// Threadgroups round up to cover the pixel grid; the kernel bounds-checks.
-	const MTL::Size local = pipeline->get_threads_per_threadgroup();
+	const MTL::Size local = tg_override.width != 0 ? tg_override : pipeline->get_threads_per_threadgroup();
 	MTL::Size groups = MTL::Size(
 			(p_width + local.width - 1) / local.width,
 			(p_height + local.height - 1) / local.height,

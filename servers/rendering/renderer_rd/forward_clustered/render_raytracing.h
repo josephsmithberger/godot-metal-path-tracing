@@ -462,6 +462,13 @@ class RenderRaytracing {
 
 	LocalVector<uint32_t> material_free_slots;
 	uint32_t next_material_slot = 0;
+	// Aggregate over the material table uploaded by finalize_buffers(): true
+	// when no material can reject a traversal candidate (no alpha scissor, no
+	// custom material dispatch). Trails the table by one frame -- rt_flags for
+	// frame N is computed before frame N's sync -- so a newly added alpha
+	// material renders opaque for a single frame before the specialized
+	// pipeline is dropped. Starts false so the first frame stays conservative.
+	bool material_table_all_opaque = false;
 	uint64_t vram_used = 0;
 	uint32_t cache_hits = 0;
 	uint32_t cache_misses = 0;
@@ -561,6 +568,8 @@ public:
 
 	RID get_bindless_uniform_set() const { return bindless_uniform_set; }
 	RID get_mat_ubo_pool_buffer() const { return mat_ubo_pool_buffer; }
+
+	bool is_material_table_all_opaque() const { return material_table_all_opaque; }
 
 	~RenderRaytracing();
 };
