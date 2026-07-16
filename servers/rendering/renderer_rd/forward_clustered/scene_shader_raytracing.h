@@ -138,6 +138,20 @@ public:
 		return result;
 	}
 
+	static inline uint32_t rt_flags_get_sample_count(uint32_t p_rt_flags) {
+		return (p_rt_flags >> RT_SAMPLE_COUNT_SHIFT) & RT_SAMPLE_COUNT_MASK;
+	}
+
+	static inline uint32_t rt_flags_get_max_bounces(uint32_t p_rt_flags) {
+		return ((p_rt_flags >> RT_MAX_BOUNCES_SHIFT) & RT_MAX_BOUNCES_MASK) + 1u;
+	}
+
+	// Replaces the packed quality fields, leaving every other flag bit intact.
+	static inline uint32_t rt_flags_with_quality(uint32_t p_rt_flags, uint32_t p_sample_count, uint32_t p_max_bounces) {
+		uint32_t flags = p_rt_flags & ~((RT_SAMPLE_COUNT_MASK << RT_SAMPLE_COUNT_SHIFT) | (RT_MAX_BOUNCES_MASK << RT_MAX_BOUNCES_SHIFT));
+		return rt_flags_pack(flags, p_sample_count, p_max_bounces);
+	}
+
 	// Build the full packed rt_flags from pathtracing environment params.
 	// `p_env_params` may be null (RT active with no pathtracing environment).
 	static uint32_t compute_rt_flags(const float *p_env_params, bool p_fog_enabled);

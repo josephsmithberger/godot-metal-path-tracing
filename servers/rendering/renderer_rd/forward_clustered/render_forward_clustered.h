@@ -114,10 +114,18 @@ public:
 #endif
 #ifdef METAL_MFXDENOISED_ENABLED
 		RendererRD::MFXDenoisedContext *mfx_denoised_context = nullptr;
+		// Constructing a MetalFX denoised scaler costs ~0.9s of main-thread time
+		// (MPSGraph specialization). Creation is not retried for a configuration
+		// that already failed, otherwise every frame pays that cost again.
+		bool mfx_denoised_failed = false;
 		PathtracingPresentationHistory mfx_denoised_presentation_history;
 #endif
 
 	public:
+		// Wall-clock time the editor viewport camera last moved, used to restore
+		// full path tracer quality once navigation settles. Zero means "never".
+		uint64_t pt_last_camera_motion_msec = 0;
+
 		ClusterBuilderRD *cluster_builder = nullptr;
 
 		struct SSEffectsData {
@@ -878,6 +886,7 @@ private:
 
 	/* Raytracing */
 	bool _setup_rt();
+	uint32_t _apply_editor_interactive_rt_quality(uint32_t p_rt_flags, const RenderDataRD *p_render_data, RenderBufferDataForwardClustered *p_rb_data);
 
 	/* Debug */
 	void _debug_draw_cluster(Ref<RenderSceneBuffersRD> p_render_buffers);

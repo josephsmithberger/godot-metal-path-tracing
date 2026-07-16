@@ -391,6 +391,11 @@ struct RTViewportState {
 	RID tlas;
 	uint32_t tlas_max_instances = 0;
 
+	// Instance array of the last committed tlas_build. A camera-only change
+	// leaves this identical, which lets the rebuild be skipped entirely.
+	LocalVector<RD::AccelerationStructureInstance> tlas_built_instances;
+	bool tlas_built = false;
+
 	RID geometry_buffer;
 	uint32_t geometry_buffer_capacity = 0;
 	RID material_buffer;
