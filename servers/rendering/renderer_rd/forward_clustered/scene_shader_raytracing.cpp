@@ -922,12 +922,12 @@ String SceneShaderRaytracing::_build_compute_material_function(uint32_t p_slot_i
 
 	const String suffix = itos(p_slot_index);
 	String source;
-	source += "MaterialResult evaluate_custom_" + suffix + "(ComputeHit hit, ComputeHitData hit_data, vec3 ray_direction) {\n";
+	source += "MaterialResult evaluate_custom_" + suffix + "(ComputeHit hit, ComputeHitData hit_data, mat4 object_to_world, mat4 world_to_object, vec3 ray_direction) {\n";
 	source += "\tMaterialData rt_mat = materials[hit.geometry_idx];\n";
 	if (p_entry.uniform_total_size > 0) {
 		source += "\tRTCustomMaterialUniforms_" + suffix + " material = RTCustomMaterialUniforms_" + suffix + "(rt_mat.uniform_address);\n";
 	}
-	source += "\tmat4 read_model_matrix = hit.object_to_world;\n";
+	source += "\tmat4 read_model_matrix = object_to_world;\n";
 	source += "\tmat4 read_view_matrix = transpose(mat4(scene_data_block.data.view_matrix[0], scene_data_block.data.view_matrix[1], scene_data_block.data.view_matrix[2], vec4(0.0, 0.0, 0.0, 1.0)));\n";
 	source += "\tmat4 inv_view_matrix = transpose(mat4(scene_data_block.data.inv_view_matrix[0], scene_data_block.data.inv_view_matrix[1], scene_data_block.data.inv_view_matrix[2], vec4(0.0, 0.0, 0.0, 1.0)));\n";
 	source += "\tmat4 projection_matrix = scene_data_block.data.projection_matrix;\n";
@@ -936,7 +936,7 @@ String SceneShaderRaytracing::_build_compute_material_function(uint32_t p_slot_i
 	source += "\tfloat global_time = scene_data_block.data.time;\n";
 	source += "\tfloat global_prev_time = scene_data_block.prev_data.time;\n";
 	source += "\tvec2 read_viewport_size = scene_data_block.data.viewport_size;\n";
-	source += "\tvec3 vertex = (hit.world_to_object * vec4(hit_data.hit_pos, 1.0)).xyz;\n";
+	source += "\tvec3 vertex = (world_to_object * vec4(hit_data.hit_pos, 1.0)).xyz;\n";
 	source += "\tvec3 normal = hit_data.geometry_normal;\n";
 	source += "\tvec3 tangent = hit_data.tangent;\n";
 	source += "\tvec3 binormal = hit_data.bitangent;\n";
@@ -1115,7 +1115,7 @@ String SceneShaderRaytracing::_build_compute_material_source(const LocalVector<u
 			return String();
 		}
 		functions += function;
-		cases += "case " + itos(i) + "u: return evaluate_custom_" + itos(i) + "(hit, hit_data, ray_direction);\n";
+		cases += "case " + itos(i) + "u: return evaluate_custom_" + itos(i) + "(hit, hit_data, object_to_world, world_to_object, ray_direction);\n";
 		if (entry.is_procedural) {
 			String procedural_function = _build_compute_procedural_function(i, entry);
 			if (procedural_function.is_empty()) {
