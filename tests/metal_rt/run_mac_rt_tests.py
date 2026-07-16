@@ -58,6 +58,7 @@ METAL_VALIDATION_ENVIRONMENT = {
 METAL_VALIDATION_FORBIDDEN_PATTERNS = (
     "Invalid device load",
     "Invalid device store",
+    "Attempted to free invalid ID",
 )
 
 
