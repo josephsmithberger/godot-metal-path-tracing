@@ -510,8 +510,8 @@ public:
 		}
 	} blit;
 
-	_FORCE_INLINE_ MTL::CommandBuffer *get_command_buffer() const {
-		return commandBuffer.get();
+	_FORCE_INLINE_ MTL::CommandBuffer *get_command_buffer() override {
+		return command_buffer();
 	}
 
 	void begin() override;

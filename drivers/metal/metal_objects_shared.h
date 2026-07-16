@@ -698,6 +698,10 @@ public:
 	virtual void commit() = 0;
 	virtual void end() = 0;
 
+	/// The underlying Metal command buffer, for effects and queries that encode
+	/// directly. Creates it if this is the first use in the frame.
+	virtual MTL::CommandBuffer *get_command_buffer() = 0;
+
 	virtual void bind_pipeline(RDD::PipelineID p_pipeline) = 0;
 	void encode_push_constant_data(RDD::ShaderID p_shader, VectorView<uint32_t> p_data);
 

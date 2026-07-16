@@ -3848,6 +3848,15 @@ void RenderingServer::init() {
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracer/multimesh_blas_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,18000,1"), 3600);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracer/multimesh_merged_blas_max_triangles", PROPERTY_HINT_RANGE, "256,1048576,1"), 65536);
 
+	// While an editor viewport camera is moving, the extra samples per pixel are
+	// spent on frames that are about to be discarded anyway. Dropping to a low
+	// sample count keeps navigation responsive and full quality is restored once
+	// the camera settles. Set the sample count to 0 to disable the behavior.
+	// This never applies to a running game, only to editor viewports.
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracer/editor_interactive_samples", PROPERTY_HINT_RANGE, "0,8,1"), 1);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracer/editor_interactive_max_bounces", PROPERTY_HINT_RANGE, "1,8,1"), 2);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracer/editor_interactive_settle_msec", PROPERTY_HINT_RANGE, "0,2000,1"), 200);
+
 	// OpenGL limits
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/limits/opengl/max_renderable_elements", PROPERTY_HINT_RANGE, "1024,65536,1"), 65536);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/limits/opengl/max_renderable_lights", PROPERTY_HINT_RANGE, "2,256,1"), 32);

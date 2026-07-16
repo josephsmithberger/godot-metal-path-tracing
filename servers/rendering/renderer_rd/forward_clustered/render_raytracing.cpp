@@ -1751,6 +1751,16 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 // Acceleration structure building
 // ---------------------------------------------------------------------------
 
+// Field-wise compare; the struct has padding, so memcmp would be unreliable.
+static bool _rt_instance_equal(const RD::AccelerationStructureInstance &p_a, const RD::AccelerationStructureInstance &p_b) {
+	return p_a.blas == p_b.blas &&
+			p_a.id == p_b.id &&
+			p_a.mask == p_b.mask &&
+			p_a.hit_sbt_range == p_b.hit_sbt_range &&
+			p_a.flags == p_b.flags &&
+			p_a.transform == p_b.transform;
+}
+
 void RenderRaytracing::build_acceleration_structures(RTViewportState *p_state, const LocalVector<RID> &p_dirty_blas_list, const LocalVector<RID> &p_dirty_blas_update_list) {
 	RENDER_TIMESTAMP("BLAS Build");
 
@@ -1769,6 +1779,7 @@ void RenderRaytracing::build_acceleration_structures(RTViewportState *p_state, c
 	RENDER_TIMESTAMP("TLAS Build");
 
 	uint32_t needed = MAX(blass.size(), (uint32_t)1);
+	bool tlas_recreated = false;
 	if (!p_state->tlas.is_valid() || needed > p_state->tlas_max_instances) {
 		if (p_state->tlas.is_valid()) {
 			RD::get_singleton()->free_rid(p_state->tlas);
@@ -1776,6 +1787,7 @@ void RenderRaytracing::build_acceleration_structures(RTViewportState *p_state, c
 		p_state->tlas_max_instances = needed * 2;
 		p_state->tlas = RD::get_singleton()->tlas_create(p_state->tlas_max_instances, RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
 		RD::get_singleton()->set_resource_name(p_state->tlas, "RT TLAS");
+		tlas_recreated = true;
 	}
 
 	LocalVector<RD::AccelerationStructureInstance> instances;
@@ -1791,7 +1803,29 @@ void RenderRaytracing::build_acceleration_structures(RTViewportState *p_state, c
 		inst.hit_sbt_range = RD::HitShaderBindingTableRange((1ULL << 32) | uint64_t(sbt_off));
 	}
 
+	// A rebuilt or refit BLAS can change the geometry bounds the TLAS was built
+	// against, so the TLAS is only reusable when no BLAS changed either.
+	bool reusable = p_state->tlas_built &&
+			!tlas_recreated &&
+			p_dirty_blas_list.is_empty() &&
+			p_dirty_blas_update_list.is_empty() &&
+			p_state->tlas_built_instances.size() == instances.size();
+	if (reusable) {
+		for (uint32_t i = 0; i < instances.size(); i++) {
+			if (!_rt_instance_equal(p_state->tlas_built_instances[i], instances[i])) {
+				reusable = false;
+				break;
+			}
+		}
+	}
+
+	if (reusable) {
+		return;
+	}
+
 	RD::get_singleton()->tlas_build(p_state->tlas, instances);
+	p_state->tlas_built_instances = instances;
+	p_state->tlas_built = true;
 }
 
 void RenderRaytracing::finalize_buffers(RTViewportState *p_state) {

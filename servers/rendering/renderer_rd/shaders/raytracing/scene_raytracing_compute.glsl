@@ -271,9 +271,11 @@ bool ray_query_candidate_accepts(rayQueryEXT query, vec3 origin, vec3 direction)
 // RT_RAY_FLAGS keeps back-face culling aligned with the Vulkan lanes;
 // double-sided materials override it per instance via
 // ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT.
-// Primary traversal and shadow visibility share one per-invocation query. The
-// generated Metal kernel otherwise keeps both large intersection_query objects
-// live for the entire kernel and can corrupt values across query traversals.
+// Primary traversal owns this query; shadow visibility uses its own local one.
+// Sharing a single query between them made SPIRV-Cross pass it by reference into
+// the shadow path, which forces the object into addressable thread memory and
+// costs ~20% of the pass -- the primary traversal then pays memory traffic per
+// step. Keep the two queries separate.
 rayQueryEXT rt_query;
 
 bool trace_material(vec3 origin, vec3 direction, float max_distance, out ComputeHit hit) {
@@ -311,19 +313,20 @@ bool trace_shadow_blocked(vec3 origin, vec3 direction, float max_distance) {
 	ComputeProceduralHit procedural_hit;
 	procedural_hit.t = max_distance;
 	procedural_hit.valid = false;
-	rayQueryInitializeEXT(rt_query, tlas, RT_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT,
+	rayQueryEXT shadow_query;
+	rayQueryInitializeEXT(shadow_query, tlas, RT_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT,
 			0xFF, origin, 0.001, direction, max_distance);
-	while (rayQueryProceedEXT(rt_query)) {
-		uint candidate_type = rayQueryGetIntersectionTypeEXT(rt_query, false);
+	while (rayQueryProceedEXT(shadow_query)) {
+		uint candidate_type = rayQueryGetIntersectionTypeEXT(shadow_query, false);
 		if (candidate_type == gl_RayQueryCandidateIntersectionTriangleEXT) {
-			if (ray_query_candidate_accepts(rt_query, origin, direction)) {
-				rayQueryConfirmIntersectionEXT(rt_query);
+			if (ray_query_candidate_accepts(shadow_query, origin, direction)) {
+				rayQueryConfirmIntersectionEXT(shadow_query);
 			}
 		} else if (candidate_type == gl_RayQueryCandidateIntersectionAABBEXT) {
-			evaluate_procedural_intersection(rt_query, origin, direction, max_distance, procedural_hit);
+			evaluate_procedural_intersection(shadow_query, origin, direction, max_distance, procedural_hit);
 		}
 	}
-	uint committed_type = rayQueryGetIntersectionTypeEXT(rt_query, true);
+	uint committed_type = rayQueryGetIntersectionTypeEXT(shadow_query, true);
 	return committed_type == gl_RayQueryCommittedIntersectionTriangleEXT ||
 			committed_type == gl_RayQueryCommittedIntersectionGeneratedEXT;
 }

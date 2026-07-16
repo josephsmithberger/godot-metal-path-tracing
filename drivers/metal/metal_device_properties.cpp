@@ -188,6 +188,13 @@ void MetalDeviceProperties::init_features(MTL::Device *p_device) {
 		features.supports_user_id_instances = features.supports_raytracing;
 	}
 
+	// Apple GPUs only sample counters at stage boundaries; draw/dispatch/blit
+	// boundary sampling reports unsupported, so timestamps have to be emitted by
+	// bracketing encoders rather than written at an arbitrary point in one.
+	if (__builtin_available(macOS 11.0, iOS 14.0, tvOS 16.0, *)) {
+		features.supports_timestamp_sampling = p_device->supportsCounterSampling(MTL::CounterSamplingPointAtStageBoundary);
+	}
+
 	if (__builtin_available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
 		features.metal_fx_spatial = MTLFX::SpatialScalerDescriptor::supportsDevice(p_device);
 #ifdef METAL_MFXTEMPORAL_ENABLED

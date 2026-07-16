@@ -2690,25 +2690,144 @@ void RenderingDeviceDriverMetal::command_trace_rays(CommandBufferID p_cmd_buffer
 // ----- TIMESTAMP -----
 
 RDD::QueryPoolID RenderingDeviceDriverMetal::timestamp_query_pool_create(uint32_t p_query_count) {
-	return QueryPoolID(1);
+	TimestampQueryPool *pool = memnew(TimestampQueryPool);
+	pool->count = p_query_count;
+
+	if (!device_properties->features.supports_timestamp_sampling || p_query_count == 0) {
+		return QueryPoolID(pool);
+	}
+
+	NS::Array *counter_sets = device->counterSets();
+	if (counter_sets == nullptr) {
+		return QueryPoolID(pool);
+	}
+
+	MTL::CounterSet *timestamp_set = nullptr;
+	for (NS::UInteger i = 0; i < counter_sets->count(); i++) {
+		MTL::CounterSet *set = counter_sets->object<MTL::CounterSet>(i);
+		if (set->name()->isEqualToString(MTL::CommonCounterSetTimestamp)) {
+			timestamp_set = set;
+			break;
+		}
+	}
+	if (timestamp_set == nullptr) {
+		return QueryPoolID(pool);
+	}
+
+	NS::SharedPtr<MTL::CounterSampleBufferDescriptor> desc = NS::TransferPtr(MTL::CounterSampleBufferDescriptor::alloc()->init());
+	desc->setCounterSet(timestamp_set);
+	desc->setSampleCount(p_query_count);
+	desc->setStorageMode(MTL::StorageModeShared);
+
+	NS::Error *error = nullptr;
+	pool->sample_buffer = NS::TransferPtr(device->newCounterSampleBuffer(desc.get(), &error));
+	if (!pool->sample_buffer) {
+		ERR_PRINT(vformat("Unable to create GPU timestamp sample buffer: %s", error != nullptr ? String(error->localizedDescription()->utf8String()) : String("unknown error")));
+	}
+
+	return QueryPoolID(pool);
 }
 
 void RenderingDeviceDriverMetal::timestamp_query_pool_free(QueryPoolID p_pool_id) {
+	TimestampQueryPool *pool = (TimestampQueryPool *)(p_pool_id.id);
+	ERR_FAIL_NULL(pool);
+	memdelete(pool);
 }
 
 void RenderingDeviceDriverMetal::timestamp_query_pool_get_results(QueryPoolID p_pool_id, uint32_t p_query_count, uint64_t *r_results) {
-	// Metal doesn't support timestamp queries, so we just clear the buffer.
-	bzero(r_results, p_query_count * sizeof(uint64_t));
+	TimestampQueryPool *pool = (TimestampQueryPool *)(p_pool_id.id);
+	if (pool == nullptr || !pool->sample_buffer || p_query_count == 0) {
+		bzero(r_results, p_query_count * sizeof(uint64_t));
+		return;
+	}
+
+	uint32_t count = MIN(p_query_count, pool->count);
+	// Autoreleased; taking ownership of it here would over-release at pool drain.
+	NS::Data *data = pool->sample_buffer->resolveCounterRange(NS::Range(0, count));
+	if (data == nullptr || data->length() < count * sizeof(MTL::CounterResultTimestamp)) {
+		bzero(r_results, p_query_count * sizeof(uint64_t));
+		return;
+	}
+
+	const MTL::CounterResultTimestamp *samples = static_cast<const MTL::CounterResultTimestamp *>(data->bytes());
+	for (uint32_t i = 0; i < count; i++) {
+		// A sample that never executed resolves to MTLCounterErrorValue. Reporting
+		// it verbatim would produce a nonsense delta, so it reads as zero instead.
+		r_results[i] = samples[i].timestamp == MTL::CounterErrorValue ? 0 : samples[i].timestamp;
+	}
+	for (uint32_t i = count; i < p_query_count; i++) {
+		r_results[i] = 0;
+	}
+}
+
+void RenderingDeviceDriverMetal::_timestamp_resolve_period() {
+	if (timestamp_period_resolved || !device_properties->features.supports_timestamp_sampling) {
+		return;
+	}
+
+	MTL::Timestamp cpu_now = 0;
+	MTL::Timestamp gpu_now = 0;
+	device->sampleTimestamps(&cpu_now, &gpu_now);
+
+	if (timestamp_correlation_cpu == 0) {
+		timestamp_correlation_cpu = cpu_now;
+		timestamp_correlation_gpu = gpu_now;
+		return;
+	}
+
+	// Wait for a baseline wide enough that clock granularity does not dominate
+	// the ratio; until then callers keep the 1.0 default.
+	const uint64_t cpu_delta = cpu_now - timestamp_correlation_cpu;
+	const uint64_t gpu_delta = gpu_now - timestamp_correlation_gpu;
+	if (cpu_delta < 100000000 || gpu_delta == 0) { // 100ms in nanoseconds.
+		return;
+	}
+
+	timestamp_period = double(cpu_delta) / double(gpu_delta);
+	timestamp_period_resolved = true;
 }
 
 uint64_t RenderingDeviceDriverMetal::timestamp_query_result_to_time(uint64_t p_result) {
-	return p_result;
+	_timestamp_resolve_period();
+	return uint64_t(double(p_result) * timestamp_period);
 }
 
 void RenderingDeviceDriverMetal::command_timestamp_query_pool_reset(CommandBufferID p_cmd_buffer, QueryPoolID p_pool_id, uint32_t p_query_count) {
 }
 
 void RenderingDeviceDriverMetal::command_timestamp_write(CommandBufferID p_cmd_buffer, QueryPoolID p_pool_id, uint32_t p_index) {
+	TimestampQueryPool *pool = (TimestampQueryPool *)(p_pool_id.id);
+	if (pool == nullptr || !pool->sample_buffer || p_index >= pool->count) {
+		return;
+	}
+
+	MDCommandBufferBase *cb = (MDCommandBufferBase *)(p_cmd_buffer.id);
+	MTL::CommandBuffer *command_buffer = cb->get_command_buffer();
+	if (command_buffer == nullptr) {
+		return;
+	}
+
+	if (!timestamp_keepalive_buffer) {
+		timestamp_keepalive_buffer = NS::TransferPtr(device->newBuffer(4, MTL::ResourceStorageModePrivate));
+		ERR_FAIL_COND(!timestamp_keepalive_buffer);
+	}
+
+	// Apple GPUs sample only at stage boundaries, so a blit encoder is opened
+	// purely to create a boundary to sample at. Closing the in-flight encoder
+	// first is what places that boundary at the requested point.
+	cb->end();
+
+	NS::SharedPtr<MTL::BlitPassDescriptor> desc = NS::TransferPtr(MTL::BlitPassDescriptor::alloc()->init());
+	MTL::BlitPassSampleBufferAttachmentDescriptor *attachment = desc->sampleBufferAttachments()->object(0);
+	attachment->setSampleBuffer(pool->sample_buffer.get());
+	attachment->setStartOfEncoderSampleIndex(p_index);
+	attachment->setEndOfEncoderSampleIndex(MTL::CounterDontSample);
+
+	MTL::BlitCommandEncoder *enc = command_buffer->blitCommandEncoder(desc.get());
+	if (enc != nullptr) {
+		enc->fillBuffer(timestamp_keepalive_buffer.get(), NS::Range(0, 4), 0);
+		enc->endEncoding();
+	}
 }
 
 #pragma mark - Labels

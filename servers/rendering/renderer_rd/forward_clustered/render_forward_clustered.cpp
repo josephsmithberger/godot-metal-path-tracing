@@ -30,7 +30,9 @@
 
 #include "render_forward_clustered.h"
 
+#include "core/config/engine.h"
 #include "core/config/project_settings.h"
+#include "core/os/os.h"
 #include "servers/rendering/renderer_rd/environment/fog.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h"
 #include "servers/rendering/renderer_rd/framebuffer_cache_rd.h"
@@ -233,6 +235,9 @@ bool RenderForwardClustered::RenderBufferDataForwardClustered::ensure_mfx_denois
 	if (mfx_denoised_context) {
 		return true;
 	}
+	if (mfx_denoised_failed) {
+		return false;
+	}
 
 	RendererRD::MFXDenoisedEffect::CreateParams params;
 	params.input_size = render_buffers->get_internal_size();
@@ -248,6 +253,7 @@ bool RenderForwardClustered::RenderBufferDataForwardClustered::ensure_mfx_denois
 	params.output_format = render_buffers->get_base_data_format();
 	params.motion_vector_scale = render_buffers->get_internal_size();
 	mfx_denoised_context = p_effect->create_context(params);
+	mfx_denoised_failed = mfx_denoised_context == nullptr;
 	return mfx_denoised_context != nullptr;
 }
 #endif
@@ -290,6 +296,8 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::free_data() {
 		memdelete(mfx_denoised_context);
 		mfx_denoised_context = nullptr;
 	}
+	// A reconfigure changes size/format, so a previous failure no longer applies.
+	mfx_denoised_failed = false;
 #endif
 
 	if (dlss_context) {
@@ -2250,6 +2258,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		const bool fog_enabled = p_render_data && p_render_data->environment.is_valid() && environment_get_fog_enabled(p_render_data->environment);
 		rt_flags = SceneShaderRaytracing::compute_rt_flags(env_params, fog_enabled);
 		rt_flags = raytracing->get_shader()->sanitize_rt_flags(rt_flags);
+		rt_flags = _apply_editor_interactive_rt_quality(rt_flags, p_render_data, rb_data.ptr());
 
 		const bool denoiser_guides_enabled = (rt_flags & SceneShaderRaytracing::RT_FLAG_DENOISER_GUIDES_ENABLED) != 0;
 		if (denoiser_guides_enabled) {
@@ -5783,6 +5792,46 @@ void RenderForwardClustered::_update_shader_quality_settings() {
 }
 
 // Raytracing methods
+
+uint32_t RenderForwardClustered::_apply_editor_interactive_rt_quality(uint32_t p_rt_flags, const RenderDataRD *p_render_data, RenderBufferDataForwardClustered *p_rb_data) {
+#ifdef TOOLS_ENABLED
+	// A running game is a separate process, so this only ever affects viewports
+	// rendered inside the editor.
+	if (!Engine::get_singleton()->is_editor_hint() || p_rb_data == nullptr || p_render_data == nullptr || p_render_data->scene_data == nullptr) {
+		return p_rt_flags;
+	}
+
+	const int interactive_samples = GLOBAL_GET_CACHED(int, "rendering/pathtracer/editor_interactive_samples");
+	if (interactive_samples <= 0) {
+		return p_rt_flags;
+	}
+
+	const uint64_t settle_msec = uint64_t(MAX(0, GLOBAL_GET_CACHED(int, "rendering/pathtracer/editor_interactive_settle_msec")));
+	const uint64_t now_msec = OS::get_singleton()->get_ticks_msec();
+
+	// The camera is the only thing checked here: a moving camera invalidates the
+	// accumulated path tracer history anyway, so those samples are discarded.
+	const bool camera_moved =
+			!p_render_data->scene_data->cam_transform.is_equal_approx(p_render_data->scene_data->prev_cam_transform) ||
+			p_render_data->scene_data->cam_projection != p_render_data->scene_data->prev_cam_projection;
+	if (camera_moved) {
+		p_rb_data->pt_last_camera_motion_msec = now_msec;
+	}
+
+	if (p_rb_data->pt_last_camera_motion_msec == 0 || now_msec - p_rb_data->pt_last_camera_motion_msec > settle_msec) {
+		return p_rt_flags;
+	}
+
+	const int interactive_bounces = GLOBAL_GET_CACHED(int, "rendering/pathtracer/editor_interactive_max_bounces");
+	// Only ever reduce; a scene authored below the interactive budget keeps its
+	// own values rather than being scaled up while navigating.
+	const uint32_t samples = MIN((uint32_t)interactive_samples, SceneShaderRaytracing::rt_flags_get_sample_count(p_rt_flags));
+	const uint32_t bounces = MIN((uint32_t)interactive_bounces, SceneShaderRaytracing::rt_flags_get_max_bounces(p_rt_flags));
+	return SceneShaderRaytracing::rt_flags_with_quality(p_rt_flags, samples, bounces);
+#else
+	return p_rt_flags;
+#endif
+}
 
 bool RenderForwardClustered::_setup_rt() {
 	const bool supports_pipeline = RD::get_singleton()->has_feature(RD::SUPPORTS_RAYTRACING_PIPELINE);

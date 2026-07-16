@@ -125,6 +125,7 @@ struct API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0)) MetalFeatures {
 	bool supports_raytracing = false; /**< If true, the device supports acceleration structures and the MSL intersector intrinsics. */
 	bool supports_function_pointers = false; /**< If true, visible function tables and function pointers are supported in compute pipelines. */
 	bool supports_user_id_instances = false; /**< If true, TLAS instance descriptors can carry a shader-visible user ID (macOS 12+). */
+	bool supports_timestamp_sampling = false; /**< If true, GPU timestamps can be sampled at encoder stage boundaries. */
 
 	/*!
 	 * Check if argument buffers are fully supported, which requires tier 2 support and no need for argument encoders.

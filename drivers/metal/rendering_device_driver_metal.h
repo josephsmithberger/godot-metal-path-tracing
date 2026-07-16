@@ -522,6 +522,29 @@ public:
 
 	// ----- TIMESTAMP -----
 
+	/// Backing store for a Godot timestamp query pool.
+	///
+	/// `sample_buffer` is null when the device cannot sample counters, in which
+	/// case results resolve to zero and the pool behaves as an inert stub.
+	struct TimestampQueryPool {
+		NS::SharedPtr<MTL::CounterSampleBuffer> sample_buffer;
+		uint32_t count = 0;
+	};
+
+	/// GPU ticks are converted to nanoseconds with a scale derived from a pair of
+	/// CPU/GPU correlation samples taken far enough apart to be meaningful. On
+	/// Apple Silicon both clocks share a timebase and the scale settles at 1.0.
+	double timestamp_period = 1.0;
+	bool timestamp_period_resolved = false;
+	MTL::Timestamp timestamp_correlation_cpu = 0;
+	MTL::Timestamp timestamp_correlation_gpu = 0;
+	void _timestamp_resolve_period();
+
+	/// A blit encoder that carries no commands is dropped before it executes, and
+	/// its stage-boundary sample never lands. Each sampling encoder writes to this
+	/// scratch buffer purely so it survives to produce a timestamp.
+	NS::SharedPtr<MTL::Buffer> timestamp_keepalive_buffer;
+
 	// Basic.
 	virtual QueryPoolID timestamp_query_pool_create(uint32_t p_query_count) override final;
 	virtual void timestamp_query_pool_free(QueryPoolID p_pool_id) override final;

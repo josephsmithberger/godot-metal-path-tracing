@@ -737,17 +737,34 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 			ERR_FAIL_V_MSG(false, "Failed to compile stage " + String(RDC::SHADER_STAGE_NAMES[stage]) + ": " + e.what());
 		}
 
-		// Apple GPUs can corrupt values kept live across the primary and shadow
-		// intersection queries when SPIRV-Cross force-inlines direct lighting into
-		// the entry point. Keep the secondary traversal behind a function boundary.
+		// Pushing direct lighting behind a function boundary costs ~2x on the path
+		// tracer: SPIRV-Cross then passes the intersection query by reference, which
+		// forces the query object into addressable thread memory and makes the
+		// primary traversal pay memory traffic per step. It was originally added to
+		// stop value corruption across the primary and shadow queries, but that came
+		// from both traversals sharing one query object; they now each own one
+		// (see scene_raytracing_compute.glsl), so inlining is the default.
+		// GODOT_MTL_RT_NOINLINE_LIGHTS=1 restores the old codegen if corruption
+		// resurfaces on hardware this was not verified against.
 		static constexpr char direct_lighting_inline[] =
 				"static inline __attribute__((always_inline))\nfloat3 lights_evaluate_direct_lighting";
 		static constexpr char direct_lighting_noinline[] =
 				"static __attribute__((noinline))\nfloat3 lights_evaluate_direct_lighting";
-		if (source.find("raytracing::intersection_query") != std::string::npos) {
+		if (source.find("raytracing::intersection_query") != std::string::npos &&
+				OS::get_singleton()->get_environment("GODOT_MTL_RT_NOINLINE_LIGHTS") == "1") {
 			size_t position = source.find(direct_lighting_inline);
 			if (position != std::string::npos) {
 				source.replace(position, sizeof(direct_lighting_inline) - 1, direct_lighting_noinline);
+			}
+		}
+
+		// Writes the generated MSL to GODOT_MTL_DUMP_MSL for offline inspection.
+		if (String dump_dir = OS::get_singleton()->get_environment("GODOT_MTL_DUMP_MSL"); !dump_dir.is_empty()) {
+			String name = String(shader_name.get_data()).validate_filename();
+			String path = dump_dir.path_join(vformat("%s.%s.%d.metal", name, RDC::SHADER_STAGE_NAMES[stage], i));
+			Ref<FileAccess> f = FileAccess::open(path, FileAccess::WRITE);
+			if (f.is_valid()) {
+				f->store_string(String::utf8(source.c_str()));
 			}
 		}
 
