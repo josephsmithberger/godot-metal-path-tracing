@@ -63,8 +63,6 @@ struct ComputeHit {
 	uint geometry_idx;
 	uint primitive_idx;
 	vec2 barycentrics;
-	mat4 object_to_world;
-	mat4 world_to_object;
 	bool front_face;
 	bool procedural;
 	uint hit_kind;
@@ -105,8 +103,6 @@ void load_query_candidate_hit(rayQueryEXT query, out ComputeHit hit) {
 	hit.geometry_idx = rayQueryGetIntersectionInstanceCustomIndexEXT(query, false);
 	hit.primitive_idx = rayQueryGetIntersectionPrimitiveIndexEXT(query, false);
 	hit.barycentrics = rayQueryGetIntersectionBarycentricsEXT(query, false);
-	hit.object_to_world = mat4(rayQueryGetIntersectionObjectToWorldEXT(query, false));
-	hit.world_to_object = mat4(rayQueryGetIntersectionWorldToObjectEXT(query, false));
 	hit.front_face = rayQueryGetIntersectionFrontFaceEXT(query, false);
 	hit.procedural = false;
 }
@@ -116,8 +112,6 @@ void load_query_committed_hit(rayQueryEXT query, out ComputeHit hit) {
 	hit.geometry_idx = rayQueryGetIntersectionInstanceCustomIndexEXT(query, true);
 	hit.primitive_idx = rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
 	hit.barycentrics = rayQueryGetIntersectionBarycentricsEXT(query, true);
-	hit.object_to_world = mat4(rayQueryGetIntersectionObjectToWorldEXT(query, true));
-	hit.world_to_object = mat4(rayQueryGetIntersectionWorldToObjectEXT(query, true));
 	hit.front_face = rayQueryGetIntersectionFrontFaceEXT(query, true);
 	hit.procedural = false;
 	hit.hit_kind = hit.front_face ? 0xFEu : 0xFFu;
@@ -128,9 +122,7 @@ void load_query_committed_procedural_hit(rayQueryEXT query, ComputeProceduralHit
 	hit.geometry_idx = rayQueryGetIntersectionInstanceCustomIndexEXT(query, true);
 	hit.primitive_idx = rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
 	hit.barycentrics = vec2(0.0);
-	hit.object_to_world = mat4(rayQueryGetIntersectionObjectToWorldEXT(query, true));
-	hit.world_to_object = mat4(rayQueryGetIntersectionWorldToObjectEXT(query, true));
-	mat3 normal_matrix = transpose(mat3(hit.world_to_object));
+	mat3 normal_matrix = transpose(mat3(rayQueryGetIntersectionWorldToObjectEXT(query, true)));
 	hit.front_face = dot(normalize(normal_matrix * procedural_hit.normal),
 							 -rayQueryGetWorldRayDirectionEXT(query)) > 0.0;
 	hit.procedural = true;
@@ -142,7 +134,11 @@ void load_query_committed_procedural_hit(rayQueryEXT query, ComputeProceduralHit
 	hit.procedural_prev_position_valid = procedural_hit.prev_position_valid;
 }
 
-ComputeHitData compute_hit_data(ComputeHit hit, vec3 ray_origin, vec3 ray_direction) {
+// The instance transforms are passed in from the ray query at each call site
+// instead of being copied into ComputeHit: keeping two mat4s (~32 scalars) in
+// the hit struct made them live across the whole shading block and cost
+// register pressure. Callers read them with a compile-time committed flag.
+ComputeHitData compute_hit_data(ComputeHit hit, mat4 object_to_world, mat4 world_to_object, vec3 ray_origin, vec3 ray_direction) {
 	ComputeHitData result;
 	result.geometry_idx = hit.geometry_idx;
 	GeometryData geometry = geometries[hit.geometry_idx];
@@ -151,8 +147,8 @@ ComputeHitData compute_hit_data(ComputeHit hit, vec3 ray_origin, vec3 ray_direct
 	if (hit.procedural) {
 		result.uv = hit.procedural_uv;
 		result.color = vec4(1.0);
-		mat3 model_rotation = mat3(hit.object_to_world);
-		mat3 normal_matrix = transpose(mat3(hit.world_to_object));
+		mat3 model_rotation = mat3(object_to_world);
+		mat3 normal_matrix = transpose(mat3(world_to_object));
 		result.geometry_normal = normalize(normal_matrix * hit.procedural_normal);
 		result.tangent = normalize(model_rotation * hit.procedural_tangent);
 		result.bitangent = normalize(cross(result.geometry_normal, result.tangent));
@@ -170,7 +166,7 @@ ComputeHitData compute_hit_data(ComputeHit hit, vec3 ray_origin, vec3 ray_direct
 	result.color = fetch_color(geometry, i0, i1, i2, bary);
 
 	TBNResult tbn = fetch_tbn(geometry, i0, i1, i2, bary);
-	mat3 model_rotation = mat3(hit.object_to_world);
+	mat3 model_rotation = mat3(object_to_world);
 	mat3 normal_matrix = mat3(
 			normalize(model_rotation[0]),
 			normalize(model_rotation[1]),
@@ -240,7 +236,7 @@ bool evaluate_procedural_intersection(rayQueryEXT query, vec3 world_origin, vec3
 	}
 }
 
-MaterialResult evaluate_material(ComputeHit hit, ComputeHitData hit_data, vec3 ray_direction) {
+MaterialResult evaluate_material(ComputeHit hit, ComputeHitData hit_data, mat4 object_to_world, mat4 world_to_object, vec3 ray_direction) {
 	MaterialData material = materials[hit.geometry_idx];
 	switch (material.dispatch_index) {
 		/* RT_COMPUTE_CUSTOM_CASES */
@@ -269,8 +265,10 @@ bool ray_query_candidate_accepts(rayQueryEXT query, vec3 origin, vec3 direction)
 	if (!needs_alpha_test) {
 		return true;
 	}
-	ComputeHitData candidate_data = compute_hit_data(candidate, origin, direction);
-	MaterialResult evaluated = evaluate_material(candidate, candidate_data, direction);
+	mat4 candidate_object_to_world = mat4(rayQueryGetIntersectionObjectToWorldEXT(query, false));
+	mat4 candidate_world_to_object = mat4(rayQueryGetIntersectionWorldToObjectEXT(query, false));
+	ComputeHitData candidate_data = compute_hit_data(candidate, candidate_object_to_world, candidate_world_to_object, origin, direction);
+	MaterialResult evaluated = evaluate_material(candidate, candidate_data, candidate_object_to_world, candidate_world_to_object, direction);
 	return !(evaluated.alpha_scissor_threshold > 0.0 && evaluated.alpha < evaluated.alpha_scissor_threshold);
 }
 
@@ -362,8 +360,10 @@ void write_primary_hit_outputs(uvec2 pixel, ComputeHit hit, ComputeHitData hit_d
 	imageStore(rt_depth_image, ivec2(pixel), vec4(clip.z / clip.w));
 
 	int motion_index = motion_indices[hit.geometry_idx];
-	mat4 previous_model = motion_index >= 0 ? decode_prev_object_to_world(motion_index) : hit.object_to_world;
-	vec3 object_position = (hit.world_to_object * vec4(hit_data.hit_pos, 1.0)).xyz;
+	// Only ever called on a hit still committed in rt_query, so the instance
+	// transforms are read from the query here instead of carried in ComputeHit.
+	mat4 previous_model = motion_index >= 0 ? decode_prev_object_to_world(motion_index) : mat4(rayQueryGetIntersectionObjectToWorldEXT(rt_query, true));
+	vec3 object_position = (mat4(rayQueryGetIntersectionWorldToObjectEXT(rt_query, true)) * vec4(hit_data.hit_pos, 1.0)).xyz;
 	if (hit.procedural && hit.procedural_prev_position_valid) {
 		object_position = hit.procedural_prev_position;
 	}
@@ -443,7 +443,10 @@ void main() {
 				break;
 			}
 
-			ComputeHitData hit_data = compute_hit_data(hit, ray_origin, ray_direction);
+			ComputeHitData hit_data = compute_hit_data(hit,
+					mat4(rayQueryGetIntersectionObjectToWorldEXT(rt_query, true)),
+					mat4(rayQueryGetIntersectionWorldToObjectEXT(rt_query, true)),
+					ray_origin, ray_direction);
 			if (sample_index == 0u && bounce == 0u) {
 				write_primary_hit_outputs(pixel, hit, hit_data);
 			}
@@ -470,7 +473,10 @@ void main() {
 				break;
 			}
 
-			MaterialResult material = evaluate_material(hit, hit_data, ray_direction);
+			MaterialResult material = evaluate_material(hit, hit_data,
+					mat4(rayQueryGetIntersectionObjectToWorldEXT(rt_query, true)),
+					mat4(rayQueryGetIntersectionWorldToObjectEXT(rt_query, true)),
+					ray_direction);
 			vec3 view_direction = -ray_direction;
 			vec3 shading_normal = clampShadingNormal(material.normal, hit_data.geometry_normal,
 					view_direction, RT_SHADING_NORMAL_CLAMP_THRESHOLD);
