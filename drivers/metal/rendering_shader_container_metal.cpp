@@ -737,22 +737,51 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 			ERR_FAIL_V_MSG(false, "Failed to compile stage " + String(RDC::SHADER_STAGE_NAMES[stage]) + ": " + e.what());
 		}
 
-		// Apple's Metal compiler can corrupt radiance values when direct lighting
-		// and its shadow-ray traversal are inlined into the path-tracing kernel.
+		// Apple's Metal compiler can corrupt radiance values when the shadow-ray
+		// intersection-query traversal is inlined into the path-tracing kernel.
 		// This occurs with either one shared intersection query or separate primary
-		// and shadow queries. Keep the traversal behind a function boundary by
-		// default; shader validation masks the issue by changing register allocation.
-		// GODOT_MTL_RT_INLINE_LIGHTS=1 restores the faster, known-unsafe codegen for
-		// controlled performance experiments only.
-		static constexpr char direct_lighting_inline[] =
-				"static inline __attribute__((always_inline))\nfloat3 lights_evaluate_direct_lighting";
-		static constexpr char direct_lighting_noinline[] =
-				"static __attribute__((noinline))\nfloat3 lights_evaluate_direct_lighting";
-		if (source.find("raytracing::intersection_query") != std::string::npos &&
-				OS::get_singleton()->get_environment("GODOT_MTL_RT_INLINE_LIGHTS") != "1") {
-			size_t position = source.find(direct_lighting_inline);
-			if (position != std::string::npos) {
-				source.replace(position, sizeof(direct_lighting_inline) - 1, direct_lighting_noinline);
+		// and shadow queries. Keep the shadow traversal behind a function boundary
+		// by default; shader validation masks the issue by changing register
+		// allocation. GODOT_MTL_RT_NOINLINE selects the boundary for controlled
+		// experiments: "shadow" (default) marks only trace_shadow_blocked noinline,
+		// "lights" restores the wider (slower) boundary around all direct lighting,
+		// "none" fully inlines (fastest, known to corrupt).
+		if (source.find("raytracing::intersection_query") != std::string::npos) {
+			String noinline_mode = OS::get_singleton()->get_environment("GODOT_MTL_RT_NOINLINE");
+			if (noinline_mode.is_empty()) {
+				noinline_mode = "shadow";
+			}
+			static constexpr char always_inline_attr[] = "static inline __attribute__((always_inline))\n";
+			static constexpr char noinline_attr[] = "static __attribute__((noinline))\n";
+			const char *noinline_function = nullptr;
+			if (noinline_mode == "lights") {
+				noinline_function = "float3 lights_evaluate_direct_lighting";
+			} else if (noinline_mode == "shadow") {
+				noinline_function = "bool trace_shadow_blocked";
+			}
+			if (noinline_function != nullptr) {
+				std::string inline_decl = std::string(always_inline_attr) + noinline_function;
+				size_t position = source.find(inline_decl);
+				if (position != std::string::npos) {
+					source.replace(position, inline_decl.size(), std::string(noinline_attr) + noinline_function);
+				}
+			}
+			// In shadow mode, additionally turn the hoisted by-reference shadow
+			// query parameter into a function-local so the traversal state stays
+			// register-allocated inside the noinline callee instead of paying
+			// thread-memory traffic against main's frame.
+			if (noinline_mode == "shadow" && OS::get_singleton()->get_environment("GODOT_MTL_RT_SHADOW_REF") != "1") {
+				static constexpr char query_param[] = "& shadow_query)\n{";
+				static constexpr char query_local[] =
+						"& shadow_query_hoisted_unused)\n{\n"
+						"    raytracing::intersection_query<raytracing::instancing, raytracing::triangle_data> shadow_query;";
+				size_t decl_pos = source.find("bool trace_shadow_blocked(");
+				if (decl_pos != std::string::npos) {
+					size_t param_pos = source.find(query_param, decl_pos);
+					if (param_pos != std::string::npos) {
+						source.replace(param_pos, sizeof(query_param) - 1, query_local);
+					}
+				}
 			}
 		}
 

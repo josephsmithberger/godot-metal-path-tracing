@@ -30,6 +30,7 @@
 
 #include "core/config/project_settings.h"
 #include "core/math/math_funcs.h"
+#include "core/os/os.h"
 #include "servers/rendering/renderer_rd/environment/sky.h"
 #include "servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h"
@@ -3433,5 +3434,39 @@ void RenderRaytracing::copy_output_texture(const RenderDataRD *p_render_data) {
 		RID src = rb_data->rt_get_texture();
 		RID dst = rb->get_internal_texture(v);
 		owner->copy_effects->copy_to_rect(src, dst, Rect2i(0, 0, rb->get_internal_size().x, rb->get_internal_size().y), false, false, false, false, false, true);
+	}
+
+	// Debug: read the raw RGBA16F path-tracer output back and count pixels with
+	// an exact-zero color channel (the sparse-speckle compiler-corruption
+	// signature). Enabled with GODOT_DBG_DUMP_RT=1; reads back every 30 frames
+	// which forces a GPU sync, so debug only.
+	static const bool dump_rt = OS::get_singleton()->get_environment("GODOT_DBG_DUMP_RT") == "1";
+	if (dump_rt) {
+		static uint64_t rt_dump_frame = 0;
+		rt_dump_frame++;
+		if (rt_dump_frame % 10 == 0) {
+			Vector<uint8_t> data = RD::get_singleton()->texture_get_data(rb_data->rt_get_texture(), 0);
+			Size2i size = rb->get_internal_size();
+			const uint16_t *px = (const uint16_t *)data.ptr();
+			uint64_t total = (uint64_t)size.x * size.y;
+			uint64_t zero_channel = 0;
+			uint64_t nonfinite = 0;
+			if (data.size() >= (int64_t)(total * 8)) {
+				for (uint64_t p = 0; p < total; p++) {
+					float r = Math::half_to_float(px[p * 4 + 0]);
+					float g = Math::half_to_float(px[p * 4 + 1]);
+					float b = Math::half_to_float(px[p * 4 + 2]);
+					if (!Math::is_finite(r) || !Math::is_finite(g) || !Math::is_finite(b)) {
+						nonfinite++;
+					}
+					bool any_zero = (r == 0.0f) || (g == 0.0f) || (b == 0.0f);
+					bool all_zero = (r == 0.0f) && (g == 0.0f) && (b == 0.0f);
+					if (any_zero && !all_zero) {
+						zero_channel++;
+					}
+				}
+			}
+			print_line(vformat("RT_RAW_DUMP frame=%d zero_channel=%d nonfinite=%d total=%d", rt_dump_frame, zero_channel, nonfinite, total));
+		}
 	}
 }
