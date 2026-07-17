@@ -1326,6 +1326,18 @@ bool RenderRaytracing::update_procedural_blas(RTProceduralState *p_state, LocalV
 		needs_new_blas = !p_state->blas.is_valid();
 	}
 
+	// Refit-capable acceleration structures trade traversal quality for update
+	// speed, so a BLAS is first built without ALLOW_UPDATE. The first in-place
+	// mutation rebuilds it refit-capable; later mutations then refit as before.
+	// Static procedural geometry keeps the faster non-refittable BVH forever.
+	if (!needs_new_blas && p_state->blas.is_valid() && p_state->blas_built_once && !p_state->blas_allow_update) {
+		RD::get_singleton()->free_rid(p_state->blas);
+		p_state->blas = RID();
+		p_state->blas_built_once = false;
+		p_state->blas_allow_update = true;
+		needs_new_blas = true;
+	}
+
 	if (needs_new_blas) {
 		ERR_FAIL_COND_V(!p_state->gpu_buffer.is_valid(), false);
 
@@ -1334,9 +1346,11 @@ bool RenderRaytracing::update_procedural_blas(RTProceduralState *p_state, LocalV
 		geom.geometry.aabbs.buffer = p_state->gpu_buffer;
 		geom.geometry.aabbs.count = aabb_count;
 		geom.geometry.aabbs.stride = 24; // VkAabbPositionsKHR: two float3 (min, max).
-		p_state->blas = RD::get_singleton()->blas_create({ &geom, 1 },
-				RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT |
-						RD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT);
+		BitField<RD::AccelerationStructureFlagBits> as_flags = RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT;
+		if (p_state->blas_allow_update) {
+			as_flags.set_flag(RD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT);
+		}
+		p_state->blas = RD::get_singleton()->blas_create({ &geom, 1 }, as_flags);
 		p_state->blas_built_once = false;
 	}
 
@@ -2237,6 +2251,17 @@ bool RenderRaytracing::_build_merged_mm_blas(
 	}
 
 	// --- Build or refit the merged BLAS (uses merged_vtx_buffer for positions) ---
+	// Refit-capable acceleration structures trade traversal quality for update
+	// speed, so the merged BLAS is first built without ALLOW_UPDATE. The first
+	// mutation after that rebuilds it refit-capable; later mutations then refit.
+	// Static multimeshes keep the faster non-refittable BVH forever.
+	if (needs_rebake && entry.blas.is_valid() && entry.blas_built_once && !entry.blas_allow_update) {
+		rd->free_rid(entry.blas);
+		entry.blas = RID();
+		entry.blas_built_once = false;
+		entry.blas_allow_update = true;
+	}
+
 	if (!entry.blas.is_valid()) {
 		RD::AccelerationStructureGeometry as_geom;
 		as_geom.type = RD::AccelerationStructureGeometry::TYPE_TRIANGLES;
@@ -2250,9 +2275,10 @@ bool RenderRaytracing::_build_merged_mm_blas(
 			as_geom.geometry.triangles.index_count = p_mm_count * index_count;
 		}
 
-		BitField<RD::AccelerationStructureFlagBits> as_flags =
-				RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT |
-				RD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT;
+		BitField<RD::AccelerationStructureFlagBits> as_flags = RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT;
+		if (entry.blas_allow_update) {
+			as_flags.set_flag(RD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT);
+		}
 		entry.blas = rd->blas_create({ &as_geom, 1 }, as_flags);
 		ERR_FAIL_COND_V(!entry.blas.is_valid(), false);
 		rd->set_resource_name(entry.blas, "RT MM merged BLAS [" + itos(cache_key) + "]");
