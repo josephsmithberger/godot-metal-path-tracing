@@ -383,16 +383,23 @@ static bool _msl_inject_after_function_brace(std::string &r_source, const char *
 // intersector body promises a triangle-only TLAS, which holds because the
 // renderer only adds procedural instances when their hit group is in the
 // active pipeline bundle. All edits are all-or-nothing per variant.
-static bool _msl_patch_ray_query_to_intersector(std::string &r_source) {
+//
+// When the patch is not applied, r_skip_reason names the anchor or exclusion
+// that stopped it so an output-format drift in SPIRV-Cross cannot silently
+// erase the optimization.
+static bool _msl_patch_ray_query_to_intersector(std::string &r_source, String &r_skip_reason) {
 	if (r_source.find("bool trace_material(") == std::string::npos ||
 			r_source.find("bool trace_shadow_blocked(") == std::string::npos) {
+		r_skip_reason = "missing trace_material/trace_shadow_blocked anchors (not the scene trace kernel, or SPIRV-Cross output drifted)";
 		return false;
 	}
 	if (r_source.find("commit_bounding_box_intersection") != std::string::npos) {
+		r_skip_reason = "variant commits procedural bounding boxes (intentional exclusion: intersector body is triangle-only)";
 		return false;
 	}
 	size_t rt_flags_pos = r_source.find("constant uint RT_FLAGS ");
 	if (rt_flags_pos == std::string::npos) {
+		r_skip_reason = "missing RT_FLAGS function-constant anchor";
 		return false;
 	}
 
@@ -443,6 +450,7 @@ static bool godot_trace_shadow_blocked_intersector(const thread float3 &origin, 
 )";
 	size_t trace_def = source.find("bool trace_material(");
 	if (trace_def == std::string::npos || rt_flags_pos > trace_def) {
+		r_skip_reason = "RT_FLAGS constant is not declared before trace_material";
 		return false;
 	}
 	source.insert(_msl_function_insert_pos(source, trace_def), trace_helpers);
@@ -452,6 +460,7 @@ static bool godot_trace_shadow_blocked_intersector(const thread float3 &origin, 
 				"    {\n"
 				"        return godot_trace_material_intersector(origin, direction, max_distance, hit, tlas);\n"
 				"    }\n")) {
+		r_skip_reason = "trace_material opening brace did not match the expected SPIRV-Cross layout";
 		return false;
 	}
 	if (!_msl_inject_after_function_brace(source, "bool trace_shadow_blocked(",
@@ -459,6 +468,7 @@ static bool godot_trace_shadow_blocked_intersector(const thread float3 &origin, 
 				"    {\n"
 				"        return godot_trace_shadow_blocked_intersector(origin, direction, max_distance, tlas);\n"
 				"    }\n")) {
+		r_skip_reason = "trace_shadow_blocked opening brace did not match the expected SPIRV-Cross layout";
 		return false;
 	}
 
@@ -923,15 +933,25 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 			}
 
 			// Native-intersector lane for ALL_OPAQUE pipelines; see
-			// _msl_patch_ray_query_to_intersector for the full story. On by
-			// default (measured 47.5 -> 64 fps at 1080p/4spp/2bounce on M5);
-			// GODOT_MTL_RT_INTERSECTOR=0 falls back to the ray-query path.
+			// _msl_patch_ray_query_to_intersector for the full story. Default
+			// on for the Apple9+ hardware-RT tier, where Apple recommends the
+			// intersector over intersection_query (measured 47.5 -> 64 fps at
+			// 1080p/4spp/2bounce on M5); pre-Apple9 tiers keep the query path
+			// until a benefit is measured there. GODOT_MTL_RT_INTERSECTOR=1
+			// forces the lane on for A/B runs, =0 forces the query path.
 			// The patch is all-or-nothing: if any anchor is missing it leaves
 			// the source untouched and the query path keeps working.
-			if (OS::get_singleton()->get_environment("GODOT_MTL_RT_INTERSECTOR") != "0") {
-				if (_msl_patch_ray_query_to_intersector(source)) {
+			const String intersector_env = OS::get_singleton()->get_environment("GODOT_MTL_RT_INTERSECTOR");
+			const bool intersector_default = device_profile->gpu >= MetalDeviceProfile::GPU::Apple9;
+			if (intersector_env == "1" || (intersector_env != "0" && intersector_default)) {
+				String skip_reason;
+				if (_msl_patch_ray_query_to_intersector(source, skip_reason)) {
 					print_verbose("Metal RT: intersector fast path patched into " + String(shader_name.get_data()));
+				} else {
+					print_verbose(vformat("Metal RT: intersector fast path not applied to %s: %s", String(shader_name.get_data()), skip_reason));
 				}
+			} else if (intersector_default) {
+				print_verbose("Metal RT: intersector fast path disabled by GODOT_MTL_RT_INTERSECTOR=0 for " + String(shader_name.get_data()));
 			}
 		}
 
