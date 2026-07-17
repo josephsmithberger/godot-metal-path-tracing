@@ -2405,9 +2405,10 @@ RDD::PipelineID RenderingDeviceDriverMetal::compute_pipeline_create(ShaderID p_s
 // ----- ACCELERATION STRUCTURE -----
 
 RDD::AccelerationStructureID RenderingDeviceDriverMetal::_acceleration_structure_create(MDAccelerationStructure::Type p_type, MTL::AccelerationStructureDescriptor *p_desc, BitField<AccelerationStructureFlagBits> p_flags, uint32_t p_max_instance_count) {
-	// ALLOW_COMPACTION affects later command encoding. PREFER_FAST_TRACE and
-	// LOW_MEMORY have no equivalent at the macOS 11 API floor, so they remain
-	// recorded on the handle without changing descriptor usage.
+	// ALLOW_COMPACTION affects later command encoding. PREFER_FAST_TRACE maps
+	// to PreferFastIntersection for immutable structures on macOS 26+ (see
+	// usage_from_flags); LOW_MEMORY has no default mapping -- MinimizeMemory
+	// must stay an explicit quality/performance tradeoff, not a default.
 	p_desc->setUsage(MDAccelerationStructure::usage_from_flags(p_flags));
 
 	MTL::AccelerationStructureSizes sizes = device->accelerationStructureSizes(p_desc);
@@ -2636,6 +2637,20 @@ void RenderingDeviceDriverMetal::command_update_blas(CommandBufferID p_cmd_buffe
 	ERR_FAIL_COND_MSG(!accel_info->flags.has_flag(ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT), "Metal BLAS was not created with ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT.");
 	ERR_FAIL_COND_MSG(!accel_info->build_encoded, "Metal BLAS must be built before it can be refit.");
 	ERR_FAIL_NULL_MSG(scratch_buffer, "Metal BLAS scratch buffer input parameter is not valid.");
+
+#ifdef MACOS_ENABLED
+	// macOS 15.2-15.3 can drop geometry from refit acceleration structures;
+	// Blender's Apple-maintained Cycles backend carries the same substitution
+	// of a full rebuild. Scratch allocations already cover both paths because
+	// required_scratch_size() takes the build/refit maximum for updatable AS.
+	const uint32_t os = device_properties->os_version;
+	if (os >= 15'02'00 && os < 15'04'00) {
+		ERR_FAIL_COND_MSG(scratch_buffer->metal_buffer->length() < accel_info->build_scratch_size, "Metal BLAS scratch buffer is too small for the macOS 15.2-15.3 refit-as-build workaround.");
+		cmd_buffer->acceleration_structure_build(accel_info, scratch_buffer->metal_buffer.get());
+		return;
+	}
+#endif
+
 	ERR_FAIL_COND_MSG(scratch_buffer->metal_buffer->length() < accel_info->refit_scratch_size, "Metal BLAS scratch buffer is too small for a refit.");
 
 	cmd_buffer->acceleration_structure_refit(accel_info, scratch_buffer->metal_buffer.get());

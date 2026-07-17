@@ -1310,6 +1310,15 @@ public:
 		if (p_flags.has_flag(RDD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT)) {
 			usage |= MTL::AccelerationStructureUsagePreferFastBuild;
 		}
+		// Static-AS fast-trace policy (mirrors Blender's Apple-maintained
+		// backend): only an immutable AS that doesn't prefer fast build maps
+		// PREFER_FAST_TRACE to PreferFastIntersection. The usage exists from
+		// macOS 26 / iOS 26; older OS releases keep the previous behavior.
+		if (usage == MTL::AccelerationStructureUsageNone && p_flags.has_flag(RDD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT)) {
+			if (__builtin_available(macOS 26.0, iOS 26.0, tvOS 26.0, *)) {
+				usage |= MTL::AccelerationStructureUsagePreferFastIntersection;
+			}
+		}
 		return usage;
 	}
 
