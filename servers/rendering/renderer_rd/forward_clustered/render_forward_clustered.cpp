@@ -2259,18 +2259,6 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		rt_flags = SceneShaderRaytracing::compute_rt_flags(env_params, fog_enabled);
 		rt_flags = raytracing->get_shader()->sanitize_rt_flags(rt_flags);
 		rt_flags = _apply_editor_interactive_rt_quality(rt_flags, p_render_data, rb_data.ptr());
-		// Uses last frame's material-table aggregate (build_tlas below refreshes
-		// it), so a material-set change takes one frame to switch pipelines.
-		// GODOT_MTL_RT_NO_ALL_OPAQUE=1 disables the specialization for A/B runs.
-		static const bool all_opaque_disabled = OS::get_singleton()->get_environment("GODOT_MTL_RT_NO_ALL_OPAQUE") == "1";
-		if (!all_opaque_disabled && raytracing->is_material_table_all_opaque() && raytracing->get_shader()->uses_compute_scene_lane()) {
-			rt_flags |= SceneShaderRaytracing::RT_FLAG_ALL_OPAQUE;
-			static bool all_opaque_marker_printed = false;
-			if (!all_opaque_marker_printed) {
-				print_line("METAL_RT_ALL_OPAQUE_PIPELINE=active");
-				all_opaque_marker_printed = true;
-			}
-		}
 
 		const bool denoiser_guides_enabled = (rt_flags & SceneShaderRaytracing::RT_FLAG_DENOISER_GUIDES_ENABLED) != 0;
 		if (denoiser_guides_enabled) {
@@ -2282,6 +2270,19 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 		RTViewportState *rt_state = raytracing->build_tlas(p_render_data, rt_flags);
 		if (rt_state) {
+			// ALL_OPAQUE comes from the viewport material table build_tlas just
+			// refreshed, so the pipeline always matches the table this frame
+			// traces against -- including per-viewport disjoint material sets.
+			// GODOT_MTL_RT_NO_ALL_OPAQUE=1 disables the specialization for A/B runs.
+			static const bool all_opaque_disabled = OS::get_singleton()->get_environment("GODOT_MTL_RT_NO_ALL_OPAQUE") == "1";
+			if (!all_opaque_disabled && rt_state->material_table_all_opaque && raytracing->get_shader()->uses_compute_scene_lane()) {
+				rt_flags |= SceneShaderRaytracing::RT_FLAG_ALL_OPAQUE;
+				static bool all_opaque_marker_printed = false;
+				if (!all_opaque_marker_printed) {
+					print_line("METAL_RT_ALL_OPAQUE_PIPELINE=active");
+					all_opaque_marker_printed = true;
+				}
+			}
 			rt_uniform_set = raytracing->update_uniform_set(rt_state, p_render_data, rt_flags);
 		}
 	} else if (rb_data.is_valid() && rb_data->dlss_rr_has_buffers()) {

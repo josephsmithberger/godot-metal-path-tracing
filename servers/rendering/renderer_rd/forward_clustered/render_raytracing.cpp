@@ -1888,20 +1888,22 @@ void RenderRaytracing::finalize_buffers(RTViewportState *p_state) {
 	// rejected when the material carries an alpha scissor or a non-HG0 custom
 	// dispatch. When no material can reject, RT_FLAG_ALL_OPAQUE lets the
 	// kernel fold the whole candidate-accept path out at pipeline compile.
-	const bool was_all_opaque = material_table_all_opaque;
-	material_table_all_opaque = true;
+	// Stored per viewport so pipeline selection always matches the table this
+	// viewport traces against in the same frame.
+	const bool was_all_opaque = p_state->material_table_all_opaque;
+	p_state->material_table_all_opaque = true;
 	for (const RT_MaterialData &mat : material_data) {
 		if ((mat.flags & RT_MAT_FLAG_ALPHA_SCISSOR) != 0 ||
 				((mat.flags & RT_MAT_FLAG_CUSTOM_SHADER) != 0 && mat.dispatch_index != 0)) {
-			material_table_all_opaque = false;
+			p_state->material_table_all_opaque = false;
 			if (OS::get_singleton()->get_environment("GODOT_RT_DUMP_OPAQUE") == "1") {
 				print_line(vformat("RT_OPAQUE_BLOCKER material_id=%d flags=0x%x dispatch=%d", mat.material_id, mat.flags, mat.dispatch_index));
 			}
 			break;
 		}
 	}
-	if (was_all_opaque != material_table_all_opaque && OS::get_singleton()->get_environment("GODOT_RT_DUMP_OPAQUE") == "1") {
-		print_line(vformat("RT_MATERIAL_TABLE all_opaque=%s materials=%d", material_table_all_opaque ? "true" : "false", material_data.size()));
+	if (was_all_opaque != p_state->material_table_all_opaque && OS::get_singleton()->get_environment("GODOT_RT_DUMP_OPAQUE") == "1") {
+		print_line(vformat("RT_MATERIAL_TABLE all_opaque=%s materials=%d", p_state->material_table_all_opaque ? "true" : "false", material_data.size()));
 	}
 	update_or_grow(p_state->motion_index_buffer, p_state->motion_index_buffer_capacity,
 			motion_indices.ptr(), motion_indices.size() * sizeof(int32_t));
