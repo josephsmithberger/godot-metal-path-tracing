@@ -194,6 +194,7 @@ private:
 private:
 	const MetalDeviceProfile *device_profile = nullptr;
 	bool export_mode = false;
+	bool _use_rt_intersector() const;
 
 	Vector<UniformData> mtl_reflection_binding_set_uniforms_data; // compliment to reflection_binding_set_uniforms_data
 
@@ -212,6 +213,7 @@ public:
 	};
 
 	MetalShaderReflection get_metal_shader_reflection() const;
+	bool is_rt_intersector_lane_compatible() const;
 
 protected:
 	virtual uint32_t _from_bytes_reflection_extra_data(const uint8_t *p_bytes) override;

@@ -34,6 +34,8 @@
 #include "core/templates/vector.h"
 #include "servers/rendering/rendering_device_commons.h"
 
+#include <string>
+
 // Chunk C7 shader-lowering lane for ray-tracing SPIR-V.
 //
 // This is the probe half of the shader strategy documented in
@@ -47,6 +49,25 @@
 
 class MetalRTShaderLowering {
 public:
+	enum class IntersectorPatchStatus {
+		APPLIED,
+		NOT_SCENE_TRACE_KERNEL,
+		PROCEDURAL_GEOMETRY,
+		MISSING_RT_FLAGS,
+		INVALID_RT_FLAGS_ORDER,
+		TRACE_MATERIAL_LAYOUT,
+		TRACE_SHADOW_LAYOUT,
+	};
+
+	struct IntersectorPatchResult {
+		IntersectorPatchStatus status = IntersectorPatchStatus::NOT_SCENE_TRACE_KERNEL;
+		String detail;
+
+		bool applied() const {
+			return status == IntersectorPatchStatus::APPLIED;
+		}
+	};
+
 	struct Result {
 		bool ok = false;
 		String error;
@@ -62,4 +83,11 @@ public:
 	// count as buffer bindings.
 	static Result lower_spirv(RenderingDeviceCommons::ShaderStage p_stage, const Vector<uint8_t> &p_spirv,
 			uint32_t p_msl_major, uint32_t p_msl_minor, bool p_argument_buffers, bool p_pad_argument_buffer_resources = true);
+
+	// Rewrites SPIRV-Cross's scene ray-query helpers to dispatch ALL_OPAQUE
+	// specializations through metal::raytracing::intersector. The operation is
+	// transactional: on any exclusion or anchor mismatch, p_source is unchanged
+	// and the result identifies the exact fallback class.
+	static IntersectorPatchResult patch_scene_ray_query_to_intersector(std::string &p_source);
+	static const char *intersector_patch_status_name(IntersectorPatchStatus p_status);
 };

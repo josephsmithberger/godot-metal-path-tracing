@@ -241,13 +241,14 @@ jobs:
           chmod +x bin/godot.macos.editor.arm64
           lipo -verify_arch arm64 bin/godot.macos.editor.arm64
 
-      - name: Run capability, GPU, image, and fallback validation
+      - name: Run capability, GPU, image, traversal parity, and fallback validation
         env:
           MTL_DEBUG_LAYER: 1
         run: |
           python3 tests/metal_rt/run_mac_rt_tests.py \
             --stage gpu \
             --stage image \
+            --stage intersector-parity \
             --stage fallback \
             --binary bin/godot.macos.editor.arm64 \
             --artifact-dir metal-rt-artifacts \

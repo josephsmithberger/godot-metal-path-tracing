@@ -19,7 +19,21 @@ from typing import Any
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[2]
 DEFAULT_ARTIFACT_ROOT = REPO_ROOT / "mac-rt-planning" / "artifacts"
-VALID_STAGES = ("preflight", "caps", "build", "smoke", "unit", "gpu", "image", "editor-scene", "geometry-scene", "material-scene", "procedural-scene", "fallback")
+VALID_STAGES = (
+    "preflight",
+    "caps",
+    "build",
+    "smoke",
+    "unit",
+    "gpu",
+    "image",
+    "editor-scene",
+    "geometry-scene",
+    "material-scene",
+    "intersector-parity",
+    "procedural-scene",
+    "fallback",
+)
 CAPS_PROBE_SOURCE = REPO_ROOT / "docs" / "rt_metal_port" / "capability_probe.mm"
 RUNTIME_GATE_PROJECT = REPO_ROOT / "tests" / "metal_rt"
 EDITOR_SCENE_PROJECT = RUNTIME_GATE_PROJECT / "editor"
@@ -30,6 +44,7 @@ GEOMETRY_SCENE_FIXTURE = "res://fixtures/e1_geometry.tscn"
 GEOMETRY_SCENE_VERIFY_SCRIPT = RUNTIME_GATE_PROJECT / "verify_geometry_scene.py"
 MATERIAL_SCENE_FIXTURE = "res://fixtures/e2_materials.tscn"
 MATERIAL_SCENE_VERIFY_SCRIPT = RUNTIME_GATE_PROJECT / "verify_material_scene.py"
+INTERSECTOR_PARITY_VERIFY_SCRIPT = RUNTIME_GATE_PROJECT / "verify_intersector_parity.py"
 PROCEDURAL_SCENE_FIXTURE = "res://fixtures/e3_procedural.tscn"
 PROCEDURAL_SCENE_VERIFY_SCRIPT = RUNTIME_GATE_PROJECT / "verify_procedural_scene.py"
 IMAGE_DIFF_SCRIPT = RUNTIME_GATE_PROJECT / "image_diff.py"
@@ -185,7 +200,20 @@ def make_commands(
         ])
 
     if "caps" in stages or (
-        any(stage in stages for stage in ("gpu", "image", "editor-scene", "geometry-scene", "material-scene", "procedural-scene", "fallback")) and args.arch == "arm64"
+        any(
+            stage in stages
+            for stage in (
+                "gpu",
+                "image",
+                "editor-scene",
+                "geometry-scene",
+                "material-scene",
+                "intersector-parity",
+                "procedural-scene",
+                "fallback",
+            )
+        )
+        and args.arch == "arm64"
     ):
         probe_binary = artifact_dir / "capability_probe"
         commands.extend([
@@ -538,6 +566,123 @@ def make_commands(
                     "METAL_RT_FIXTURE_REVISION=e2-materials-v1",
                 ),
                 forbidden_log_patterns=("METAL_RT_C13_EDITOR_HG0=passed", "METAL_RT_C15_MATERIAL_DISPATCH=passed"),
+            ),
+        ])
+
+    if "intersector-parity" in stages:
+        parity_environment = {
+            **METAL_VALIDATION_ENVIRONMENT,
+            "GODOT_MRT_EDITOR_CAPTURE": "1",
+        }
+        parity_geometry_command = [
+            str(binary),
+            "--editor",
+            "--verbose",
+            "--path",
+            str(EDITOR_SCENE_PROJECT),
+            GEOMETRY_SCENE_FIXTURE,
+            "--quit-after",
+            "900",
+        ]
+        parity_material_command = [
+            str(binary),
+            "--editor",
+            "--verbose",
+            "--path",
+            str(EDITOR_SCENE_PROJECT),
+            MATERIAL_SCENE_FIXTURE,
+            "--quit-after",
+            "900",
+        ]
+        geometry_markers = (
+            "METAL_RT_EDITOR_ROUTE=compute_ray_query",
+            "METAL_RT_C14_SCENE_GEOMETRY=passed",
+            "METAL_RT_MUTATION_SEQUENCE=passed",
+            "METAL_RT_FIXTURE_REVISION=e1-geometry-v1",
+        )
+        material_markers = (
+            "METAL_RT_EDITOR_ROUTE=compute_ray_query",
+            "METAL_RT_C15_MATERIAL_DISPATCH=passed",
+            "METAL_RT_ALPHA_TEST=passed",
+            "METAL_RT_CUSTOM_SHADER_RELOAD=passed",
+            "METAL_RT_FIXTURE_REVISION=e2-materials-v1",
+        )
+        commands.extend([
+            command_record(
+                "intersector-parity-geometry-default",
+                parity_geometry_command,
+                requires_passed="caps-probe" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                environment={
+                    **parity_environment,
+                    "GODOT_MRT_FIXTURE": "e1_geometry",
+                    "GODOT_MRT_CAPTURE_LABEL": "cold",
+                    "GODOT_MTL_RT_INTERSECTOR": "1",
+                },
+                required_log_patterns=geometry_markers,
+                forbidden_log_patterns=METAL_VALIDATION_FORBIDDEN_PATTERNS,
+            ),
+            command_record(
+                "intersector-parity-geometry-query",
+                parity_geometry_command,
+                requires_passed="intersector-parity-geometry-default" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                environment={
+                    **parity_environment,
+                    "GODOT_MRT_FIXTURE": "e1_geometry",
+                    "GODOT_MRT_CAPTURE_LABEL": "query",
+                    "GODOT_MTL_RT_INTERSECTOR": "0",
+                },
+                required_log_patterns=(
+                    *geometry_markers,
+                    "intersector fast path disabled by GODOT_MTL_RT_INTERSECTOR=0",
+                ),
+                forbidden_log_patterns=METAL_VALIDATION_FORBIDDEN_PATTERNS,
+            ),
+            command_record(
+                "intersector-parity-geometry-verify",
+                [sys.executable, str(INTERSECTOR_PARITY_VERIFY_SCRIPT), str(artifact_dir), "e1_geometry"],
+                requires_passed="intersector-parity-geometry-query" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                required_log_patterns=("METAL_RT_B2_INTERSECTOR_PARITY=passed fixture=e1_geometry",),
+            ),
+            command_record(
+                "intersector-parity-material-default",
+                parity_material_command,
+                requires_passed="intersector-parity-geometry-verify" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                environment={
+                    **parity_environment,
+                    "GODOT_MRT_FIXTURE": "e2_materials",
+                    "GODOT_MRT_CAPTURE_LABEL": "cold",
+                    "GODOT_MTL_RT_INTERSECTOR": "1",
+                },
+                required_log_patterns=material_markers,
+                forbidden_log_patterns=METAL_VALIDATION_FORBIDDEN_PATTERNS,
+            ),
+            command_record(
+                "intersector-parity-material-query",
+                parity_material_command,
+                requires_passed="intersector-parity-material-default" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                environment={
+                    **parity_environment,
+                    "GODOT_MRT_FIXTURE": "e2_materials",
+                    "GODOT_MRT_CAPTURE_LABEL": "query",
+                    "GODOT_MTL_RT_INTERSECTOR": "0",
+                },
+                required_log_patterns=(
+                    *material_markers,
+                    "intersector fast path disabled by GODOT_MTL_RT_INTERSECTOR=0",
+                ),
+                forbidden_log_patterns=METAL_VALIDATION_FORBIDDEN_PATTERNS,
+            ),
+            command_record(
+                "intersector-parity-material-verify",
+                [sys.executable, str(INTERSECTOR_PARITY_VERIFY_SCRIPT), str(artifact_dir), "e2_materials"],
+                requires_passed="intersector-parity-material-query" if args.arch == "arm64" else None,
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                required_log_patterns=("METAL_RT_B2_INTERSECTOR_PARITY=passed fixture=e2_materials",),
             ),
         ])
 

@@ -1182,6 +1182,9 @@ RDD::ShaderID RenderingDeviceDriverMetal::shader_create_from_container(const Ref
 		WARN_PRINT("Metal shader container is invalid and will be recompiled.");
 		return RDD::ShaderID();
 	}
+	if (!shader_container->is_rt_intersector_lane_compatible()) {
+		return RDD::ShaderID();
+	}
 
 	CharString shader_name = shader_container->shader_name;
 	RSCM::HeaderData &mtl_reflection_data = shader_container->mtl_reflection_data;
