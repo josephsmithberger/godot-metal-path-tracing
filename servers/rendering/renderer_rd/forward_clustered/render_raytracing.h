@@ -97,6 +97,17 @@ struct RT_InstanceMotionData {
 };
 static_assert(sizeof(RT_InstanceMotionData) == 48, "RT_InstanceMotionData must be 48 bytes");
 
+/// Per-instance current transforms for the compute lane (matches GLSL
+/// InstanceCurrentXform, 96 bytes), indexed by the TLAS instance custom index
+/// like geometries[]/materials[]. Both directions are stored so the shader
+/// never inverts a matrix, and so committed-hit transforms never have to be
+/// read back from a ray query after traversal.
+struct RT_InstanceCurrentXform {
+	float object_to_world[12]; // Current object-to-world (mat3x4, transposed 3x4).
+	float world_to_object[12]; // Current world-to-object (mat3x4, transposed 3x4).
+};
+static_assert(sizeof(RT_InstanceCurrentXform) == 96, "RT_InstanceCurrentXform must be 96 bytes");
+
 // Must match GLSL MaterialData (std430, 112 bytes).
 struct alignas(16) RT_MaterialData {
 	uint32_t albedo_texture_idx;
@@ -406,6 +417,8 @@ struct RTViewportState {
 	uint32_t motion_index_buffer_capacity = 0;
 	RID motion_transform_buffer;
 	uint32_t motion_transform_buffer_capacity = 0;
+	RID current_xform_buffer;
+	uint32_t current_xform_buffer_capacity = 0;
 
 	RID light_buffer;
 	RID params_buffer;
@@ -482,6 +495,7 @@ class RenderRaytracing {
 	LocalVector<RT_InstanceMotionData> motion_transforms; ///< Compact: only moving instances.
 	LocalVector<RID> blass;
 	LocalVector<Transform3D> blas_transforms;
+	LocalVector<RT_InstanceCurrentXform> current_xform_data; ///< Packed from blas_transforms at upload.
 	LocalVector<uint32_t> instance_flags;
 	LocalVector<uint8_t> instance_masks; // Per-instance ray mask (0x00 = invisible to rays, 0xFF = normal)
 	LocalVector<uint32_t> sbt_offsets; // 0 = default material hit group

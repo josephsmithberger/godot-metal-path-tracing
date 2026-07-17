@@ -134,6 +134,9 @@ void RenderRaytracing::_free_viewport_state_internal(RTViewportState *p_state) {
 	if (p_state->motion_transform_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->motion_transform_buffer);
 	}
+	if (p_state->current_xform_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(p_state->current_xform_buffer);
+	}
 	if (p_state->light_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->light_buffer);
 	}
@@ -1904,6 +1907,20 @@ void RenderRaytracing::finalize_buffers(RTViewportState *p_state) {
 			motion_indices.ptr(), motion_indices.size() * sizeof(int32_t));
 	update_or_grow(p_state->motion_transform_buffer, p_state->motion_transform_buffer_capacity,
 			motion_transforms.ptr(), motion_transforms.size() * sizeof(RT_InstanceMotionData));
+
+	// Current per-instance transforms for the compute lane, indexed by the
+	// TLAS instance custom index (inst.id = i, so blas_transforms order is the
+	// custom-index order shared with geometries[]/materials[]). Reading them
+	// from a table instead of the committed ray query keeps shading
+	// independent of query state, which the native-intersector fast path in
+	// the Metal driver relies on.
+	current_xform_data.resize(blas_transforms.size());
+	for (uint32_t i = 0; i < blas_transforms.size(); i++) {
+		RendererRD::MaterialStorage::store_transform_transposed_3x4(blas_transforms[i], current_xform_data[i].object_to_world);
+		RendererRD::MaterialStorage::store_transform_transposed_3x4(blas_transforms[i].affine_inverse(), current_xform_data[i].world_to_object);
+	}
+	update_or_grow(p_state->current_xform_buffer, p_state->current_xform_buffer_capacity,
+			current_xform_data.ptr(), current_xform_data.size() * sizeof(RT_InstanceCurrentXform));
 }
 
 // ---------------------------------------------------------------------------
@@ -3182,6 +3199,21 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
 		if (p_state->motion_transform_buffer.is_valid()) {
 			u.append_id(p_state->motion_transform_buffer);
+		} else {
+			u.append_id(RendererRD::MeshStorage::get_singleton()->get_default_rd_storage_buffer());
+		}
+		uniforms.push_back(u);
+	}
+
+	// Binding 33: per-instance current transforms. Only the compute lane
+	// declares this binding; uniform_set_create ignores entries the raygen
+	// lane shaders do not use.
+	{
+		RD::Uniform u;
+		u.binding = 33;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		if (p_state->current_xform_buffer.is_valid()) {
+			u.append_id(p_state->current_xform_buffer);
 		} else {
 			u.append_id(RendererRD::MeshStorage::get_singleton()->get_default_rd_storage_buffer());
 		}
