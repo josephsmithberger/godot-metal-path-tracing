@@ -16,7 +16,7 @@ execution, the reviewed image regression, and runtime fallback behavior.
 | Job | Runner | Contract |
 |---|---|---|
 | `build-macos-metal-only` | GitHub-hosted `macos-26` | Build the arm64 Metal-only editor, run boot/unit checks, and publish the binary and logs. |
-| `test-metal-rt` | `[self-hosted, macOS, ARM64, metal-rt]` | Download that exact binary, record capabilities, run C5-C10 GPU tests with Metal validation, compare the C10 image, run both C11 gates, and always upload the evidence. |
+| `test-metal-rt` | `[self-hosted, macOS, ARM64, metal-rt]` | Download that exact binary, record capabilities, run C5-C10 plus B2 traversal-parity GPU tests with Metal validation, compare the C10 and editor-fixture images, run both C11 gates, and always upload the evidence. |
 
 The GPU job has a 30-minute timeout and a global
 `metal-rt-apple-silicon` concurrency group so two workflow runs cannot drive
@@ -93,6 +93,38 @@ identical, and floating-point GPU results may require the reviewed tolerance.
 `python3 tests/metal_rt/test_image_diff.py` exercises threshold, exact-pixel,
 and exact-byte behavior and is included in the runner's `preflight` stage.
 
+## Native-intersector parity (B2)
+
+The GPU suite patches a reduced SPIRV-Cross-shaped MSL scene kernel through
+the same `MetalRTShaderLowering::patch_scene_ray_query_to_intersector()` helper
+used by the production shader container. It specializes that one library as
+both `RT_FLAGS=0` (query) and `RT_FLAG_ALL_OPAQUE` (intersector), then compares
+closest-hit, shadow, miss, `t_min`, and `t_max` results from identical rays.
+The Metal container also inspects cached RT MSL and forces recompilation when
+the cached traversal lane disagrees with the current policy or environment
+override, so an A/B process cannot silently reuse the preceding lane.
+
+The self-hosted job has a dedicated `intersector-parity` stage that runs the
+E1 geometry and E2 material scenes with `GODOT_MTL_RT_INTERSECTOR=1`, then
+again with `GODOT_MTL_RT_INTERSECTOR=0`. `verify_intersector_parity.py`
+compares each forced-query capture with its intersector capture and writes
+per-image diffs plus machine-readable metrics. Together the two fixtures cover
+transformed/negative-scale geometry, culling and double-sided instances,
+alpha cutouts, material shading, and mutation/reload behavior. The E2
+material-ID debug target is deliberately excluded: its existing same-lane
+cold/reload check is nondeterministic, so it cannot identify an intersector
+regression. All of these runs
+inherit Metal shader validation and fail on invalid device loads or stores.
+Beauty targets allow a maximum per-channel delta of 4/255 to account for
+floating-point traversal-order rounding; E1 instance and primitive targets
+remain bounded to a 1/255 delta in at most 128 of 4096 pixels.
+
+Headless hardware counters are not treated as an automated pass gate. On the
+current M5 runner, `MTLDevice.counterSets` exposes only timestamps and the
+`xctrace` Metal GPU Counters profiles are unsupported. Occupancy evidence is
+therefore retained as a reviewed Metal System Trace capture; executable-lane
+proof comes from specializing and dispatching the patched source itself.
+
 ## Running locally
 
 Run the complete C12 GPU contract against an existing Metal-only editor:
@@ -101,6 +133,7 @@ Run the complete C12 GPU contract against an existing Metal-only editor:
 MTL_DEBUG_LAYER=1 python3 tests/metal_rt/run_mac_rt_tests.py \
   --stage gpu \
   --stage image \
+  --stage intersector-parity \
   --stage fallback \
   --binary bin/godot.macos.editor.arm64 \
   --fail-on-skip \

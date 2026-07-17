@@ -36,9 +36,11 @@ TEST_FORCE_LINK(test_metal_rt_shader_strategy)
 
 #if defined(METAL_ENABLED) && defined(MODULE_GLSLANG_ENABLED)
 
+#include "core/io/file_access.h"
 #include "drivers/metal/metal_objects_shared.h"
 #include "drivers/metal/metal_rt_shader_lowering.h"
 #include "drivers/metal/rendering_shader_container_metal.h"
+#include "tests/test_utils.h"
 
 #include "modules/glslang/shader_compile.h"
 
@@ -192,6 +194,99 @@ kernel void trace_spike(
 }
 )MSL";
 
+// Reduced standalone SPIRV-Cross-shaped scene kernel for the production B2
+// rewrite. The test specializes RT_FLAGS to 0 and ALL_OPAQUE from this same
+// patched library, proving the query and injected intersector bodies against
+// identical rays and acceleration structures.
+static const char *B2_PATCH_PARITY_MSL = R"MSL(
+#include <metal_stdlib>
+#include <metal_raytracing>
+
+using namespace metal;
+using namespace metal::raytracing;
+
+struct ComputeHit {
+	float t;
+	uint geometry_idx;
+	uint primitive_idx;
+	float2 barycentrics;
+	short front_face;
+	short procedural;
+	uint hit_kind;
+};
+
+struct B2Rays {
+	float4 origin_tmin[4];
+	float4 direction_tmax[4];
+};
+
+struct B2Results {
+	float4 material_shadow[4];
+};
+
+constant uint RT_FLAGS_tmp [[function_constant(0)]];
+constant uint RT_FLAGS = is_function_constant_defined(RT_FLAGS_tmp) ? RT_FLAGS_tmp : 0u;
+
+static inline __attribute__((always_inline))
+bool trace_material(thread const float3& origin, thread const float3& direction, thread const float& max_distance, thread ComputeHit& hit, const raytracing::acceleration_structure<raytracing::instancing> tlas)
+{
+	raytracing::intersection_query<raytracing::instancing, raytracing::triangle_data> query;
+	raytracing::intersection_params params;
+	params.force_opacity(raytracing::forced_opacity::opaque);
+	params.set_triangle_cull_mode(raytracing::triangle_cull_mode::back);
+	query.reset(raytracing::ray(origin, direction, 0.001, max_distance), tlas, 0xFFu, params);
+	while (query.next())
+	{
+		query.commit_triangle_intersection();
+	}
+	if (query.get_committed_intersection_type() != raytracing::intersection_type::triangle)
+	{
+		return false;
+	}
+	hit.t = query.get_committed_distance();
+	hit.geometry_idx = uint(query.get_committed_user_instance_id());
+	hit.primitive_idx = uint(query.get_committed_primitive_id());
+	hit.barycentrics = query.get_committed_triangle_barycentric_coord();
+	hit.front_face = short(query.is_committed_triangle_front_facing());
+	hit.procedural = short(false);
+	hit.hit_kind = bool(hit.front_face) ? 254u : 255u;
+	return true;
+}
+
+static inline __attribute__((always_inline))
+bool trace_shadow_blocked(thread const float3& origin, thread const float3& direction, thread const float& max_distance, const raytracing::acceleration_structure<raytracing::instancing> tlas)
+{
+	raytracing::intersection_query<raytracing::instancing, raytracing::triangle_data> query;
+	raytracing::intersection_params params;
+	params.force_opacity(raytracing::forced_opacity::opaque);
+	params.set_triangle_cull_mode(raytracing::triangle_cull_mode::back);
+	params.accept_any_intersection(true);
+	query.reset(raytracing::ray(origin, direction, 0.001, max_distance), tlas, 0xFFu, params);
+	while (query.next())
+	{
+		query.commit_triangle_intersection();
+	}
+	return query.get_committed_intersection_type() == raytracing::intersection_type::triangle;
+}
+
+kernel void b2_trace_parity(
+		const raytracing::instance_acceleration_structure tlas [[buffer(0)]],
+		const device B2Rays& rays [[buffer(1)]],
+		device B2Results& results [[buffer(2)]],
+		uint tid [[thread_position_in_grid]])
+{
+	ComputeHit hit = {};
+	float3 origin = rays.origin_tmin[tid].xyz;
+	float3 direction = rays.direction_tmax[tid].xyz;
+	float max_distance = rays.direction_tmax[tid].w;
+	bool material_hit = trace_material(origin, direction, max_distance, hit, tlas);
+	bool shadow_hit = trace_shadow_blocked(origin, direction, max_distance, tlas);
+	results.material_shadow[tid] = float4(material_hit ? 1.0 : 0.0,
+		material_hit ? hit.t : -1.0, shadow_hit ? 1.0 : 0.0,
+		material_hit ? float(hit.geometry_idx) : -1.0);
+}
+)MSL";
+
 struct SpikeRayData {
 	float origin_tmin[2][4] = {
 		// Aimed at the triangle from z = -2 along +z; expected hit at t = 2.
@@ -209,9 +304,34 @@ struct SpikeResultData {
 	float hit_t_primitive_instance[2][4] = {};
 };
 
+struct B2RayData {
+	float origin_tmin[4][4] = {
+		{ 0.0f, -0.25f, -2.0f, 0.001f },
+		{ 0.0f, -0.25f, -2.0f, 0.001f },
+		{ 0.0f, -0.25f, -2.0f, 0.001f },
+		{ 0.0f, -0.25f, -0.0005f, 0.001f },
+	};
+	float direction_tmax[4][4] = {
+		{ 0.0f, 0.0f, 1.0f, 100.0f }, // Hit at t=2.
+		{ 0.0f, 0.0f, -1.0f, 100.0f }, // Direction miss.
+		{ 0.0f, 0.0f, 1.0f, 1.0f }, // Clipped by t_max.
+		{ 0.0f, 0.0f, 1.0f, 100.0f }, // Clipped by fixed t_min=0.001.
+	};
+};
+
+struct B2ResultData {
+	float material_shadow[4][4] = {};
+};
+
 static Vector<uint8_t> compile_stage_to_spirv(RDC::ShaderStage p_stage, const char *p_glsl, String *r_error) {
 	return compile_glslang_shader(p_stage, String::utf8(p_glsl),
 			RDC::SHADER_LANGUAGE_VULKAN_VERSION_1_3, RDC::SHADER_SPIRV_VERSION_1_6, r_error);
+}
+
+static std::string load_msl_rewrite_fixture(const char *p_name) {
+	String path = TestUtils::get_data_path(String("metal_rt/") + p_name);
+	String source = FileAccess::get_file_as_string(path);
+	return std::string(source.utf8().get_data());
 }
 
 static bool build_bindless_material_container(const Vector<uint8_t> &p_spirv, Ref<RenderingShaderContainerMetal> &r_container, String &r_msl_source) {
@@ -400,6 +520,54 @@ static void run_trace_kernel(MTL::Device *p_device, MTL::CommandQueue *p_queue, 
 			p_device->name()->utf8String(), p_label, hit[0], hit[1], hit[2], hit[3], miss[0]));
 }
 
+static bool run_b2_patch_lane(MTL::Device *p_device, MTL::CommandQueue *p_queue, SpikeScene &p_scene,
+		MTL::Library *p_library, uint32_t p_rt_flags, B2ResultData &r_results, String &r_error) {
+	NS::SharedPtr<NS::String> entry_name = NS::TransferPtr(NS::String::alloc()->init("b2_trace_parity", NS::UTF8StringEncoding));
+	NS::SharedPtr<MTL::FunctionConstantValues> constants = NS::TransferPtr(MTL::FunctionConstantValues::alloc()->init());
+	constants->setConstantValue(&p_rt_flags, MTL::DataTypeUInt, NS::UInteger(0));
+	NS::Error *error = nullptr;
+	NS::SharedPtr<MTL::Function> function = NS::TransferPtr(p_library->newFunction(entry_name.get(), constants.get(), &error));
+	if (!function) {
+		r_error = vformat("function specialization failed: %s", error ? error->localizedDescription()->utf8String() : "unknown error");
+		return false;
+	}
+	NS::SharedPtr<MTL::ComputePipelineState> pipeline = NS::TransferPtr(p_device->newComputePipelineState(function.get(), &error));
+	if (!pipeline) {
+		r_error = vformat("pipeline creation failed: %s", error ? error->localizedDescription()->utf8String() : "unknown error");
+		return false;
+	}
+
+	B2RayData rays;
+	NS::SharedPtr<MTL::Buffer> ray_buffer = NS::TransferPtr(p_device->newBuffer(&rays, sizeof(rays), MTL::ResourceStorageModeShared));
+	NS::SharedPtr<MTL::Buffer> result_buffer = NS::TransferPtr(p_device->newBuffer(&r_results, sizeof(r_results), MTL::ResourceStorageModeShared));
+	if (!ray_buffer || !result_buffer) {
+		r_error = "buffer allocation failed";
+		return false;
+	}
+
+	NS::SharedPtr<MTL::CommandBuffer> command = NS::RetainPtr(p_queue->commandBuffer());
+	NS::SharedPtr<MTL::ComputeCommandEncoder> encoder = NS::RetainPtr(command->computeCommandEncoder());
+	if (!encoder) {
+		r_error = "compute encoder creation failed";
+		return false;
+	}
+	encoder->setComputePipelineState(pipeline.get());
+	encoder->setAccelerationStructure(p_scene.tlas.get(), 0);
+	encoder->setBuffer(ray_buffer.get(), 0, 1);
+	encoder->setBuffer(result_buffer.get(), 0, 2);
+	encoder->useResource(p_scene.blas.get(), MTL::ResourceUsageRead);
+	encoder->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(4, 1, 1));
+	encoder->endEncoding();
+	command->commit();
+	command->waitUntilCompleted();
+	if (command->status() != MTL::CommandBufferStatusCompleted || command->error() != nullptr) {
+		r_error = vformat("dispatch failed: %s", command->error() ? command->error()->localizedDescription()->utf8String() : "unknown error");
+		return false;
+	}
+	memcpy(&r_results, result_buffer->contents(), sizeof(r_results));
+	return true;
+}
+
 TEST_CASE("[MetalRT] C7 SPIRV-Cross lane lowers ray query compute to MSL") {
 	String glsl_error;
 	Vector<uint8_t> spirv = compile_stage_to_spirv(RDC::SHADER_STAGE_COMPUTE, RAY_QUERY_COMPUTE_GLSL, &glsl_error);
@@ -424,6 +592,100 @@ TEST_CASE("[MetalRT] C7 SPIRV-Cross lane lowers ray query compute to MSL") {
 	MetalRTShaderLowering::Result argbuf = MetalRTShaderLowering::lower_spirv(RDC::SHADER_STAGE_COMPUTE, spirv, 3, 0, true, false);
 	REQUIRE_MESSAGE(argbuf.ok, vformat("SPIRV-Cross argument-buffer lowering failed: %s", argbuf.error));
 	CHECK(argbuf.msl_source.contains("intersection_query"));
+}
+
+TEST_CASE("[MetalRT] B2 production MSL rewrite injects closest-hit and shadow intersectors") {
+	std::string source = load_msl_rewrite_fixture("intersector_scene_fixture.metal");
+	REQUIRE_FALSE(source.empty());
+
+	MetalRTShaderLowering::IntersectorPatchResult patch = MetalRTShaderLowering::patch_scene_ray_query_to_intersector(source);
+	REQUIRE_MESSAGE(patch.applied(), patch.detail);
+	CHECK(String(MetalRTShaderLowering::intersector_patch_status_name(patch.status)) == "applied");
+
+	// The function-constant gate keeps alpha/custom material variants on their
+	// original query path. Only ALL_OPAQUE specializations force opacity.
+	CHECK(source.find("constant bool godot_use_intersector = ((RT_FLAGS & 16u) != 0u)") != std::string::npos);
+	CHECK(source.find("trace.force_opacity(raytracing::forced_opacity::opaque)") != std::string::npos);
+	CHECK(source.find("return godot_trace_material_intersector(origin, direction, max_distance, hit, tlas)") != std::string::npos);
+	CHECK(source.find("return godot_trace_shadow_blocked_intersector(origin, direction, max_distance, tlas)") != std::string::npos);
+
+	// Match the GLSL/Blender contracts: closest hit does not terminate early,
+	// shadows do, and both preserve the explicit range, mask, and back-face
+	// policy. Per-instance DisableTriangleCulling still makes double-sided
+	// geometry visible; Metal applies TLAS transforms before returning IDs.
+	CHECK(source.find("raytracing::ray r(origin, direction, 0.001, max_distance)") != std::string::npos);
+	CHECK(source.find("trace.set_triangle_cull_mode(raytracing::triangle_cull_mode::back)") != std::string::npos);
+	CHECK(source.find("trace.accept_any_intersection(false)") != std::string::npos);
+	CHECK(source.find("trace.accept_any_intersection(true)") != std::string::npos);
+	CHECK(source.find("trace.intersect(r, tlas, 0xFFu)") != std::string::npos);
+	CHECK(source.find("hit.geometry_idx = result.user_instance_id") != std::string::npos);
+	CHECK(source.find("hit.primitive_idx = result.primitive_id") != std::string::npos);
+	CHECK(source.find("hit.barycentrics = result.triangle_barycentric_coord") != std::string::npos);
+	CHECK(source.find("hit.front_face = short(result.triangle_front_facing)") != std::string::npos);
+
+	// Injection must precede SPIRV-Cross attributes, never split an attribute
+	// from its function definition.
+	size_t helper = source.find("godot_trace_material_intersector");
+	size_t material_attribute = source.find("static inline __attribute__((always_inline))");
+	size_t material_definition = source.find("bool trace_material(");
+	REQUIRE(helper != std::string::npos);
+	REQUIRE(material_attribute != std::string::npos);
+	REQUIRE(material_definition != std::string::npos);
+	CHECK(helper < material_attribute);
+	CHECK(material_attribute < material_definition);
+}
+
+TEST_CASE("[MetalRT] B2 production MSL rewrite reports transactional fallbacks") {
+	SUBCASE("SPIRV-Cross brace drift") {
+		std::string source = load_msl_rewrite_fixture("intersector_anchor_drift_fixture.metal");
+		REQUIRE_FALSE(source.empty());
+		const std::string original = source;
+		MetalRTShaderLowering::IntersectorPatchResult patch = MetalRTShaderLowering::patch_scene_ray_query_to_intersector(source);
+		CHECK_FALSE(patch.applied());
+		CHECK(patch.status == MetalRTShaderLowering::IntersectorPatchStatus::TRACE_MATERIAL_LAYOUT);
+		CHECK(String(MetalRTShaderLowering::intersector_patch_status_name(patch.status)) == "trace_material_layout");
+		CHECK(source == original);
+	}
+
+	SUBCASE("procedural/AABB variant") {
+		std::string source = load_msl_rewrite_fixture("intersector_procedural_fixture.metal");
+		REQUIRE_FALSE(source.empty());
+		const std::string original = source;
+		MetalRTShaderLowering::IntersectorPatchResult patch = MetalRTShaderLowering::patch_scene_ray_query_to_intersector(source);
+		CHECK_FALSE(patch.applied());
+		CHECK(patch.status == MetalRTShaderLowering::IntersectorPatchStatus::PROCEDURAL_GEOMETRY);
+		CHECK(String(MetalRTShaderLowering::intersector_patch_status_name(patch.status)) == "procedural_geometry");
+		CHECK(source == original);
+	}
+
+	SUBCASE("missing function constant") {
+		std::string source = load_msl_rewrite_fixture("intersector_scene_fixture.metal");
+		REQUIRE_FALSE(source.empty());
+		size_t begin = source.find("constant uint RT_FLAGS ");
+		REQUIRE(begin != std::string::npos);
+		size_t end = source.find('\n', begin);
+		source.erase(begin, end - begin + 1);
+		const std::string original = source;
+		MetalRTShaderLowering::IntersectorPatchResult patch = MetalRTShaderLowering::patch_scene_ray_query_to_intersector(source);
+		CHECK_FALSE(patch.applied());
+		CHECK(patch.status == MetalRTShaderLowering::IntersectorPatchStatus::MISSING_RT_FLAGS);
+		CHECK(source == original);
+	}
+
+	SUBCASE("shadow layout drift after valid material anchor") {
+		std::string source = load_msl_rewrite_fixture("intersector_scene_fixture.metal");
+		REQUIRE_FALSE(source.empty());
+		size_t shadow = source.find("bool trace_shadow_blocked(");
+		REQUIRE(shadow != std::string::npos);
+		size_t brace = source.find(")\n{\n", shadow);
+		REQUIRE(brace != std::string::npos);
+		source.replace(brace, 3, ") {\n");
+		const std::string original = source;
+		MetalRTShaderLowering::IntersectorPatchResult patch = MetalRTShaderLowering::patch_scene_ray_query_to_intersector(source);
+		CHECK_FALSE(patch.applied());
+		CHECK(patch.status == MetalRTShaderLowering::IntersectorPatchStatus::TRACE_SHADOW_LAYOUT);
+		CHECK(source == original);
+	}
 }
 
 TEST_CASE("[MetalRT] Metal container lowers bindless GPU-addressed material access") {
@@ -638,6 +900,57 @@ TEST_CASE_PENDING("[MetalRT][GPU] C7 native intersector kernel traces hit and mi
 	REQUIRE(scene.build(device.get(), queue.get()));
 
 	run_trace_kernel(device.get(), queue.get(), scene, String::utf8(NATIVE_INTERSECTOR_MSL), "trace_spike", MTL::LanguageVersion2_3, "native_intersector");
+}
+
+TEST_CASE_PENDING("[MetalRT][GPU] B2 production rewrite matches query traversal") {
+	NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+	NS::SharedPtr<MTL::Device> device = NS::TransferPtr(MTL::CreateSystemDefaultDevice());
+	if (!device || !device->supportsRaytracing()) {
+		MESSAGE("SKIP_REASON=missing_metal_rt_feature");
+		return;
+	}
+
+	std::string patched_source(B2_PATCH_PARITY_MSL);
+	MetalRTShaderLowering::IntersectorPatchResult patch = MetalRTShaderLowering::patch_scene_ray_query_to_intersector(patched_source);
+	REQUIRE_MESSAGE(patch.applied(), patch.detail);
+	CHECK(patched_source.find("intersection_query") != std::string::npos);
+	CHECK(patched_source.find("godot_trace_material_intersector") != std::string::npos);
+
+	NS::Error *error = nullptr;
+	NS::SharedPtr<MTL::CompileOptions> compile_options = NS::TransferPtr(MTL::CompileOptions::alloc()->init());
+	compile_options->setLanguageVersion(MTL::LanguageVersion2_4);
+	NS::SharedPtr<NS::String> source_string = NS::TransferPtr(NS::String::alloc()->init(patched_source.c_str(), NS::UTF8StringEncoding));
+	NS::SharedPtr<MTL::Library> library = NS::TransferPtr(device->newLibrary(source_string.get(), compile_options.get(), &error));
+	REQUIRE_MESSAGE(library, vformat("B2 patched MSL compile failed: %s", error ? error->localizedDescription()->utf8String() : "unknown error"));
+
+	NS::SharedPtr<MTL::CommandQueue> queue = NS::TransferPtr(device->newCommandQueue());
+	REQUIRE(queue);
+	SpikeScene scene;
+	REQUIRE(scene.build(device.get(), queue.get()));
+
+	B2ResultData query_results;
+	B2ResultData intersector_results;
+	String lane_error;
+	REQUIRE_MESSAGE(run_b2_patch_lane(device.get(), queue.get(), scene, library.get(), 0u, query_results, lane_error), lane_error);
+	REQUIRE_MESSAGE(run_b2_patch_lane(device.get(), queue.get(), scene, library.get(), 16u, intersector_results, lane_error), lane_error);
+
+	for (uint32_t ray_index = 0; ray_index < 4; ray_index++) {
+		for (uint32_t component = 0; component < 4; component++) {
+			CHECK(intersector_results.material_shadow[ray_index][component] == doctest::Approx(query_results.material_shadow[ray_index][component]));
+		}
+	}
+	CHECK(query_results.material_shadow[0][0] == 1.0f);
+	CHECK(query_results.material_shadow[0][1] == doctest::Approx(2.0f).epsilon(0.001));
+	CHECK(query_results.material_shadow[0][2] == 1.0f);
+	CHECK(query_results.material_shadow[0][3] == 0.0f);
+	for (uint32_t ray_index = 1; ray_index < 4; ray_index++) {
+		CHECK(query_results.material_shadow[ray_index][0] == 0.0f);
+		CHECK(query_results.material_shadow[ray_index][1] == -1.0f);
+		CHECK(query_results.material_shadow[ray_index][2] == 0.0f);
+		CHECK(query_results.material_shadow[ray_index][3] == -1.0f);
+	}
+	print_line(vformat("MetalRT B2 traversal parity: device=\"%s\" rays=4 closest=passed shadow=passed t_min=passed t_max=passed",
+			device->name()->utf8String()));
 }
 
 } // namespace TestMetalRTShaderStrategy

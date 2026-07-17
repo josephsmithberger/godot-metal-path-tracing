@@ -41,6 +41,7 @@ never from raster stages.
 | 5 | Raygen stage (`traceRayEXT`) → SPIRV-Cross MSL | **Fails**: "A memory declaration object must be used in TraceRayKHR." |
 | 6 | Closest-hit stage (payload + hit attributes) → SPIRV-Cross MSL | **Fails**: "PrimitiveId is not supported in this execution model." |
 | 7 | Handwritten `metal::raytracing::intersector` kernel at MSL **2.3** (macOS 11 floor), same scene and rays | **Correct**: identical hit/miss results |
+| 8 | Production B2 rewrite applied to SPIRV-Cross-shaped MSL, specialized as query and `ALL_OPAQUE` intersector from one library | **Correct**: identical closest-hit, shadow, miss, `t_min`, and `t_max` results |
 
 Two structural facts back up #5/#6: the vendored SPIRV-Cross MSL backend maps
 every RT execution model to entry type `"unknown"` (`spirv_msl.cpp`,
@@ -69,6 +70,15 @@ RT-pipeline stages.**
    "trace one ray" kernel is authored directly in MSL against
    `metal::raytracing::intersector`, proven at MSL 2.3 by experiment #7.
    Backend-owned kernels do not round-trip through SPIR-V at all.
+
+   The production compute scene additionally has a bounded B2 specialization:
+   `MetalRTShaderLowering::patch_scene_ray_query_to_intersector()` injects
+   native closest-hit and shadow helpers into SPIRV-Cross output. It engages
+   only for `RT_FLAG_ALL_OPAQUE`; alpha/custom variants retain the original
+   query body. The patch is transactional and returns a stable status code for
+   every intentional exclusion or output-anchor mismatch. Tracked MSL fixtures
+   and experiment #8 prevent a SPIRV-Cross format drift from silently removing
+   or semantically changing this lane.
 
 3. **RT-pipeline stages are re-expressed, not translated.** The five-stage
    `traceRayEXT` program cannot be pushed through SPIRV-Cross (experiments
