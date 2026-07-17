@@ -270,6 +270,7 @@ struct RTProceduralState {
 	uint64_t gpu_buffer_address = 0; // BDA (0 = not exposed).
 	uint32_t aabb_count = 0;
 	bool blas_built_once = false;
+	bool blas_allow_update = false; // Upgraded on the first mutation after a static build.
 	uint32_t build_count = 0;
 	uint32_t refit_count = 0;
 };
@@ -366,6 +367,7 @@ struct RTMergedMMEntry {
 	uint32_t last_used_frame = 0;
 	uint64_t cached_mm_last_change = 0;
 	bool blas_built_once = false;
+	bool blas_allow_update = false; // Upgraded on the first mutation after a static build.
 	bool indexed = false; // selects MODE_INDEXED vs MODE_NON_INDEXED variant
 };
 
