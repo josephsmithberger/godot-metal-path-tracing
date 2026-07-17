@@ -48,6 +48,33 @@ layout(set = 0, binding = 32, std430) readonly buffer MotionTransforms {
 	InstanceMotionData motion_transforms[];
 };
 
+// Current per-instance transforms, indexed by gl_InstanceCustomIndexEXT like
+// geometries[]/materials[]. Committed-hit transforms are read from this table
+// instead of the ray query so shading never depends on live query state; the
+// Metal native-intersector fast path relies on that (it bypasses the query).
+struct InstanceCurrentXform {
+	vec4 object_to_world[3]; // Transposed 3x4 rows.
+	vec4 world_to_object[3]; // Transposed 3x4 rows.
+};
+
+layout(set = 0, binding = 33, std430) readonly buffer CurrentTransforms {
+	InstanceCurrentXform current_transforms[];
+};
+
+mat4 current_object_to_world(uint geometry_idx) {
+	return transpose(mat4(current_transforms[geometry_idx].object_to_world[0],
+			current_transforms[geometry_idx].object_to_world[1],
+			current_transforms[geometry_idx].object_to_world[2],
+			vec4(0.0, 0.0, 0.0, 1.0)));
+}
+
+mat4 current_world_to_object(uint geometry_idx) {
+	return transpose(mat4(current_transforms[geometry_idx].world_to_object[0],
+			current_transforms[geometry_idx].world_to_object[1],
+			current_transforms[geometry_idx].world_to_object[2],
+			vec4(0.0, 0.0, 0.0, 1.0)));
+}
+
 layout(set = 0, binding = 7) uniform texture2D radiance_octmap;
 layout(set = 0, binding = 8) uniform sampler radiance_sampler;
 
@@ -122,7 +149,7 @@ void load_query_committed_procedural_hit(rayQueryEXT query, ComputeProceduralHit
 	hit.geometry_idx = rayQueryGetIntersectionInstanceCustomIndexEXT(query, true);
 	hit.primitive_idx = rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
 	hit.barycentrics = vec2(0.0);
-	mat3 normal_matrix = transpose(mat3(rayQueryGetIntersectionWorldToObjectEXT(query, true)));
+	mat3 normal_matrix = transpose(mat3(current_world_to_object(hit.geometry_idx)));
 	hit.front_face = dot(normalize(normal_matrix * procedural_hit.normal),
 							 -rayQueryGetWorldRayDirectionEXT(query)) > 0.0;
 	hit.procedural = true;
@@ -134,10 +161,10 @@ void load_query_committed_procedural_hit(rayQueryEXT query, ComputeProceduralHit
 	hit.procedural_prev_position_valid = procedural_hit.prev_position_valid;
 }
 
-// The instance transforms are passed in from the ray query at each call site
-// instead of being copied into ComputeHit: keeping two mat4s (~32 scalars) in
-// the hit struct made them live across the whole shading block and cost
-// register pressure. Callers read them with a compile-time committed flag.
+// The instance transforms are passed in from the current_transforms table at
+// each call site instead of being copied into ComputeHit: keeping two mat4s
+// (~32 scalars) in the hit struct made them live across the whole shading
+// block and cost register pressure.
 ComputeHitData compute_hit_data(ComputeHit hit, mat4 object_to_world, mat4 world_to_object, vec3 ray_origin, vec3 ray_direction) {
 	ComputeHitData result;
 	result.geometry_idx = hit.geometry_idx;
@@ -265,8 +292,8 @@ bool ray_query_candidate_accepts(rayQueryEXT query, vec3 origin, vec3 direction)
 	if (!needs_alpha_test) {
 		return true;
 	}
-	mat4 candidate_object_to_world = mat4(rayQueryGetIntersectionObjectToWorldEXT(query, false));
-	mat4 candidate_world_to_object = mat4(rayQueryGetIntersectionWorldToObjectEXT(query, false));
+	mat4 candidate_object_to_world = current_object_to_world(candidate.geometry_idx);
+	mat4 candidate_world_to_object = current_world_to_object(candidate.geometry_idx);
 	ComputeHitData candidate_data = compute_hit_data(candidate, candidate_object_to_world, candidate_world_to_object, origin, direction);
 	MaterialResult evaluated = evaluate_material(candidate, candidate_data, candidate_object_to_world, candidate_world_to_object, direction);
 	return !(evaluated.alpha_scissor_threshold > 0.0 && evaluated.alpha < evaluated.alpha_scissor_threshold);
@@ -360,10 +387,8 @@ void write_primary_hit_outputs(uvec2 pixel, ComputeHit hit, ComputeHitData hit_d
 	imageStore(rt_depth_image, ivec2(pixel), vec4(clip.z / clip.w));
 
 	int motion_index = motion_indices[hit.geometry_idx];
-	// Only ever called on a hit still committed in rt_query, so the instance
-	// transforms are read from the query here instead of carried in ComputeHit.
-	mat4 previous_model = motion_index >= 0 ? decode_prev_object_to_world(motion_index) : mat4(rayQueryGetIntersectionObjectToWorldEXT(rt_query, true));
-	vec3 object_position = (mat4(rayQueryGetIntersectionWorldToObjectEXT(rt_query, true)) * vec4(hit_data.hit_pos, 1.0)).xyz;
+	mat4 previous_model = motion_index >= 0 ? decode_prev_object_to_world(motion_index) : current_object_to_world(hit.geometry_idx);
+	vec3 object_position = (current_world_to_object(hit.geometry_idx) * vec4(hit_data.hit_pos, 1.0)).xyz;
 	if (hit.procedural && hit.procedural_prev_position_valid) {
 		object_position = hit.procedural_prev_position;
 	}
@@ -382,6 +407,54 @@ vec3 sample_environment(vec3 ray_direction) {
 	vec2 sky_uv = vec3_to_oct_with_border(sky_direction, border);
 	return textureLod(sampler2D(radiance_octmap, radiance_sampler), sky_uv, 0.0).rgb *
 			scene_data_block.data.IBL_exposure_normalization;
+}
+
+// Chooses a diffuse or specular lobe, samples it, and advances the path state.
+// Returns false when the path terminates (unrecoverable BRDF sample).
+bool scatter_from_hit(vec3 hit_pos, vec3 geometry_normal, vec3 shading_normal, vec3 view_direction,
+		MaterialProperties brdf_material, inout uint rng_state, inout vec3 throughput,
+		inout uint diffuse_bounces, out vec3 ray_origin, out vec3 ray_direction) {
+	vec3 specular_f0 = baseColorToSpecularF0(brdf_material.baseColor,
+			brdf_material.metalness, brdf_material.dielectricF0);
+	vec3 diffuse_reflectance = baseColorToDiffuseReflectance(brdf_material.baseColor,
+			brdf_material.metalness);
+	float specular_luminance = luminance(specular_f0);
+	float diffuse_luminance = luminance(diffuse_reflectance);
+	int brdf_type;
+	if (diffuse_luminance < 0.0001) {
+		brdf_type = SPECULAR_TYPE;
+	} else if (specular_luminance < 0.0001) {
+		brdf_type = DIFFUSE_TYPE;
+	} else {
+		float probability = clamp(specular_luminance / (specular_luminance + diffuse_luminance), 0.01, 0.99);
+		if (rand(rng_state) < probability) {
+			brdf_type = SPECULAR_TYPE;
+			throughput /= probability;
+		} else {
+			brdf_type = DIFFUSE_TYPE;
+			throughput /= 1.0 - probability;
+		}
+	}
+
+	vec3 next_direction;
+	vec3 brdf_weight;
+	if (!evalIndirectCombinedBRDF(rand2(rng_state), shading_normal, geometry_normal,
+				view_direction, brdf_material, brdf_type, next_direction, brdf_weight, vec4(0.0))) {
+		vec3 recovered_direction;
+		if (luminance(brdf_weight) == 0.0 ||
+				!recoverBelowHemisphereSample(next_direction, geometry_normal, recovered_direction)) {
+			return false;
+		}
+		next_direction = recovered_direction;
+	}
+
+	throughput *= brdf_weight;
+	if (brdf_type == DIFFUSE_TYPE) {
+		diffuse_bounces++;
+	}
+	ray_origin = offset_ray_origin(hit_pos, geometry_normal);
+	ray_direction = next_direction;
+	return true;
 }
 
 void main() {
@@ -406,6 +479,15 @@ void main() {
 	uint max_bounces = RT_GET_MAX_BOUNCES();
 	uint frame_index = uint(get_rt_param(RT_PARAM_FRAME_INDEX));
 	int visualization_mode = int(get_rt_param(RT_PARAM_VIS_MODE));
+	uint light_count = uint(get_rt_param(RT_PARAM_LIGHT_COUNT));
+
+	// NOTE: the primary ray is identical for every sample (no per-sample
+	// jitter), so hoisting the primary trace + material evaluation out of the
+	// sample loop looks attractive. Measured on Apple M5 (1080p, 4spp,
+	// 2 bounces) it is a wash on the intersector fast path and a ~17%
+	// regression on the ray-query path: the cached hit/material state stays
+	// live across every secondary traversal and the added ray-trace scratch
+	// traffic outweighs the saved primary traversals. Keep the uniform loop.
 	vec3 total_radiance = vec3(0.0);
 
 	[[dont_unroll]] for (uint sample_index = 0u; sample_index < samples_per_pixel; sample_index++) {
@@ -444,8 +526,8 @@ void main() {
 			}
 
 			ComputeHitData hit_data = compute_hit_data(hit,
-					mat4(rayQueryGetIntersectionObjectToWorldEXT(rt_query, true)),
-					mat4(rayQueryGetIntersectionWorldToObjectEXT(rt_query, true)),
+					current_object_to_world(hit.geometry_idx),
+					current_world_to_object(hit.geometry_idx),
 					ray_origin, ray_direction);
 			if (sample_index == 0u && bounce == 0u) {
 				write_primary_hit_outputs(pixel, hit, hit_data);
@@ -474,8 +556,8 @@ void main() {
 			}
 
 			MaterialResult material = evaluate_material(hit, hit_data,
-					mat4(rayQueryGetIntersectionObjectToWorldEXT(rt_query, true)),
-					mat4(rayQueryGetIntersectionWorldToObjectEXT(rt_query, true)),
+					current_object_to_world(hit.geometry_idx),
+					current_world_to_object(hit.geometry_idx),
 					ray_direction);
 			vec3 view_direction = -ray_direction;
 			vec3 shading_normal = clampShadingNormal(material.normal, hit_data.geometry_normal,
@@ -514,7 +596,6 @@ void main() {
 			}
 #endif
 
-			uint light_count = uint(get_rt_param(RT_PARAM_LIGHT_COUNT));
 			if (light_count > 0u) {
 				vec3 light_origin = offset_ray_origin(hit_data.hit_pos, hit_data.geometry_normal);
 				vec3 direct = lights_evaluate_direct_lighting(light_origin, shading_normal, view_direction,
@@ -526,46 +607,10 @@ void main() {
 				break;
 			}
 
-			vec3 specular_f0 = baseColorToSpecularF0(brdf_material.baseColor,
-					brdf_material.metalness, brdf_material.dielectricF0);
-			vec3 diffuse_reflectance = baseColorToDiffuseReflectance(brdf_material.baseColor,
-					brdf_material.metalness);
-			float specular_luminance = luminance(specular_f0);
-			float diffuse_luminance = luminance(diffuse_reflectance);
-			int brdf_type;
-			if (diffuse_luminance < 0.0001) {
-				brdf_type = SPECULAR_TYPE;
-			} else if (specular_luminance < 0.0001) {
-				brdf_type = DIFFUSE_TYPE;
-			} else {
-				float probability = clamp(specular_luminance / (specular_luminance + diffuse_luminance), 0.01, 0.99);
-				if (rand(rng_state) < probability) {
-					brdf_type = SPECULAR_TYPE;
-					throughput /= probability;
-				} else {
-					brdf_type = DIFFUSE_TYPE;
-					throughput /= 1.0 - probability;
-				}
+			if (!scatter_from_hit(hit_data.hit_pos, hit_data.geometry_normal, shading_normal, view_direction,
+						brdf_material, rng_state, throughput, diffuse_bounces, ray_origin, ray_direction)) {
+				break;
 			}
-
-			vec3 next_direction;
-			vec3 brdf_weight;
-			if (!evalIndirectCombinedBRDF(rand2(rng_state), shading_normal, hit_data.geometry_normal,
-						view_direction, brdf_material, brdf_type, next_direction, brdf_weight, vec4(0.0))) {
-				vec3 recovered_direction;
-				if (luminance(brdf_weight) == 0.0 ||
-						!recoverBelowHemisphereSample(next_direction, hit_data.geometry_normal, recovered_direction)) {
-					break;
-				}
-				next_direction = recovered_direction;
-			}
-
-			throughput *= brdf_weight;
-			if (brdf_type == DIFFUSE_TYPE) {
-				diffuse_bounces++;
-			}
-			ray_origin = offset_ray_origin(hit_data.hit_pos, hit_data.geometry_normal);
-			ray_direction = next_direction;
 		}
 
 		total_radiance += radiance;

@@ -50,8 +50,13 @@ void main() {
 
 	const uint max_bounces = RT_GET_MAX_BOUNCES();
 
-	// TODO: when we have a spp > 0 the first raycast is always identical,
-	// we should move it out of the loop
+	// NOTE: the primary ray carries no per-sample jitter, so with spp > 1 the
+	// first raycast is identical for every sample. Hoisting it was measured on
+	// the compute lane (Apple M5) and rejected: the cached primary hit state
+	// living across the sample loop costs more in register/scratch pressure
+	// than the redundant traversals cost to re-run. If revisited here, the SER
+	// route (trace the hitObjectEXT once, hitObjectExecuteShaderEXT per
+	// sample) is the only shape that avoids re-tracing.
 
 	[[dont_unroll]] for (uint sample_idx = 0u; sample_idx < samples_per_pixel; sample_idx++) {
 		PathState ps;
