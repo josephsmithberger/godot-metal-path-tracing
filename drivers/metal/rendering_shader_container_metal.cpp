@@ -328,6 +328,144 @@ MetalDeviceProfile::MinimumRequirements RenderingShaderContainerMetal::inspect_s
 	return reqs;
 }
 
+// Returns the insertion point for a block that must precede the function
+// definition at p_def_pos, stepping over the SPIRV-Cross attribute line
+// ("static inline __attribute__((always_inline))" or the patched noinline
+// variant) so injected code never lands between an attribute and its function.
+static size_t _msl_function_insert_pos(const std::string &p_source, size_t p_def_pos) {
+	size_t line_start = p_source.rfind('\n', p_def_pos);
+	line_start = (line_start == std::string::npos) ? 0 : line_start + 1;
+	if (line_start >= 2) {
+		size_t prev_line_start = p_source.rfind('\n', line_start - 2);
+		prev_line_start = (prev_line_start == std::string::npos) ? 0 : prev_line_start + 1;
+		if (p_source.compare(prev_line_start, strlen("static"), "static") == 0 &&
+				p_source.find("__attribute__", prev_line_start) < line_start) {
+			return prev_line_start;
+		}
+	}
+	return line_start;
+}
+
+// Inserts p_block immediately after the opening brace of the function whose
+// definition starts with p_signature_start.
+static bool _msl_inject_after_function_brace(std::string &r_source, const char *p_signature_start, const char *p_block) {
+	size_t def_pos = r_source.find(p_signature_start);
+	if (def_pos == std::string::npos) {
+		return false;
+	}
+	static constexpr char brace_pattern[] = ")\n{\n";
+	size_t brace = r_source.find(brace_pattern, def_pos);
+	if (brace == std::string::npos) {
+		return false;
+	}
+	r_source.insert(brace + sizeof(brace_pattern) - 1, p_block);
+	return true;
+}
+
+// Rewrites the SPIRV-Cross MSL of the compute path-tracing kernel so
+// ALL_OPAQUE pipeline variants traverse with the native
+// metal::raytracing::intersector instead of the intersection_query proceed
+// loop (on by default; GODOT_MTL_RT_INTERSECTOR=0 keeps the query path).
+// Apple explicitly recommends the intersector
+// API: intersection query "increases the amount of ray trace scratch memory
+// that must be read and written, as well as disables the reorder stage"
+// (Tech Talk "Explore GPU advancements in M3 and A17 Pro").
+//
+// trace_material / trace_shadow_blocked get an early dispatch to
+// intersector-based bodies, gated on RT_FLAG_ALL_OPAQUE (bit 4 of the
+// RT_FLAGS function constant, see raytracing_common_inc.glsl), so each PSO
+// folds to exactly one traversal implementation at compile time. This is only
+// possible because the GLSL reads committed-hit instance transforms from the
+// current_transforms table rather than from the ray query, so no query state
+// is consumed outside the two traversal functions.
+//
+// Variants with procedural (bounding-box) commits keep the query path: the
+// intersector body promises a triangle-only TLAS, which holds because the
+// renderer only adds procedural instances when their hit group is in the
+// active pipeline bundle. All edits are all-or-nothing per variant.
+static bool _msl_patch_ray_query_to_intersector(std::string &r_source) {
+	if (r_source.find("bool trace_material(") == std::string::npos ||
+			r_source.find("bool trace_shadow_blocked(") == std::string::npos) {
+		return false;
+	}
+	if (r_source.find("commit_bounding_box_intersection") != std::string::npos) {
+		return false;
+	}
+	size_t rt_flags_pos = r_source.find("constant uint RT_FLAGS ");
+	if (rt_flags_pos == std::string::npos) {
+		return false;
+	}
+
+	std::string source = r_source;
+
+	// Traversal bodies. Semantics match the query path under ALL_OPAQUE:
+	// forced-opaque traversal (RT_FLAG_ALL_OPAQUE adds gl_RayFlagsOpaqueEXT),
+	// back-face culling (RT_RAY_FLAGS), t_min 0.001, mask 0xFF, triangle-only.
+	static constexpr char trace_helpers[] = R"(
+// --- Godot: native-intersector fast path for ALL_OPAQUE pipelines ----------
+constant bool godot_use_intersector = ((RT_FLAGS & 16u) != 0u); // RT_FLAG_ALL_OPAQUE
+
+static bool godot_trace_material_intersector(const thread float3 &origin, const thread float3 &direction, float max_distance, thread ComputeHit &hit, raytracing::acceleration_structure<raytracing::instancing> tlas)
+{
+    raytracing::ray r(origin, direction, 0.001, max_distance);
+    raytracing::intersector<raytracing::instancing, raytracing::triangle_data> trace;
+    trace.assume_geometry_type(raytracing::geometry_type::triangle);
+    trace.force_opacity(raytracing::forced_opacity::opaque);
+    trace.set_triangle_cull_mode(raytracing::triangle_cull_mode::back);
+    trace.accept_any_intersection(false);
+    auto result = trace.intersect(r, tlas, 0xFFu);
+    if (result.type != raytracing::intersection_type::triangle)
+    {
+        return false;
+    }
+    hit.t = result.distance;
+    hit.geometry_idx = result.user_instance_id;
+    hit.primitive_idx = result.primitive_id;
+    hit.barycentrics = result.triangle_barycentric_coord;
+    hit.front_face = short(result.triangle_front_facing);
+    hit.procedural = short(false);
+    hit.hit_kind = result.triangle_front_facing ? 254u : 255u;
+    return true;
+}
+
+static bool godot_trace_shadow_blocked_intersector(const thread float3 &origin, const thread float3 &direction, float max_distance, raytracing::acceleration_structure<raytracing::instancing> tlas)
+{
+    raytracing::ray r(origin, direction, 0.001, max_distance);
+    raytracing::intersector<raytracing::instancing, raytracing::triangle_data> trace;
+    trace.assume_geometry_type(raytracing::geometry_type::triangle);
+    trace.force_opacity(raytracing::forced_opacity::opaque);
+    trace.set_triangle_cull_mode(raytracing::triangle_cull_mode::back);
+    trace.accept_any_intersection(true);
+    auto result = trace.intersect(r, tlas, 0xFFu);
+    return result.type != raytracing::intersection_type::none;
+}
+
+)";
+	size_t trace_def = source.find("bool trace_material(");
+	if (trace_def == std::string::npos || rt_flags_pos > trace_def) {
+		return false;
+	}
+	source.insert(_msl_function_insert_pos(source, trace_def), trace_helpers);
+
+	if (!_msl_inject_after_function_brace(source, "bool trace_material(",
+				"    if (godot_use_intersector)\n"
+				"    {\n"
+				"        return godot_trace_material_intersector(origin, direction, max_distance, hit, tlas);\n"
+				"    }\n")) {
+		return false;
+	}
+	if (!_msl_inject_after_function_brace(source, "bool trace_shadow_blocked(",
+				"    if (godot_use_intersector)\n"
+				"    {\n"
+				"        return godot_trace_shadow_blocked_intersector(origin, direction, max_distance, tlas);\n"
+				"    }\n")) {
+		return false;
+	}
+
+	r_source = std::move(source);
+	return true;
+}
+
 bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_shader) {
 	using namespace spirv_cross;
 	using spirv_cross::CompilerMSL;
@@ -781,6 +919,18 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 					if (param_pos != std::string::npos) {
 						source.replace(param_pos, sizeof(query_param) - 1, query_local);
 					}
+				}
+			}
+
+			// Native-intersector lane for ALL_OPAQUE pipelines; see
+			// _msl_patch_ray_query_to_intersector for the full story. On by
+			// default (measured 47.5 -> 64 fps at 1080p/4spp/2bounce on M5);
+			// GODOT_MTL_RT_INTERSECTOR=0 falls back to the ray-query path.
+			// The patch is all-or-nothing: if any anchor is missing it leaves
+			// the source untouched and the query path keeps working.
+			if (OS::get_singleton()->get_environment("GODOT_MTL_RT_INTERSECTOR") != "0") {
+				if (_msl_patch_ray_query_to_intersector(source)) {
+					print_verbose("Metal RT: intersector fast path patched into " + String(shader_name.get_data()));
 				}
 			}
 		}
