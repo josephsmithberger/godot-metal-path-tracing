@@ -60,6 +60,13 @@ namespace RendererSceneRenderImplementation {
 class RenderForwardClustered;
 class SceneShaderRaytracing;
 
+inline uint32_t rt_tlas_growth_capacity(uint32_t p_needed, uint64_t p_standard_limit) {
+	if (p_needed > p_standard_limit) {
+		return p_needed;
+	}
+	return (uint32_t)MIN(uint64_t(p_needed) * 2, MIN(p_standard_limit, uint64_t(UINT32_MAX)));
+}
+
 // Must match GLSL GeometryData (std430, 128 bytes).
 struct alignas(16) RT_GeometryData {
 	uint64_t vertex_buffer_address;
@@ -293,14 +300,17 @@ struct RTSurfaceData {
 	enum class BlasCompaction : uint8_t {
 		INELIGIBLE, // Updatable/fast-build BLAS, or the driver has no support.
 		PENDING, // Built with ALLOW_COMPACTION; waiting on the recorded size.
+		COPYING, // copyAndCompact is queued; source remains live until completion.
 		DONE, // Compacted, or measured not worth the copy.
 	};
 
 	RID blas;
+	RID compacted_blas;
 	RT_GeometryData geometry = {};
 	Transform3D aabb_transform;
 	bool is_compressed = false;
 	uint64_t blas_size = 0;
+	uint64_t source_blas_size = 0;
 	BlasCompaction compaction = BlasCompaction::INELIGIBLE;
 };
 

@@ -1411,7 +1411,8 @@ public:
 	// drivers without compaction support always report zero.
 	uint64_t blas_get_compacted_size(RID p_blas);
 	uint64_t blas_get_allocated_size(RID p_blas);
-	RID blas_create_compacted_target(uint64_t p_size);
+	bool blas_is_compaction_complete(RID p_blas);
+	RID blas_create_compacted_target(RID p_source, uint64_t p_size);
 	Error blas_compact(RID p_source, RID p_destination);
 
 	typedef int64_t HitShaderBindingTableRange;

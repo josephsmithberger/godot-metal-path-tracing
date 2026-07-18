@@ -676,6 +676,11 @@ void SceneShaderRaytracing::finalize_custom_shaders() {
 		// frame boundary in drain_completed_compiles().
 		async_compilation_enabled = GLOBAL_GET_CACHED(bool, "rendering/pathtracer/async_shader_compilation");
 		if (async_compilation_enabled) {
+			if (!compute_compile_debounce.is_ready(material_generation)) {
+				// No material may arrive during the intervening finalize pass
+				// before this generation becomes a stable aggregate target.
+				return;
+			}
 			_kick_compute_rebuild_if_idle();
 			return;
 		}
@@ -1255,11 +1260,11 @@ RID SceneShaderRaytracing::_compute_cache_acquire(uint64_t p_key) {
 	return e->shader;
 }
 
-void SceneShaderRaytracing::_compute_cache_insert(uint64_t p_key, RID p_shader) {
+bool SceneShaderRaytracing::_compute_cache_insert(uint64_t p_key, RID p_shader) {
 	ComputeVariantCacheEntry e;
 	e.shader = p_shader;
 	e.refcount = 1;
-	compute_variant_cache.insert(p_key, e);
+	return compute_cache_insert_if_absent(compute_variant_cache, p_key, e);
 }
 
 void SceneShaderRaytracing::_compute_cache_release(uint64_t p_key) {
@@ -1648,6 +1653,14 @@ void SceneShaderRaytracing::_finalize_compute_build(ComputeBuildTask *p_task) {
 	}
 	RD::get_singleton()->hit_sbt_range_update(hit_sbt, range, 0, indices);
 
+	// Acquire the bisection result's final key before releasing the bundle's
+	// current cache reference. This also handles a (defensive) same-key result
+	// without transiently deleting the shared entry.
+	RID final_cached_shader;
+	if (!p_task->cached_shader.is_valid()) {
+		final_cached_shader = _compute_cache_acquire(p_task->final_key);
+	}
+
 	// Atomic swap; RID frees are deferred-safe for in-flight frames.
 	const uint32_t previous_material_generation = bundle.material_generation;
 	if (bundle.hit_sbt.is_valid()) {
@@ -1669,9 +1682,25 @@ void SceneShaderRaytracing::_finalize_compute_build(ComputeBuildTask *p_task) {
 		bundle.base_shader_cache_key = p_task->cached_key;
 		p_task->cached_shader = RID();
 	} else {
-		bundle.base_shader = p_task->new_shader;
-		_compute_cache_insert(p_task->final_key, p_task->new_shader);
-		bundle.base_shader_cache_key = p_task->final_key;
+		// Bisection can land on a subset key that another rt_flags bundle
+		// inserted after this task's full-key probe. Re-acquire the final key;
+		// HashMap::insert() would otherwise overwrite and corrupt ownership.
+		if (final_cached_shader.is_valid()) {
+			bundle.base_shader = final_cached_shader;
+			bundle.base_shader_cache_key = p_task->final_key;
+			RD::get_singleton()->free_rid(p_task->new_shader);
+		} else {
+			const bool inserted = _compute_cache_insert(p_task->final_key, p_task->new_shader);
+			if (inserted) {
+				bundle.base_shader = p_task->new_shader;
+			} else {
+				// Main-thread cache mutation is serialized, but preserve ownership
+				// even if that invariant changes in the future.
+				bundle.base_shader = _compute_cache_acquire(p_task->final_key);
+				RD::get_singleton()->free_rid(p_task->new_shader);
+			}
+			bundle.base_shader_cache_key = p_task->final_key;
+		}
 		p_task->new_shader = RID();
 	}
 	bundle.owns_base_shader = false; // The aggregate cache owns generated kernels.

@@ -2569,6 +2569,32 @@ RDD::AccelerationStructureID RenderingDeviceDriverMetal::tlas_create(uint32_t p_
 	return _acceleration_structure_create(MDAccelerationStructure::Type::TLAS, desc, p_flags, p_max_instance_count, needs_extended_limits);
 }
 
+bool RenderingDeviceDriverMetal::tlas_build_is_valid(AccelerationStructureID p_tlas, VectorView<AccelerationStructureInstance> p_instances) const {
+	const MDAccelerationStructure *tlas = (const MDAccelerationStructure *)p_tlas.id;
+	ERR_FAIL_NULL_V_MSG(tlas, false, "Metal TLAS input parameter is not valid.");
+	ERR_FAIL_COND_V_MSG(tlas->type != MDAccelerationStructure::Type::TLAS || p_instances.size() > tlas->max_instance_count, false, "Metal TLAS build exceeds its allocated instance capacity.");
+	if (tlas->extended_limits) {
+		WARN_PRINT_ONCE("Metal RT: the TLAS exceeds the standard instance limit (built with ExtendedLimits); tracing it requires extended_limits shader support that is not implemented yet, so the TLAS build is refused before enqueue.");
+		return false;
+	}
+	for (uint32_t i = 0; i < p_instances.size(); i++) {
+		const AccelerationStructureInstance &instance = p_instances[i];
+		if (!instance.blas) {
+			continue;
+		}
+		const MDAccelerationStructure *blas = (const MDAccelerationStructure *)instance.blas.id;
+		// The BLAS build may have been queued earlier in the same rendering graph.
+		// In that case build_encoded is still false until graph execution reaches
+		// the BLAS command, so only validate properties known before enqueue here.
+		ERR_FAIL_COND_V_MSG(blas->type != MDAccelerationStructure::Type::BLAS || !blas->accel, false, "Metal TLAS references an invalid BLAS.");
+		if (blas->extended_limits) {
+			WARN_PRINT_ONCE("Metal RT: a BLAS exceeds the standard acceleration-structure limits (built with ExtendedLimits); tracing it requires extended_limits shader support that is not implemented yet, so the TLAS build is refused before enqueue.");
+			return false;
+		}
+	}
+	return true;
+}
+
 void RenderingDeviceDriverMetal::acceleration_structure_instance_write(uint8_t *r_driver_instance, const AccelerationStructureInstance &p_instance) {
 	ERR_FAIL_NULL_MSG(r_driver_instance, "Metal acceleration structure instance output parameter is not valid.");
 	MDAccelerationStructureInstance driver_instance;
@@ -2609,11 +2635,21 @@ uint64_t RenderingDeviceDriverMetal::acceleration_structure_get_allocated_size(A
 	return accel_info->acceleration_structure_size;
 }
 
-RDD::AccelerationStructureID RenderingDeviceDriverMetal::blas_create_compacted_target(uint64_t p_size) {
+bool RenderingDeviceDriverMetal::acceleration_structure_is_compaction_complete(AccelerationStructureID p_acceleration_structure) {
+	const MDAccelerationStructure *accel_info = (const MDAccelerationStructure *)p_acceleration_structure.id;
+	ERR_FAIL_NULL_V_MSG(accel_info, false, "Metal acceleration structure input parameter is not valid.");
+	return accel_info->is_compaction_complete();
+}
+
+RDD::AccelerationStructureID RenderingDeviceDriverMetal::blas_create_compacted_target(AccelerationStructureID p_source, uint64_t p_size) {
 	ERR_FAIL_COND_V_MSG(!device_properties->features.supports_raytracing, AccelerationStructureID(), "Acceleration structures are not supported by this device.");
 	ERR_FAIL_COND_V_MSG(p_size == 0, AccelerationStructureID(), "A compacted Metal BLAS target requires a nonzero size.");
+	const MDAccelerationStructure *source = (const MDAccelerationStructure *)p_source.id;
+	ERR_FAIL_NULL_V_MSG(source, AccelerationStructureID(), "A compacted Metal BLAS target requires a source BLAS.");
+	ERR_FAIL_COND_V_MSG(source->type != MDAccelerationStructure::Type::BLAS, AccelerationStructureID(), "Only a BLAS can be the source of a compacted Metal target.");
 
 	MDAccelerationStructure *accel_info = memnew(MDAccelerationStructure(MDAccelerationStructure::Type::BLAS, p_size));
+	accel_info->inherit_compaction_metadata_from(*source);
 	if (!accel_info->allocate(device)) {
 		memdelete(accel_info);
 		ERR_FAIL_V_MSG(AccelerationStructureID(), "Failed to allocate the compacted Metal BLAS target.");
@@ -3216,6 +3252,8 @@ uint64_t RenderingDeviceDriverMetal::limit_get(Limit p_limit) {
 			return limits.maxViewportDimensionX;
 		case LIMIT_MAX_VIEWPORT_DIMENSIONS_Y:
 			return limits.maxViewportDimensionY;
+		case LIMIT_MAX_ACCELERATION_STRUCTURE_INSTANCES:
+			return MDAccelerationStructure::STANDARD_LIMIT_MAX_INSTANCES;
 		case LIMIT_SUBGROUP_SIZE:
 			// MoltenVK sets the subgroupSize to the same as the maxSubgroupSize.
 			return limits.maxSubgroupSize;

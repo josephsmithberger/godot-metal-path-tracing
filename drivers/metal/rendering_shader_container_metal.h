@@ -236,6 +236,7 @@ protected:
 
 	virtual uint32_t _format() const override;
 	virtual uint32_t _format_version() const override;
+	virtual bool _format_version_supported(uint32_t p_version) const override;
 	virtual bool _set_code_from_spirv(const ReflectShader &p_shader) override;
 };
 

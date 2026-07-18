@@ -167,6 +167,36 @@ TEST_CASE("[MetalRT] C15 material cache key invalidates on RID, parameters, and 
 	CHECK_FALSE(first == reloaded);
 }
 
+TEST_CASE("[MetalRT] P1 compute aggregate debounce waits for a quiet finalize pass") {
+	SceneShader::ComputeCompileDebounce debounce;
+	CHECK(debounce.is_ready(0));
+	CHECK_FALSE(debounce.is_ready(1));
+	// A sequential arrival restarts the quiet-pass window.
+	CHECK_FALSE(debounce.is_ready(2));
+	CHECK(debounce.is_ready(2));
+	CHECK(debounce.is_ready(2));
+	CHECK_FALSE(debounce.is_ready(3));
+	CHECK(debounce.is_ready(3));
+}
+
+TEST_CASE("[MetalRT] P1 aggregate cache insertion never overwrites an owner") {
+	HashMap<uint64_t, RID> cache;
+	const RID first = RID::from_uint64(11);
+	const RID duplicate = RID::from_uint64(22);
+	REQUIRE(SceneShader::compute_cache_insert_if_absent(cache, 7, first));
+	CHECK_FALSE(SceneShader::compute_cache_insert_if_absent(cache, 7, duplicate));
+	REQUIRE(cache.getptr(7) != nullptr);
+	CHECK(*cache.getptr(7) == first);
+}
+
+TEST_CASE("[MetalRT] P4 TLAS growth stays standard at the limit boundary") {
+	using namespace RendererSceneRenderImplementation;
+	constexpr uint64_t standard_limit = 1ull << 24;
+	CHECK(rt_tlas_growth_capacity((1u << 23) + 1, standard_limit) == standard_limit);
+	CHECK(rt_tlas_growth_capacity((uint32_t)standard_limit, standard_limit) == standard_limit);
+	CHECK(rt_tlas_growth_capacity((uint32_t)standard_limit + 1, standard_limit) == standard_limit + 1);
+}
+
 TEST_CASE("[MetalRT] C15 custom uniform and bindless texture writes stay within their BDA record") {
 	using namespace RendererSceneRenderImplementation;
 	CHECK(rt_material_buffer_write_fits(0, 16, 32));

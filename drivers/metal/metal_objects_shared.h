@@ -37,6 +37,7 @@
 
 #include <CoreFoundation/CoreFoundation.h>
 
+#include <atomic>
 #include <memory>
 #include <optional>
 
@@ -1291,6 +1292,13 @@ public:
 	uint64_t scratch_size = 0;
 	/// Shared result buffer populated after builds that request compaction.
 	NS::SharedPtr<MTL::Buffer> compacted_size_buffer;
+	struct CompletionState {
+		std::atomic<uint64_t> requested_build{ 0 };
+		std::atomic<uint64_t> completed_build{ 0 };
+		std::atomic<uint64_t> requested_compaction{ 0 };
+		std::atomic<uint64_t> completed_compaction{ 0 };
+	};
+	std::shared_ptr<CompletionState> completion_state = std::make_shared<CompletionState>();
 	BitField<RDD::AccelerationStructureFlagBits> flags = {};
 	/// True after a build has been encoded, allowing a later in-place refit.
 	bool build_encoded = false;
@@ -1363,10 +1371,11 @@ public:
 		return true;
 	}
 
-	void encode_build(MTL::AccelerationStructureCommandEncoder *p_encoder, MTL::Buffer *p_scratch_buffer) {
+	uint64_t encode_build(MTL::AccelerationStructureCommandEncoder *p_encoder, MTL::Buffer *p_scratch_buffer) {
+		const uint64_t generation = completion_state->requested_build.fetch_add(1, std::memory_order_relaxed) + 1;
 		p_encoder->buildAccelerationStructure(accel.get(), descriptor.get(), p_scratch_buffer, 0);
 		if (compacted_size_buffer) {
-			if (__builtin_available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
+			if (__builtin_available(macOS 12.0, iOS 15.0, tvOS 15.0, *)) {
 				// Explicit 64-bit result. The legacy selector writes 32 bits; the
 				// buffer is a zero-initialized 8-byte allocation, so the 64-bit
 				// read in get_compacted_size() is correct for both variants on
@@ -1377,11 +1386,15 @@ public:
 			}
 		}
 		build_encoded = true;
+		return generation;
 	}
 
-	void encode_compact_into(MTL::AccelerationStructureCommandEncoder *p_encoder, MDAccelerationStructure *p_destination) const {
+	uint64_t encode_compact_into(MTL::AccelerationStructureCommandEncoder *p_encoder, MDAccelerationStructure *p_destination) const {
+		const uint64_t generation = p_destination->completion_state->requested_compaction.fetch_add(1, std::memory_order_relaxed) + 1;
 		p_encoder->copyAndCompactAccelerationStructure(accel.get(), p_destination->accel.get());
 		p_destination->build_encoded = true;
+		p_destination->inherit_compaction_metadata_from(*this);
+		return generation;
 	}
 
 	void encode_refit(MTL::AccelerationStructureCommandEncoder *p_encoder, MTL::Buffer *p_scratch_buffer) {
@@ -1399,7 +1412,21 @@ public:
 		if (!compacted_size_buffer || !compacted_size_buffer->contents()) {
 			return 0;
 		}
+		const uint64_t requested = completion_state->requested_build.load(std::memory_order_acquire);
+		if (requested == 0 || completion_state->completed_build.load(std::memory_order_acquire) < requested) {
+			return 0;
+		}
 		return *static_cast<const uint64_t *>(compacted_size_buffer->contents());
+	}
+
+	bool is_compaction_complete() const {
+		const uint64_t requested = completion_state->requested_compaction.load(std::memory_order_acquire);
+		return requested != 0 && completion_state->completed_compaction.load(std::memory_order_acquire) >= requested;
+	}
+
+	void inherit_compaction_metadata_from(const MDAccelerationStructure &p_source) {
+		flags = p_source.flags;
+		extended_limits = p_source.extended_limits;
 	}
 
 	MDAccelerationStructure(Type p_type, NS::SharedPtr<MTL::AccelerationStructureDescriptor> p_descriptor, const MTL::AccelerationStructureSizes &p_sizes, BitField<RDD::AccelerationStructureFlagBits> p_flags, uint32_t p_max_instance_count = 0) :
