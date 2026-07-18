@@ -925,7 +925,7 @@ const SceneShaderRaytracing::PipelineBundle &SceneShaderRaytracing::ensure_pipel
 			return EMPTY_BUNDLE;
 		}
 		bundle.initial_pipeline_built = true;
-		// P1: the synchronous bootstrap stops at the generic template kernel;
+		// AGGREGATE_COMPILATION: the synchronous bootstrap stops at the generic template kernel;
 		// ready custom slots are folded in by one async aggregate compile.
 		for (uint32_t i = 1; i < hit_group_slots.size(); i++) {
 			if (hit_group_slots[i].state == HGState::Ready && bundle.per_hg_states[i] != HGState::Failed) {
@@ -984,7 +984,7 @@ void SceneShaderRaytracing::_replace_identifier(String &r_source, const String &
 String SceneShaderRaytracing::_build_compute_material_function(uint32_t p_slot_index, const CustomShaderEntry &p_entry) const {
 	// Stage-global helper functions need symbol namespacing before several
 	// unrelated materials can coexist in one monolithic compute kernel. Reject
-	// that uncommon form deterministically for C15; direct vertex/fragment code,
+	// that uncommon form deterministically for MATERIAL; direct vertex/fragment code,
 	// uniforms, and textures remain supported.
 	if (!p_entry.fragment_globals.strip_edges().is_empty()) {
 		return String();
@@ -1240,12 +1240,12 @@ bool SceneShaderRaytracing::_compile_compute_source(const String &p_source, Vect
 uint64_t SceneShaderRaytracing::_compute_aggregate_key(int p_compute_variant, const ComputeBuildTask &p_task, const LocalVector<uint8_t> &p_active) {
 	// Slot indices are baked into the generated switch cases, so the key must
 	// cover (index, source) pairs, not just the source set.
-	uint64_t h = hash_djb2_one_64((uint64_t)p_compute_variant + 1);
+	uint64_t h = hash_djintersector_one_64((uint64_t)p_compute_variant + 1);
 	for (const ComputeBuildTask::SlotSnapshot &snap : p_task.slots) {
 		if (snap.index < p_active.size() && p_active[snap.index]) {
-			h = hash_djb2_one_64(snap.index, h);
-			h = hash_djb2_one_64(snap.source_hash.a, h);
-			h = hash_djb2_one_64(snap.source_hash.b, h);
+			h = hash_djintersector_one_64(snap.index, h);
+			h = hash_djintersector_one_64(snap.source_hash.a, h);
+			h = hash_djintersector_one_64(snap.source_hash.b, h);
 		}
 	}
 	return h == 0 ? 1 : h;
@@ -1283,7 +1283,7 @@ void SceneShaderRaytracing::_compute_cache_release(uint64_t p_key) {
 }
 
 bool SceneShaderRaytracing::_build_compute_bundle(uint32_t p_rt_flags, PipelineBundle &r_bundle) {
-	// P1: the synchronous path only assembles the generic template kernel into
+	// AGGREGATE_COMPILATION: the synchronous path only assembles the generic template kernel into
 	// a pipeline/SBT (HG0 bootstrap). Custom material slots are folded in later
 	// by the batched aggregate compile on the compute lane.
 	_bundle_resize_for_slots(r_bundle);

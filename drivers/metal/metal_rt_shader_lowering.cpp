@@ -97,7 +97,7 @@ const char *MetalRTShaderLowering::intersector_patch_status_name(IntersectorPatc
 	return "unknown";
 }
 
-// --- P3: traversal-class registry -----------------------------------------
+// --- TRAVERSAL_METADATA: traversal-class registry -----------------------------------------
 //
 // Declarative metadata for every traversal class the compute scene kernel can
 // dispatch natively. The engine below is generic; broadening intersector
@@ -454,7 +454,7 @@ MetalRTShaderLowering::Result MetalRTShaderLowering::lower_spirv(RenderingDevice
 		msl_options.force_active_argument_buffer_resources = p_argument_buffers;
 		// The container always pads argument buffer resources, but SPIRV-Cross's
 		// binding registration rejects acceleration structures when padding is
-		// enabled; C7 measures both configurations.
+		// enabled; SHADER_LOWERING measures both configurations.
 		msl_options.pad_argument_buffer_resources = p_argument_buffers && p_pad_argument_buffer_resources;
 		msl_options.texture_buffer_native = true;
 		msl_options.pad_fragment_output_components = true;

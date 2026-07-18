@@ -88,7 +88,7 @@ func _process(_delta: float) -> void:
 		print("METAL_RT_CAPTURE_LABEL=%s" % capture_label)
 		print("METAL_RT_MUTATION_SEQUENCE=passed")
 		if OS.get_environment("GODOT_MTL_DISABLE_RAYTRACING") != "1":
-			print("METAL_RT_C14_SCENE_GEOMETRY=passed")
+			print("METAL_RT_SCENE_GEOMETRY=passed")
 		get_tree().quit()
 
 
@@ -231,7 +231,7 @@ func _capture(kind: String) -> void:
 	var path := artifact_dir.path_join("e1_geometry_%s_%s.png" % [capture_label, kind])
 	var error := captured.save_png(path)
 	if error != OK:
-		push_error("Failed to save C14 editor capture %s: %s" % [path, error_string(error)])
+		push_error("Failed to save SCENE_GEOMETRY editor capture %s: %s" % [path, error_string(error)])
 
 
 func _configure_capture_camera() -> void:
@@ -285,6 +285,6 @@ func _write_manifest() -> void:
 	var manifest_path := artifact_dir.path_join("e1_geometry_%s_manifest.json" % capture_label)
 	var file := FileAccess.open(manifest_path, FileAccess.WRITE)
 	if file == null:
-		push_error("Failed to open C14 manifest: %s" % manifest_path)
+		push_error("Failed to open SCENE_GEOMETRY manifest: %s" % manifest_path)
 		return
 	file.store_string(JSON.stringify(manifest, "  ") + "\n")

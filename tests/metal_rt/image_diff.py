@@ -283,7 +283,7 @@ def compare(args: argparse.Namespace) -> int:
     }
     write_json(args.metrics, metrics)
     print(
-        "MetalRT C12 image diff: "
+        "MetalRT IMAGE_COMPARISON image diff: "
         f"reference={manifest['reference_id']} status={metrics['status']} "
         f"mode={mode} max_diff={max_diff}/{threshold} mean_diff={mean_diff:.6f} "
         f"encoded_bytes_equal={str(encoded_bytes_equal).lower()} "
@@ -309,7 +309,7 @@ def main() -> int:
                 "diff_file": args.diff.name,
             },
         )
-        print(f"MetalRT C12 image diff error: {error}", file=sys.stderr)
+        print(f"MetalRT IMAGE_COMPARISON image diff error: {error}", file=sys.stderr)
         return 2
 
 

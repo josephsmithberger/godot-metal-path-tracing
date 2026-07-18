@@ -132,7 +132,7 @@ public:
 		SHA256Digest hash; ///< SHA 256 hash of the shader code
 		uint32_t source_size = 0; ///< size of the source code in the returned bytes
 		uint32_t library_size = 0; ///< size of the compiled library in the returned bytes, 0 if it is not compiled
-		/// Explicit traversal-lowering metadata (P3). Bitmasks of
+		/// Explicit traversal-lowering metadata (TRAVERSAL_METADATA). Bitmasks of
 		/// MetalRTShaderLowering::TraversalClassBits recorded at compile time:
 		/// which native intersector classes were injected into this stage's MSL
 		/// and which were eligible. Cache validation compares them against the

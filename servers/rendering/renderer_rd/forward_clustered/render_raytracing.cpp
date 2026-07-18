@@ -1002,7 +1002,7 @@ void RenderRaytracing::_populate_surface_blas(
 		if (p_allow_update) {
 			as_flags.set_flag(RD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT);
 		}
-		// P2: immutable BLASes record their compacted size at build so a later
+		// BLAS_COMPACTION: immutable BLASes record their compacted size at build so a later
 		// frame can copy-and-compact them (drivers without support ignore this).
 		const bool compaction_eligible = !p_allow_update && !p_prefer_fast_build && _blas_compaction_enabled();
 		if (compaction_eligible) {
@@ -2820,7 +2820,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				continue;
 			}
 
-			// P2: revisit static BLASes until their recorded compacted size is
+			// BLAS_COMPACTION: revisit static BLASes until their recorded compacted size is
 			// consumed in build_acceleration_structures() this frame.
 			if (surf_data->compaction == RTSurfaceData::BlasCompaction::PENDING ||
 					surf_data->compaction == RTSurfaceData::BlasCompaction::COPYING) {

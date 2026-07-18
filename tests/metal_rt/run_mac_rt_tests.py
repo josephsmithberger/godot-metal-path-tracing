@@ -49,7 +49,7 @@ PROCEDURAL_SCENE_FIXTURE = "res://fixtures/e3_procedural.tscn"
 PROCEDURAL_SCENE_VERIFY_SCRIPT = RUNTIME_GATE_PROJECT / "verify_procedural_scene.py"
 IMAGE_DIFF_SCRIPT = RUNTIME_GATE_PROJECT / "image_diff.py"
 IMAGE_DIFF_TEST_SCRIPT = RUNTIME_GATE_PROJECT / "test_image_diff.py"
-IMAGE_REFERENCE = RUNTIME_GATE_PROJECT / "references" / "c10_pathtracer_launch_v1.png"
+IMAGE_REFERENCE = RUNTIME_GATE_PROJECT / "references" / "pathtracer_launch_v1.png"
 IMAGE_REFERENCE_MANIFEST = IMAGE_REFERENCE.with_suffix(".json")
 CAPS_SKIP_EXIT_CODE = 3  # Probe exit code for a machine-readable skip (see capability_probe.mm).
 
@@ -296,7 +296,7 @@ def make_commands(
                     [
                         str(binary),
                         "--test",
-                        "--test-case=*[MetalRT][GPU] C10*",
+                        "--test-case=*[MetalRT][GPU] PATH_TRACER*",
                         "--no-skip",
                         "--force-colors",
                     ],
@@ -313,18 +313,18 @@ def make_commands(
                 [
                     sys.executable,
                     str(IMAGE_DIFF_SCRIPT),
-                    str(artifact_dir / "c10_pathtracer_launch_gpu.png"),
+                    str(artifact_dir / "pathtracer_launch_gpu.png"),
                     str(IMAGE_REFERENCE),
                     "--manifest",
                     str(IMAGE_REFERENCE_MANIFEST),
                     "--diff",
-                    str(artifact_dir / "c10_pathtracer_launch_diff.png"),
+                    str(artifact_dir / "pathtracer_launch_diff.png"),
                     "--metrics",
-                    str(artifact_dir / "c10_pathtracer_launch_metrics.json"),
+                    str(artifact_dir / "pathtracer_launch_metrics.json"),
                 ],
                 requires_passed=image_render_name,
                 preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
-                required_log_patterns=("MetalRT C12 image diff:", "status=passed"),
+                required_log_patterns=("MetalRT IMAGE_COMPARISON image diff:", "status=passed"),
             )
         )
 
@@ -343,7 +343,7 @@ def make_commands(
             "GODOT_MRT_EDITOR_CAPTURE": "1",
             "GODOT_MRT_FIXTURE": "e0_hg0",
         }
-        c17_editor_command = [
+        presentation_editor_command = [
             str(binary),
             "--editor",
             "--verbose",
@@ -356,7 +356,7 @@ def make_commands(
         scene_markers = (
             "METAL_RT_EDITOR_ROUTE=compute_ray_query",
             "METAL_RT_DENOISER=none",
-            "METAL_RT_C13_EDITOR_HG0=passed",
+            "METAL_RT_EDITOR_HG0=passed",
             "METAL_RT_FIXTURE_REVISION=e0-hg0-v1",
         )
         commands.extend([
@@ -383,7 +383,7 @@ def make_commands(
                 [sys.executable, str(EDITOR_SCENE_VERIFY_SCRIPT), str(artifact_dir)],
                 requires_passed="editor-scene-reload" if args.arch == "arm64" else None,
                 preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
-                required_log_patterns=("METAL_RT_C13_FIXTURE_VERIFY=passed",),
+                required_log_patterns=("METAL_RT_EDITOR_SCENE_FIXTURE_VERIFY=passed",),
             ),
             command_record(
                 "editor-scene-forced-fallback",
@@ -397,20 +397,20 @@ def make_commands(
                 },
                 required_log_patterns=(
                     "using non-RT rendering fallback",
-                    "C11_GATE=disabled:forced_disabled",
+                    "capability_gate=disabled:forced_disabled",
                     "METAL_RT_FIXTURE_REVISION=e0-hg0-v1",
                 ),
-                forbidden_log_patterns=("METAL_RT_C13_EDITOR_HG0=passed",),
+                forbidden_log_patterns=("METAL_RT_EDITOR_HG0=passed",),
             ),
             command_record(
-                "editor-scene-c17-presentation",
-                c17_editor_command,
+                "editor-scene-presentation-presentation",
+                presentation_editor_command,
                 requires_passed="editor-scene-forced-fallback" if args.arch == "arm64" else None,
                 preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
                 environment={
                     **editor_environment,
-                    "GODOT_MRT_CAPTURE_LABEL": "c17",
-                    "GODOT_MRT_C17_PRESENTATION": "1",
+                    "GODOT_MRT_CAPTURE_LABEL": "presentation",
+                    "GODOT_MRT_PRESENTATION": "1",
                 },
                 required_log_patterns=(
                     "METAL_RT_EDITOR_ROUTE=compute_ray_query",
@@ -418,8 +418,8 @@ def make_commands(
                     "METAL_RT_SER=disabled",
                     "METAL_RT_PRESENTATION=native,fsr1,fsr2",
                     "METAL_RT_TEMPORAL_SEQUENCE=passed",
-                    "METAL_RT_C17_MAC_UX=passed",
-                    "MetalRT C17 temporal presentation history reset: context",
+                    "METAL_RT_PRESENTATION_MAC_UX=passed",
+                    "MetalRT PRESENTATION temporal presentation history reset: context",
                     "camera_cut",
                     "The saved path-tracing denoiser is unavailable",
                 ),
@@ -427,11 +427,11 @@ def make_commands(
                 required_log_counts={"The saved path-tracing denoiser is unavailable": 1},
             ),
             command_record(
-                "editor-scene-c17-verify",
+                "editor-scene-presentation-verify",
                 [sys.executable, str(PRESENTATION_VERIFY_SCRIPT), str(artifact_dir)],
-                requires_passed="editor-scene-c17-presentation" if args.arch == "arm64" else None,
+                requires_passed="editor-scene-presentation-presentation" if args.arch == "arm64" else None,
                 preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
-                required_log_patterns=("METAL_RT_C17_PRESENTATION_VERIFY=passed",),
+                required_log_patterns=("METAL_RT_PRESENTATION_VERIFY=passed",),
             ),
         ])
 
@@ -452,8 +452,8 @@ def make_commands(
         }
         geometry_markers = (
             "METAL_RT_EDITOR_ROUTE=compute_ray_query",
-            "METAL_RT_C13_EDITOR_HG0=passed",
-            "METAL_RT_C14_SCENE_GEOMETRY=passed",
+            "METAL_RT_EDITOR_HG0=passed",
+            "METAL_RT_SCENE_GEOMETRY=passed",
             "METAL_RT_MUTATION_SEQUENCE=passed",
             "METAL_RT_FIXTURE_REVISION=e1-geometry-v1",
         )
@@ -481,7 +481,7 @@ def make_commands(
                 [sys.executable, str(GEOMETRY_SCENE_VERIFY_SCRIPT), str(artifact_dir)],
                 requires_passed="geometry-scene-reload" if args.arch == "arm64" else None,
                 preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
-                required_log_patterns=("METAL_RT_C14_FIXTURE_VERIFY=passed",),
+                required_log_patterns=("METAL_RT_SCENE_GEOMETRY_FIXTURE_VERIFY=passed",),
             ),
             command_record(
                 "geometry-scene-forced-fallback",
@@ -495,10 +495,10 @@ def make_commands(
                 },
                 required_log_patterns=(
                     "using non-RT rendering fallback",
-                    "C11_GATE=disabled:forced_disabled",
+                    "capability_gate=disabled:forced_disabled",
                     "METAL_RT_FIXTURE_REVISION=e1-geometry-v1",
                 ),
-                forbidden_log_patterns=("METAL_RT_C13_EDITOR_HG0=passed", "METAL_RT_C14_SCENE_GEOMETRY=passed"),
+                forbidden_log_patterns=("METAL_RT_EDITOR_HG0=passed", "METAL_RT_SCENE_GEOMETRY=passed"),
             ),
         ])
 
@@ -519,7 +519,7 @@ def make_commands(
         }
         material_markers = (
             "METAL_RT_EDITOR_ROUTE=compute_ray_query",
-            "METAL_RT_C15_MATERIAL_DISPATCH=passed",
+            "METAL_RT_MATERIAL_DISPATCH=passed",
             "METAL_RT_ALPHA_TEST=passed",
             "METAL_RT_CUSTOM_SHADER_RELOAD=passed",
             "METAL_RT_FIXTURE_REVISION=e2-materials-v1",
@@ -548,7 +548,7 @@ def make_commands(
                 [sys.executable, str(MATERIAL_SCENE_VERIFY_SCRIPT), str(artifact_dir)],
                 requires_passed="material-scene-reload" if args.arch == "arm64" else None,
                 preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
-                required_log_patterns=("METAL_RT_C15_FIXTURE_VERIFY=passed",),
+                required_log_patterns=("METAL_RT_MATERIAL_FIXTURE_VERIFY=passed",),
             ),
             command_record(
                 "material-scene-forced-fallback",
@@ -562,10 +562,10 @@ def make_commands(
                 },
                 required_log_patterns=(
                     "using non-RT rendering fallback",
-                    "C11_GATE=disabled:forced_disabled",
+                    "capability_gate=disabled:forced_disabled",
                     "METAL_RT_FIXTURE_REVISION=e2-materials-v1",
                 ),
-                forbidden_log_patterns=("METAL_RT_C13_EDITOR_HG0=passed", "METAL_RT_C15_MATERIAL_DISPATCH=passed"),
+                forbidden_log_patterns=("METAL_RT_EDITOR_HG0=passed", "METAL_RT_MATERIAL_DISPATCH=passed"),
             ),
         ])
 
@@ -603,13 +603,13 @@ def make_commands(
         ]
         geometry_markers = (
             "METAL_RT_EDITOR_ROUTE=compute_ray_query",
-            "METAL_RT_C14_SCENE_GEOMETRY=passed",
+            "METAL_RT_SCENE_GEOMETRY=passed",
             "METAL_RT_MUTATION_SEQUENCE=passed",
             "METAL_RT_FIXTURE_REVISION=e1-geometry-v1",
         )
         material_markers = (
             "METAL_RT_EDITOR_ROUTE=compute_ray_query",
-            "METAL_RT_C15_MATERIAL_DISPATCH=passed",
+            "METAL_RT_MATERIAL_DISPATCH=passed",
             "METAL_RT_ALPHA_TEST=passed",
             "METAL_RT_CUSTOM_SHADER_RELOAD=passed",
             "METAL_RT_FIXTURE_REVISION=e2-materials-v1",
@@ -651,7 +651,7 @@ def make_commands(
                 [sys.executable, str(INTERSECTOR_PARITY_VERIFY_SCRIPT), str(artifact_dir), "e1_geometry"],
                 requires_passed="intersector-parity-geometry-query" if args.arch == "arm64" else None,
                 preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
-                required_log_patterns=("METAL_RT_B2_INTERSECTOR_PARITY=passed fixture=e1_geometry",),
+                required_log_patterns=("METAL_RT_INTERSECTOR_INTERSECTOR_PARITY=passed fixture=e1_geometry",),
             ),
             command_record(
                 "intersector-parity-material-default",
@@ -689,7 +689,7 @@ def make_commands(
                 [sys.executable, str(INTERSECTOR_PARITY_VERIFY_SCRIPT), str(artifact_dir), "e2_materials"],
                 requires_passed="intersector-parity-material-query" if args.arch == "arm64" else None,
                 preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
-                required_log_patterns=("METAL_RT_B2_INTERSECTOR_PARITY=passed fixture=e2_materials",),
+                required_log_patterns=("METAL_RT_INTERSECTOR_INTERSECTOR_PARITY=passed fixture=e2_materials",),
             ),
         ])
 
@@ -710,7 +710,7 @@ def make_commands(
         }
         procedural_markers = (
             "METAL_RT_EDITOR_ROUTE=compute_ray_query",
-            "METAL_RT_C16_PROCEDURAL=passed",
+            "METAL_RT_PROCEDURAL=passed",
             "METAL_RT_CUSTOM_INTERSECTION=passed",
             "METAL_RT_MIXED_GEOMETRY=passed",
             "METAL_RT_PROCEDURAL_UPDATE=builds:3,refits:1,removed:1",
@@ -743,7 +743,7 @@ def make_commands(
                 [sys.executable, str(PROCEDURAL_SCENE_VERIFY_SCRIPT), str(artifact_dir)],
                 requires_passed="procedural-scene-reload" if args.arch == "arm64" else None,
                 preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
-                required_log_patterns=("METAL_RT_C16_FIXTURE_VERIFY=passed",),
+                required_log_patterns=("METAL_RT_PROCEDURAL_FIXTURE_VERIFY=passed",),
             ),
             command_record(
                 "procedural-scene-forced-fallback",
@@ -757,11 +757,11 @@ def make_commands(
                 },
                 required_log_patterns=(
                     "using non-RT rendering fallback",
-                    "C11_GATE=disabled:forced_disabled",
+                    "capability_gate=disabled:forced_disabled",
                     "METAL_RT_FIXTURE_REVISION=e3-procedural-v1",
                 ),
                 forbidden_log_patterns=(
-                    "METAL_RT_C16_PROCEDURAL=passed",
+                    "METAL_RT_PROCEDURAL=passed",
                     "METAL_RT_CUSTOM_INTERSECTION=passed",
                     "METAL_RT_MIXED_GEOMETRY=passed",
                 ),
@@ -784,7 +784,7 @@ def make_commands(
                 gate_command,
                 requires_passed="caps-probe" if args.arch == "arm64" else None,
                 preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
-                required_log_patterns=("C11_GATE=enabled",),
+                required_log_patterns=("capability_gate=enabled",),
             ),
             command_record(
                 "runtime-gate-forced-fallback",
@@ -792,7 +792,7 @@ def make_commands(
                 requires_passed="runtime-gate-supported" if args.arch == "arm64" else None,
                 preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
                 environment={"GODOT_MTL_DISABLE_RAYTRACING": "1"},
-                required_log_patterns=("using non-RT rendering fallback", "C11_GATE=disabled:forced_disabled"),
+                required_log_patterns=("using non-RT rendering fallback", "capability_gate=disabled:forced_disabled"),
             ),
         ])
 
@@ -828,7 +828,7 @@ def run_command(command: dict[str, Any], index: int, artifact_dir: Path, dry_run
     command["log"] = log_path.name
     started = time.monotonic()
     with log_path.open("w", encoding="utf-8", newline="\n") as log:
-        # Tests that produce image evidence (for example the C10 controlled
+        # Tests that produce image evidence (for example the PATH_TRACER controlled
         # scene) write it into the stage artifact directory via this variable.
         command_env = {
             **os.environ,

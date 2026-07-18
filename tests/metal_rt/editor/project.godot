@@ -10,7 +10,7 @@ config_version=5
 
 [application]
 
-config/name="Metal RT C13 Editor HG0"
+config/name="Metal RT EDITOR_SCENE Editor HG0"
 run/main_scene="res://fixtures/e0_hg0.tscn"
 config/features=PackedStringArray("4.7")
 

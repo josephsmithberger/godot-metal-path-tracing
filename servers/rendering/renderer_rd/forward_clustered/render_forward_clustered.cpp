@@ -77,7 +77,7 @@ static void _print_pathtracing_presentation_history_reset(uint32_t p_reasons) {
 	if (p_reasons & PT_PRESENTATION_HISTORY_RESET_LONG_FRAME) {
 		append_reason("long_frame");
 	}
-	print_verbose("MetalRT C17 temporal presentation history reset: " + reasons);
+	print_verbose("MetalRT PRESENTATION temporal presentation history reset: " + reasons);
 }
 
 void RenderForwardClustered::RenderBufferDataForwardClustered::ensure_specular() {
@@ -2682,14 +2682,14 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		RD::get_singleton()->raytracing_list_trace_rays(raytracing_list, 0, raytracing->get_shader()->get_hit_sbt(rt_flags), rt_size.width, rt_size.height, 1);
 		RD::get_singleton()->raytracing_list_end();
 		if (raytracing->get_shader()->uses_compute_scene_lane()) {
-			static bool c13_markers_printed = false;
-			if (!c13_markers_printed) {
+			static bool editor_scene_markers_printed = false;
+			if (!editor_scene_markers_printed) {
 				print_line("METAL_RT_EDITOR_ROUTE=compute_ray_query");
 				print_line(vformat("METAL_RT_DENOISER=%s", scale_type == SCALE_MFX_DENOISED ? "metalfx" : "none"));
-				print_line("METAL_RT_C13_EDITOR_HG0=passed");
-				print_line("METAL_RT_C15_MATERIAL_DISPATCH=passed");
+				print_line("METAL_RT_EDITOR_HG0=passed");
+				print_line("METAL_RT_MATERIAL_DISPATCH=passed");
 				print_line("METAL_RT_ALPHA_TEST=passed");
-				c13_markers_printed = true;
+				editor_scene_markers_printed = true;
 			}
 			WARN_PRINT_ONCE("Metal path tracing supports triangle and procedural AABB geometry with opaque, alpha-scissored, double-sided, textured, and generated/inlined custom material/intersection bodies. Transparent blending, stage-global custom helpers, and SER remain disabled.");
 		}

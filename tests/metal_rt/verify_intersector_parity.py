@@ -139,9 +139,9 @@ def verify(artifact_dir: Path, fixture: str) -> int:
         "comparison_lane": "GODOT_MTL_RT_INTERSECTOR=0",
         "comparison": comparisons,
     }
-    metrics_path = artifact_dir / f"{fixture}_b2_intersector_parity_metrics.json"
+    metrics_path = artifact_dir / f"{fixture}_intersector_intersector_parity_metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    print(f"METAL_RT_B2_INTERSECTOR_PARITY=passed fixture={fixture} captures={len(comparisons)}")
+    print(f"METAL_RT_INTERSECTOR_INTERSECTOR_PARITY=passed fixture={fixture} captures={len(comparisons)}")
     return 0
 
 
@@ -150,7 +150,7 @@ def main() -> int:
     try:
         return verify(args.artifact_dir.resolve(), args.fixture)
     except (OSError, ImageDiffError, VerificationError) as error:
-        print(f"METAL_RT_B2_INTERSECTOR_PARITY=failed fixture={args.fixture} error={error}", file=sys.stderr)
+        print(f"METAL_RT_INTERSECTOR_INTERSECTOR_PARITY=failed fixture={args.fixture} error={error}", file=sys.stderr)
         return 1
 
 

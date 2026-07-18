@@ -124,7 +124,7 @@ func _process(_delta: float) -> void:
 		print("METAL_RT_CAPTURE_LABEL=%s" % capture_label)
 		print("METAL_RT_PROCEDURAL_UPDATE=builds:%d,refits:%d,removed:1" % [procedural_builds_expected, procedural_refits_expected])
 		if OS.get_environment("GODOT_MTL_DISABLE_RAYTRACING") != "1":
-			print("METAL_RT_C16_PROCEDURAL=passed")
+			print("METAL_RT_PROCEDURAL=passed")
 			print("METAL_RT_CUSTOM_INTERSECTION=passed")
 			print("METAL_RT_MIXED_GEOMETRY=passed")
 		get_tree().quit()
@@ -171,7 +171,7 @@ func _build_fixture() -> void:
 	)
 	fallback_procedural.size = Vector3(1.15, 1.3, 1.15)
 
-	# This invalid zero-volume record is inside a valid culling box. C16 must
+	# This invalid zero-volume record is inside a valid culling box. PROCEDURAL must
 	# omit it without dropping the valid triangle floor visible behind it.
 	invalid_procedural = _make_procedural(
 		"InvalidProcedural",
@@ -233,7 +233,7 @@ func _capture(kind: String) -> void:
 	var path := artifact_dir.path_join("e3_procedural_%s_%s.png" % [capture_label, kind])
 	var error := captured.save_png(path)
 	if error != OK:
-		push_error("Failed to save C16 editor capture %s: %s" % [path, error_string(error)])
+		push_error("Failed to save PROCEDURAL editor capture %s: %s" % [path, error_string(error)])
 
 
 func _configure_capture_camera() -> void:
@@ -282,6 +282,6 @@ func _write_manifest() -> void:
 	var manifest_path := artifact_dir.path_join("e3_procedural_%s_manifest.json" % capture_label)
 	var file := FileAccess.open(manifest_path, FileAccess.WRITE)
 	if file == null:
-		push_error("Failed to open C16 manifest: %s" % manifest_path)
+		push_error("Failed to open PROCEDURAL manifest: %s" % manifest_path)
 		return
 	file.store_string(JSON.stringify(manifest, "  ") + "\n")

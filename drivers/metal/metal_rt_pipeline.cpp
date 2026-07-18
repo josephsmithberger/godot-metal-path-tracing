@@ -58,7 +58,7 @@ bool MDRaytracingPipeline::configure_shader_groups(VectorView<RDD::PipelineShade
 		return fail("The Metal raytracing software recursion budget must be greater than zero.");
 	}
 
-	// C10 compute lane: the ray-generation group may be a re-expressed
+	// PATH_TRACER compute lane: the ray-generation group may be a re-expressed
 	// ray-query compute kernel instead of an RT-pipeline stage. That kernel is
 	// monolithic — raygen, miss, and hit logic are inlined — so it must be the
 	// only shader in the pipeline; miss and hit groups are retained purely as

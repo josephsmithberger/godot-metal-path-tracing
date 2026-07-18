@@ -549,7 +549,7 @@ private:
 	static void _replace_identifier(String &r_source, const String &p_identifier, const String &p_replacement);
 	void _kick_rebuild_if_idle();
 
-	// Compute-lane aggregate rebuild (P1): one batched compile per burst of
+	// Compute-lane aggregate rebuild (AGGREGATE_COMPILATION): one batched compile per burst of
 	// newly ready material slots, run off-thread; the previous pipeline keeps
 	// serving frames until the generation-checked swap at the frame boundary.
 	struct ComputeBuildTask;

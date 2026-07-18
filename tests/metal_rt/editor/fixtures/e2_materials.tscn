@@ -21,7 +21,7 @@ pathtracing_samples_per_pixel = 4
 pathtracing_max_bounces = 2
 pathtracing_denoiser = 0
 
-[node name="C15MaterialDispatch" type="Node3D"]
+[node name="MATERIALMaterialDispatch" type="Node3D"]
 script = ExtResource("1_capture")
 
 [node name="WorldEnvironment" type="WorldEnvironment" parent="."]

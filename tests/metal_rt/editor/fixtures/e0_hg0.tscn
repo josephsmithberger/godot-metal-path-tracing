@@ -56,7 +56,7 @@ height = 1.7
 radial_segments = 32
 rings = 16
 
-[node name="C13EditorHG0" type="Node3D"]
+[node name="EDITOR_SCENEEditorHG0" type="Node3D"]
 script = ExtResource("1_capture")
 
 [node name="WorldEnvironment" type="WorldEnvironment" parent="."]

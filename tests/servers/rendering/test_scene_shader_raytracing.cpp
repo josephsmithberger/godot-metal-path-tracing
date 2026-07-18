@@ -41,7 +41,7 @@ namespace TestSceneShaderRaytracing {
 
 using SceneShader = RendererSceneRenderImplementation::SceneShaderRaytracing;
 
-TEST_CASE("[MetalRT] C13 selects the editor route only when its scene shader is ready") {
+TEST_CASE("[MetalRT] EDITOR_SCENE selects the editor route only when its scene shader is ready") {
 	CHECK(SceneShader::select_scene_route(true, false, false) == SceneShader::SceneRoute::RAYTRACING_PIPELINE);
 	CHECK(SceneShader::select_scene_route(true, true, false) == SceneShader::SceneRoute::RAYTRACING_PIPELINE);
 	CHECK(SceneShader::select_scene_route(false, true, true) == SceneShader::SceneRoute::COMPUTE_RAY_QUERY);
@@ -49,7 +49,7 @@ TEST_CASE("[MetalRT] C13 selects the editor route only when its scene shader is 
 	CHECK(SceneShader::select_scene_route(false, false, true) == SceneShader::SceneRoute::UNAVAILABLE);
 }
 
-TEST_CASE("[MetalRT] C13 masks unsupported Metal scene variants") {
+TEST_CASE("[MetalRT] EDITOR_SCENE masks unsupported Metal scene variants") {
 	uint32_t flags = SceneShader::rt_flags_pack(
 			SceneShader::RT_FLAG_DEBUG_VIS_ENABLED |
 					SceneShader::RT_FLAG_DENOISER_GUIDES_ENABLED |
@@ -65,7 +65,7 @@ TEST_CASE("[MetalRT] C13 masks unsupported Metal scene variants") {
 	CHECK(((sanitized >> SceneShader::RT_MAX_BOUNCES_SHIFT) & SceneShader::RT_MAX_BOUNCES_MASK) == 2);
 }
 
-TEST_CASE("[MetalRT] C17 resets temporal presentation history on discontinuities") {
+TEST_CASE("[MetalRT] PRESENTATION resets temporal presentation history on discontinuities") {
 	using namespace RendererSceneRenderImplementation;
 	PathtracingPresentationHistory history;
 	const Transform3D camera;
@@ -94,7 +94,7 @@ TEST_CASE("[MetalRT] C17 resets temporal presentation history on discontinuities
 	CHECK((reasons & PT_PRESENTATION_HISTORY_RESET_LONG_FRAME) != 0);
 }
 
-TEST_CASE("[MetalRT] C17 keeps NVIDIA SER disabled on the Metal compute lane") {
+TEST_CASE("[MetalRT] PRESENTATION keeps NVIDIA SER disabled on the Metal compute lane") {
 	const uint32_t requested = SceneShader::rt_flags_pack(SceneShader::RT_FLAG_SER_ENABLED, 1, 1);
 	const uint32_t sanitized = SceneShader::sanitize_compute_rt_flags(requested);
 	CHECK((sanitized & SceneShader::RT_FLAG_SER_ENABLED) == 0);
@@ -115,7 +115,7 @@ TEST_CASE("[MetalRT] MetalFX denoising enables path-tracing guide output") {
 	CHECK((flags & SceneShader::RT_FLAG_DENOISER_GUIDES_ENABLED) == 0);
 }
 
-TEST_CASE("[MetalRT] C14 preserves front-face winding across mirrored transforms") {
+TEST_CASE("[MetalRT] SCENE_GEOMETRY preserves front-face winding across mirrored transforms") {
 	using namespace RendererSceneRenderImplementation;
 	const uint32_t flip = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT;
 	const uint32_t opaque = RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
@@ -129,7 +129,7 @@ TEST_CASE("[MetalRT] C14 preserves front-face winding across mirrored transforms
 	CHECK(rt_instance_flags_apply_transform_winding(opaque, mirrored) == (flip | opaque));
 }
 
-TEST_CASE("[MetalRT] C15 material ABI carries dispatch, alpha, identity, and custom uniforms") {
+TEST_CASE("[MetalRT] MATERIAL material ABI carries dispatch, alpha, identity, and custom uniforms") {
 	using namespace RendererSceneRenderImplementation;
 	CHECK(sizeof(RT_MaterialData) == 112);
 	CHECK(offsetof(RT_MaterialData, uniform_address) == 88);
@@ -150,7 +150,7 @@ TEST_CASE("[MetalRT] C15 material ABI carries dispatch, alpha, identity, and cus
 	CHECK(material.material_id == 73);
 }
 
-TEST_CASE("[MetalRT] C15 material cache key invalidates on RID, parameters, and shader generation") {
+TEST_CASE("[MetalRT] MATERIAL material cache key invalidates on RID, parameters, and shader generation") {
 	using namespace RendererSceneRenderImplementation;
 	CHECK(rt_material_cache_needs_refresh(false, 7, 11, 7, 11));
 	CHECK_FALSE(rt_material_cache_needs_refresh(true, 7, 11, 7, 11));
@@ -167,7 +167,7 @@ TEST_CASE("[MetalRT] C15 material cache key invalidates on RID, parameters, and 
 	CHECK_FALSE(first == reloaded);
 }
 
-TEST_CASE("[MetalRT] P1 compute aggregate debounce waits for a quiet finalize pass") {
+TEST_CASE("[MetalRT] AGGREGATE_COMPILATION compute aggregate debounce waits for a quiet finalize pass") {
 	SceneShader::ComputeCompileDebounce debounce;
 	CHECK(debounce.is_ready(0));
 	CHECK_FALSE(debounce.is_ready(1));
@@ -179,7 +179,7 @@ TEST_CASE("[MetalRT] P1 compute aggregate debounce waits for a quiet finalize pa
 	CHECK(debounce.is_ready(3));
 }
 
-TEST_CASE("[MetalRT] P1 aggregate cache insertion never overwrites an owner") {
+TEST_CASE("[MetalRT] AGGREGATE_COMPILATION aggregate cache insertion never overwrites an owner") {
 	HashMap<uint64_t, RID> cache;
 	const RID first = RID::from_uint64(11);
 	const RID duplicate = RID::from_uint64(22);
@@ -189,7 +189,7 @@ TEST_CASE("[MetalRT] P1 aggregate cache insertion never overwrites an owner") {
 	CHECK(*cache.getptr(7) == first);
 }
 
-TEST_CASE("[MetalRT] P4 TLAS growth stays standard at the limit boundary") {
+TEST_CASE("[MetalRT] ACCELERATION_LIMITS TLAS growth stays standard at the limit boundary") {
 	using namespace RendererSceneRenderImplementation;
 	constexpr uint64_t standard_limit = 1ull << 24;
 	CHECK(rt_tlas_growth_capacity((1u << 23) + 1, standard_limit) == standard_limit);
@@ -197,7 +197,7 @@ TEST_CASE("[MetalRT] P4 TLAS growth stays standard at the limit boundary") {
 	CHECK(rt_tlas_growth_capacity((uint32_t)standard_limit + 1, standard_limit) == standard_limit + 1);
 }
 
-TEST_CASE("[MetalRT] C15 custom uniform and bindless texture writes stay within their BDA record") {
+TEST_CASE("[MetalRT] MATERIAL custom uniform and bindless texture writes stay within their BDA record") {
 	using namespace RendererSceneRenderImplementation;
 	CHECK(rt_material_buffer_write_fits(0, 16, 32));
 	CHECK(rt_material_buffer_write_fits(28, 4, 32));
@@ -205,7 +205,7 @@ TEST_CASE("[MetalRT] C15 custom uniform and bindless texture writes stay within 
 	CHECK_FALSE(rt_material_buffer_write_fits(UINT32_MAX, 4, 32));
 }
 
-TEST_CASE("[MetalRT] C16 validates explicit and fallback procedural bounds") {
+TEST_CASE("[MetalRT] PROCEDURAL validates explicit and fallback procedural bounds") {
 	using namespace RendererSceneRenderImplementation;
 	const float valid_bounds[] = {
 		-1.0f,
@@ -253,7 +253,7 @@ TEST_CASE("[MetalRT] C16 validates explicit and fallback procedural bounds") {
 	CHECK(error.contains("positive volume"));
 }
 
-TEST_CASE("[MetalRT] C16 procedural geometry ABI preserves IDs and hit attributes") {
+TEST_CASE("[MetalRT] PROCEDURAL procedural geometry ABI preserves IDs and hit attributes") {
 	using namespace RendererSceneRenderImplementation;
 	CHECK(sizeof(RT_GeometryData) == 128);
 	CHECK(offsetof(RT_GeometryData, flags) == 68);

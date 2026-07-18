@@ -756,7 +756,7 @@ public:
 #pragma mark - Raytracing Commands
 
 	/// Dispatches the bound compute-lane raytracing pipeline over a
-	/// `p_width` x `p_height` x `p_depth` pixel grid (C10). The kernel is
+	/// `p_width` x `p_height` x `p_depth` pixel grid (PATH_TRACER). The kernel is
 	/// responsible for bounds-checking because threadgroups round up.
 	virtual void trace_rays(uint32_t p_width, uint32_t p_height, uint32_t p_depth) = 0;
 
@@ -1160,7 +1160,7 @@ public:
  * dispatch whose kernel uses a ray query or the MSL intersector. Godot's Vulkan-
  * shaped shader groups are retained as small, deterministic records. Triangle
  * groups share Metal's system opaque-triangle intersection function; procedural
- * groups reserve stable table slots for the compute lowering supplied by C10.
+ * groups reserve stable table slots for the compute lowering supplied by PATH_TRACER.
  */
 class API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0), visionos(2.0)) MDRaytracingPipeline final : public MDPipeline {
 public:
@@ -1214,7 +1214,7 @@ public:
 
 	/// Compute pipeline that hosts the trace kernel (raygen equivalent).
 	NS::SharedPtr<MTL::ComputePipelineState> state;
-	/// Pipeline-specific table. C8 installs Metal's opaque-triangle function at
+	/// Pipeline-specific table. TRACE_KERNEL installs Metal's opaque-triangle function at
 	/// index zero; custom procedural intersection functions remain a later step.
 	NS::SharedPtr<MTL::IntersectionFunctionTable> intersection_function_table;
 	uint32_t intersection_function_count = 0;
@@ -1228,7 +1228,7 @@ public:
 	// budget which the compute-lane kernel must enforce explicitly.
 	uint32_t max_trace_recursion_depth = 0;
 	// True when the ray-generation group is a re-expressed ray-query compute
-	// kernel supplied by the engine (C10) rather than an RT-pipeline stage.
+	// kernel supplied by the engine (PATH_TRACER) rather than an RT-pipeline stage.
 	bool uses_compute_lane = false;
 	MDShader *shader = nullptr;
 	MTL::Size threads_per_threadgroup = MTL::Size(8, 8, 1);
@@ -1236,12 +1236,12 @@ public:
 	bool configure_shader_groups(VectorView<RDD::PipelineShader> p_shaders, VectorView<uint32_t> p_raygen_shader_indices, VectorView<uint32_t> p_miss_shader_indices, VectorView<RDD::HitGroup> p_hit_groups, uint32_t p_max_trace_recursion_depth, String *r_error = nullptr);
 	bool get_shader_group_handles(uint32_t p_group_index_offset, VectorView<uint32_t> p_group_indices, uint8_t *r_data, uint32_t p_data_stride_bytes, String *r_error = nullptr) const;
 
-	/// Creates the backend-owned C8 kernel and its intersection-function table.
+	/// Creates the backend-owned TRACE_KERNEL kernel and its intersection-function table.
 	bool create_trace_one_ray(MTL::Device *p_device, String *r_error = nullptr);
 	/// Encodes a 2D image dispatch. Each output pixel is four bytes (RGBA8).
 	bool encode_trace_one_ray(MTL::ComputeCommandEncoder *p_encoder, MTL::AccelerationStructure *p_tlas, MTL::Buffer *p_output_buffer, uint32_t p_width, uint32_t p_height) const;
 
-	/// Creates the compute pipeline state for a C10 compute-lane kernel. The
+	/// Creates the compute pipeline state for a PATH_TRACER compute-lane kernel. The
 	/// function is the engine's re-expressed ray-query compute entry point and
 	/// `p_local` its reflected workgroup size. Ray-query kernels use no
 	/// intersection-function table.
@@ -1458,7 +1458,7 @@ public:
  * The record's native prefix is the 68-byte UserID descriptor
  * (`MTL::AccelerationStructureUserIDInstanceDescriptor`), whose first 64 bytes
  * are identical to the default descriptor. `user_id` carries Godot's instance
- * custom index so the C10 ray-query compute lane can read it through
+ * custom index so the PATH_TRACER ray-query compute lane can read it through
  * `rayQueryGetIntersectionInstanceCustomIndexEXT` (SPIRV-Cross lowers it to
  * MSL `user_instance_id`). Consuming the field requires the TLAS descriptor
  * type to be UserID, which `tlas_create()` selects on macOS 12+; at the
@@ -1565,7 +1565,7 @@ inline bool MDAccelerationStructure::prepare_tlas_build(MTL::Buffer *p_instance_
 				(blas_info != nullptr && (blas_info->type != Type::BLAS || !blas_info->accel || !blas_info->build_encoded))) {
 			return false;
 		}
-		// Coherence gate (P4): the compiled MSL (SPIRV-Cross ray query and the
+		// Coherence gate (ACCELERATION_LIMITS): the compiled MSL (SPIRV-Cross ray query and the
 		// intersector lowering) does not declare the `extended_limits`
 		// intersection tag, so tracing an extended-limits structure would be
 		// undefined. Oversized structures build correctly but are refused here
