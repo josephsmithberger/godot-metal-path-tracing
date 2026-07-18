@@ -2025,27 +2025,17 @@ void RenderRaytracing::finalize_buffers(RTViewportState *p_state) {
 	update_or_grow(p_state->material_buffer, p_state->material_buffer_capacity,
 			material_data.ptr(), material_data.size() * sizeof(RT_MaterialData));
 
-	// Mirrors the shader's candidate alpha test: a candidate can only be
-	// rejected when the material carries an alpha scissor or a non-HG0 custom
-	// dispatch. When no material can reject, RT_FLAG_ALL_OPAQUE lets the
-	// kernel fold the whole candidate-accept path out at pipeline compile.
-	// Stored per viewport so pipeline selection always matches the table this
-	// viewport traces against in the same frame.
-	const bool was_all_opaque = p_state->material_table_all_opaque;
-	p_state->material_table_all_opaque = true;
-	for (const RT_MaterialData &mat : material_data) {
-		if ((mat.flags & RT_MAT_FLAG_ALPHA_SCISSOR) != 0 ||
-				((mat.flags & RT_MAT_FLAG_CUSTOM_SHADER) != 0 && mat.dispatch_index != 0)) {
-			p_state->material_table_all_opaque = false;
-			if (OS::get_singleton()->get_environment("GODOT_RT_DUMP_OPAQUE") == "1") {
-				print_line(vformat("RT_OPAQUE_BLOCKER material_id=%d flags=0x%x dispatch=%d", mat.material_id, mat.flags, mat.dispatch_index));
-			}
-			break;
-		}
+	p_state->traversal_has_opaque_triangles = false;
+	p_state->traversal_has_query_instances = false;
+	p_state->traversal_has_procedural_instances = false;
+	for (uint32_t i = 0; i < instance_masks.size(); i++) {
+		const uint8_t mask = instance_masks[i];
+		p_state->traversal_has_opaque_triangles |= (mask & RT_INSTANCE_MASK_OPAQUE_TRIANGLE) != 0;
+		p_state->traversal_has_query_instances |= (mask & RT_INSTANCE_MASK_QUERY) != 0;
+		p_state->traversal_has_procedural_instances |= i < geometry_data.size() &&
+				(geometry_data[i].flags & RT_GEOM_FLAG_PROCEDURAL) != 0;
 	}
-	if (was_all_opaque != p_state->material_table_all_opaque && OS::get_singleton()->get_environment("GODOT_RT_DUMP_OPAQUE") == "1") {
-		print_line(vformat("RT_MATERIAL_TABLE all_opaque=%s materials=%d", p_state->material_table_all_opaque ? "true" : "false", material_data.size()));
-	}
+
 	update_or_grow(p_state->motion_index_buffer, p_state->motion_index_buffer_capacity,
 			motion_indices.ptr(), motion_indices.size() * sizeof(int32_t));
 	update_or_grow(p_state->motion_transform_buffer, p_state->motion_transform_buffer_capacity,
@@ -2656,7 +2646,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				uint32_t inst_flags = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT |
 						RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 				instance_flags.push_back(inst_flags);
-				instance_masks.push_back(0xFF);
+				instance_masks.push_back(RT_INSTANCE_MASK_QUERY);
 
 #ifdef TOOLS_ENABLED
 				if (collect_render_info) {
@@ -2930,8 +2920,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 				}
 			}
-			instance_flags.push_back(rt_instance_flags_apply_transform_winding(inst_flags, final_transform));
-			instance_masks.push_back(0xFF);
+			inst_flags = rt_instance_flags_apply_transform_winding(inst_flags, final_transform);
+			instance_flags.push_back(inst_flags);
+			instance_masks.push_back(rt_instance_traversal_mask(inst_flags, surf_data->geometry.flags));
 
 			surf = surf->next;
 		}
@@ -2960,8 +2951,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			sbt_offsets.push_back(pending.mat_data->rt_sbt_offset);
 			material_data.push_back(pending.mat_data->data);
 			motion_indices.push_back(-1);
-			instance_flags.push_back(rt_instance_flags_apply_transform_winding(pending.inst_flags, pending.instance_transform));
-			instance_masks.push_back(0xFF);
+			const uint32_t inst_flags = rt_instance_flags_apply_transform_winding(pending.inst_flags, pending.instance_transform);
+			instance_flags.push_back(inst_flags);
+			instance_masks.push_back(rt_instance_traversal_mask(inst_flags, merged_sd.geometry.flags));
 #ifdef TOOLS_ENABLED
 			if (collect_render_info) {
 				tlas_instance_count++;
@@ -3032,8 +3024,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					motion_indices.push_back(-1);
 				}
 
-				instance_flags.push_back(rt_instance_flags_apply_transform_winding(pending.inst_flags, final_transform));
-				instance_masks.push_back(0xFF);
+				const uint32_t inst_flags = rt_instance_flags_apply_transform_winding(pending.inst_flags, final_transform);
+				instance_flags.push_back(inst_flags);
+				instance_masks.push_back(rt_instance_traversal_mask(inst_flags, surf_data->geometry.flags));
 			}
 
 #ifdef TOOLS_ENABLED
@@ -3664,13 +3657,6 @@ void RenderRaytracing::copy_output_texture(const RenderDataRD *p_render_data) {
 	Ref<RenderForwardClustered::RenderBufferDataForwardClustered> rb_data = rb->get_custom_data(RB_SCOPE_FORWARD_CLUSTERED);
 	if (rb_data.is_null() || !rb_data->rt_has_texture()) {
 		return;
-	}
-
-	// Copy raytracing output to main color buffer
-	for (uint32_t v = 0; v < rb->get_view_count(); v++) {
-		RID src = rb_data->rt_get_texture();
-		RID dst = rb->get_internal_texture(v);
-		owner->copy_effects->copy_to_rect(src, dst, Rect2i(0, 0, rb->get_internal_size().x, rb->get_internal_size().y), false, false, false, false, false, true);
 	}
 
 	// Debug: read the raw RGBA16F path-tracer output back and count pixels with

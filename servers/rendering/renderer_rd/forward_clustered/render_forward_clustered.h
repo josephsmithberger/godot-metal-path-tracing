@@ -184,8 +184,11 @@ public:
 
 		// Raytracing support
 		void rt_ensure_textures();
-		bool rt_has_texture() const { return render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING); }
-		RID rt_get_texture() const { return render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING); }
+		// The path tracer writes the storage-capable main color texture directly;
+		// keeping a second full-resolution color image only to copy it here cost
+		// bandwidth and delayed every downstream editor effect.
+		bool rt_has_texture() const { return render_buffers->has_internal_texture(); }
+		RID rt_get_texture() const { return render_buffers->get_internal_texture(); }
 		bool rt_has_depth_texture() const { return render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_DEPTH); }
 		RID rt_get_depth_texture() const { return render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_DEPTH); }
 
@@ -887,6 +890,8 @@ private:
 	/* Raytracing */
 	bool _setup_rt();
 	uint32_t _apply_editor_interactive_rt_quality(uint32_t p_rt_flags, const RenderDataRD *p_render_data, RenderBufferDataForwardClustered *p_rb_data);
+	bool _editor_interactive_rt_active(const RenderDataRD *p_render_data, RenderBufferDataForwardClustered *p_rb_data);
+	bool _editor_interactive_use_temporal_upscaler(const RenderDataRD *p_render_data) const;
 
 	/* Debug */
 	void _debug_draw_cluster(Ref<RenderSceneBuffersRD> p_render_buffers);

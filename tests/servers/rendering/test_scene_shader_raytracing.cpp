@@ -129,6 +129,15 @@ TEST_CASE("[MetalRT] SCENE_GEOMETRY preserves front-face winding across mirrored
 	CHECK(rt_instance_flags_apply_transform_winding(opaque, mirrored) == (flip | opaque));
 }
 
+TEST_CASE("[MetalRT] SCENE_GEOMETRY partitions native opaque and query traversal") {
+	using namespace RendererSceneRenderImplementation;
+	const uint32_t opaque = RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
+	CHECK(rt_instance_traversal_mask(opaque, 0) == RT_INSTANCE_MASK_OPAQUE_TRIANGLE);
+	CHECK(rt_instance_traversal_mask(0, 0) == RT_INSTANCE_MASK_QUERY);
+	CHECK(rt_instance_traversal_mask(opaque, RT_GEOM_FLAG_PROCEDURAL) == RT_INSTANCE_MASK_QUERY);
+	CHECK((RT_INSTANCE_MASK_OPAQUE_TRIANGLE | RT_INSTANCE_MASK_QUERY) == RT_INSTANCE_MASK_ALL);
+}
+
 TEST_CASE("[MetalRT] MATERIAL material ABI carries dispatch, alpha, identity, and custom uniforms") {
 	using namespace RendererSceneRenderImplementation;
 	CHECK(sizeof(RT_MaterialData) == 112);

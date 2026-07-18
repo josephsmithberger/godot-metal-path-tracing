@@ -137,10 +137,13 @@ public:
 		RT_FLAG_DENOISER_GUIDES_ENABLED = (1 << 1),
 		RT_FLAG_FOG_ENABLED = (1 << 2),
 		RT_FLAG_SER_ENABLED = (1 << 3),
-		// No material in the table can reject a traversal candidate; the
-		// compute-lane kernel compiles out the candidate alpha-test path and
-		// traverses with the opaque ray flag.
+		// Every visible TLAS instance is an opaque triangle; the compute lane
+		// compiles out candidate evaluation and uses native opaque traversal.
 		RT_FLAG_ALL_OPAQUE = (1 << 4),
+		// The TLAS contains both native-opaque triangles and alpha/procedural
+		// query instances. Metal traces the opaque partition with its native
+		// intersector, queries only the second partition, and selects the nearest.
+		RT_FLAG_MIXED_ALPHA = (1 << 5),
 	};
 
 	constexpr static uint32_t RT_SAMPLE_COUNT_SHIFT = 21;
