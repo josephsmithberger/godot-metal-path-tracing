@@ -1,0 +1,7 @@
+# Heavy binaries / generated output — kept out of git history
+artifacts/
+__pycache__/
+perf/
+apple-bug-report/
+apple-metal-rt-inline-bug.zip
+.DS_Store

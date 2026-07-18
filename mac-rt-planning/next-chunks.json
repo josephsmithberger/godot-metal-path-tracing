@@ -1,0 +1,192 @@
+{
+  "schema_version": 1,
+  "plan_id": "metal-rt-editor-parity-c13-c18",
+  "status_vocabulary": [
+    "available",
+    "scaffolded",
+    "planned",
+    "blocked"
+  ],
+  "test_profiles": [
+    "L0",
+    "L1",
+    "L2",
+    "L3",
+    "L4",
+    "L5-C",
+    "L5-E0",
+    "L5-E1",
+    "L5-E2",
+    "L5-E3",
+    "L6"
+  ],
+  "documents": [
+    "mac-rt-planning/README.md",
+    "mac-rt-planning/editor-parity-findings.md",
+    "mac-rt-planning/next-chunks.md",
+    "mac-rt-planning/editor-scene-testing.md",
+    "mac-rt-planning/testing-standard.md",
+    "mac-rt-planning/automation.md"
+  ],
+  "canonical_test_runner": "tests/metal_rt/run_mac_rt_tests.py",
+  "chunks": [
+    {
+      "id": "C13",
+      "title": "First Metal path-traced editor scene (HG0)",
+      "status": "planned",
+      "depends_on": [
+        "C12"
+      ],
+      "plan": "mac-rt-planning/chunks/c13-editor-hg0.md",
+      "required_test_profiles": [
+        "L0",
+        "L1",
+        "L3",
+        "L4",
+        "L5-E0"
+      ],
+      "future_runner_stages": [
+        "editor-scene",
+        "fallback",
+        "image"
+      ],
+      "acceptance_markers": [
+        "METAL_RT_C13_EDITOR_HG0=passed",
+        "METAL_RT_EDITOR_ROUTE=compute_ray_query",
+        "METAL_RT_DENOISER=none"
+      ]
+    },
+    {
+      "id": "C14",
+      "title": "Real scene geometry and lifetime",
+      "status": "planned",
+      "depends_on": [
+        "C13"
+      ],
+      "plan": "mac-rt-planning/chunks/c14-scene-geometry.md",
+      "required_test_profiles": [
+        "L1",
+        "L3",
+        "L4",
+        "L5-E1"
+      ],
+      "future_runner_stages": [
+        "editor-scene",
+        "stability"
+      ],
+      "acceptance_markers": [
+        "METAL_RT_C14_SCENE_GEOMETRY=passed",
+        "METAL_RT_RESOURCE_LIFETIME=passed"
+      ]
+    },
+    {
+      "id": "C15",
+      "title": "Alpha and custom material dispatch",
+      "status": "planned",
+      "depends_on": [
+        "C14"
+      ],
+      "plan": "mac-rt-planning/chunks/c15-material-dispatch.md",
+      "required_test_profiles": [
+        "L1",
+        "L3",
+        "L4",
+        "L5-E2"
+      ],
+      "future_runner_stages": [
+        "editor-scene",
+        "stability"
+      ],
+      "acceptance_markers": [
+        "METAL_RT_C15_MATERIAL_DISPATCH=passed",
+        "METAL_RT_ALPHA_TEST=passed",
+        "METAL_RT_CUSTOM_SHADER_RELOAD=passed"
+      ]
+    },
+    {
+      "id": "C16",
+      "title": "Procedural geometry and custom intersections",
+      "status": "planned",
+      "depends_on": [
+        "C15"
+      ],
+      "plan": "mac-rt-planning/chunks/c16-procedural-geometry.md",
+      "required_test_profiles": [
+        "L1",
+        "L3",
+        "L4",
+        "L5-E3"
+      ],
+      "future_runner_stages": [
+        "editor-scene",
+        "stability"
+      ],
+      "acceptance_markers": [
+        "METAL_RT_C16_PROCEDURAL=passed",
+        "METAL_RT_CUSTOM_INTERSECTION=passed",
+        "METAL_RT_MIXED_GEOMETRY=passed"
+      ]
+    },
+    {
+      "id": "C17",
+      "title": "Mac UX, denoising, and presentation",
+      "status": "planned",
+      "depends_on": [
+        "C13"
+      ],
+      "plan": "mac-rt-planning/chunks/c17-mac-ux-denoising.md",
+      "required_test_profiles": [
+        "L1",
+        "L3",
+        "L5-E0",
+        "L5-E2"
+      ],
+      "future_runner_stages": [
+        "editor-scene",
+        "image"
+      ],
+      "acceptance_markers": [
+        "METAL_RT_C17_MAC_UX=passed",
+        "METAL_RT_DENOISER_DEFAULT=none",
+        "METAL_RT_SER=disabled"
+      ]
+    },
+    {
+      "id": "C18",
+      "title": "Exports, CI, stability, and shipping parity",
+      "status": "planned",
+      "depends_on": [
+        "C14",
+        "C15",
+        "C16",
+        "C17"
+      ],
+      "plan": "mac-rt-planning/chunks/c18-shipping-parity.md",
+      "required_test_profiles": [
+        "L0",
+        "L1",
+        "L2",
+        "L3",
+        "L4",
+        "L5-E0",
+        "L5-E1",
+        "L5-E2",
+        "L5-E3",
+        "L6"
+      ],
+      "future_runner_stages": [
+        "editor-scene",
+        "export",
+        "fallback",
+        "image",
+        "stability"
+      ],
+      "acceptance_markers": [
+        "METAL_RT_C18_EXPORT=passed",
+        "METAL_RT_C18_CI=passed",
+        "METAL_RT_C18_STABILITY=passed",
+        "METAL_RT_C18_PARITY=passed"
+      ]
+    }
+  ]
+}
