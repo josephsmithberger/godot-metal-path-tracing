@@ -656,6 +656,68 @@ Error RenderingDevice::tlas_build(RID p_tlas, Span<AccelerationStructureInstance
 	return OK;
 }
 
+uint64_t RenderingDevice::blas_get_compacted_size(RID p_blas) {
+	_THREAD_SAFE_METHOD_
+
+	AccelerationStructure *blas = acceleration_structure_owner.get_or_null(p_blas);
+	ERR_FAIL_NULL_V_MSG(blas, 0, "BLAS argument is not valid.");
+	ERR_FAIL_COND_V_MSG(blas->type != RDD::ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL, 0, "Compacted sizes are only recorded for BLAS resources.");
+	return driver->acceleration_structure_get_compacted_size(blas->driver_id);
+}
+
+uint64_t RenderingDevice::blas_get_allocated_size(RID p_blas) {
+	_THREAD_SAFE_METHOD_
+
+	AccelerationStructure *blas = acceleration_structure_owner.get_or_null(p_blas);
+	ERR_FAIL_NULL_V_MSG(blas, 0, "BLAS argument is not valid.");
+	return driver->acceleration_structure_get_allocated_size(blas->driver_id);
+}
+
+RID RenderingDevice::blas_create_compacted_target(uint64_t p_size) {
+	ERR_FAIL_COND_V_MSG(p_size == 0, RID(), "A compacted BLAS target requires a nonzero size.");
+
+	AccelerationStructure acceleration_structure;
+	acceleration_structure.type = RDD::ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+	acceleration_structure.driver_id = driver->blas_create_compacted_target(p_size);
+	if (!acceleration_structure.driver_id) {
+		// The driver has no compaction support; callers treat this as "skip".
+		return RID();
+	}
+
+	acceleration_structure.draw_tracker = RDG::resource_tracker_create();
+	acceleration_structure.draw_tracker->acceleration_structure_driver_id = acceleration_structure.driver_id;
+	acceleration_structure.draw_tracker->usage = RDG::RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ_WRITE;
+
+	RID id = acceleration_structure_owner.make_rid(acceleration_structure);
+#ifdef DEV_ENABLED
+	set_resource_name(id, "RID:" + itos(id.get_id()));
+#endif
+	return id;
+}
+
+Error RenderingDevice::blas_compact(RID p_source, RID p_destination) {
+	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
+
+	ERR_FAIL_COND_V_MSG(draw_list.active, ERR_INVALID_PARAMETER, "Compacting a BLAS is forbidden during creation of a draw list.");
+	ERR_FAIL_COND_V_MSG(compute_list.active, ERR_INVALID_PARAMETER, "Compacting a BLAS is forbidden during creation of a compute list.");
+	ERR_FAIL_COND_V_MSG(raytracing_list.active, ERR_INVALID_PARAMETER, "Compacting a BLAS is forbidden during creation of a raytracing list.");
+
+	AccelerationStructure *src = acceleration_structure_owner.get_or_null(p_source);
+	ERR_FAIL_NULL_V_MSG(src, ERR_INVALID_PARAMETER, "Source BLAS argument is not valid.");
+	ERR_FAIL_COND_V_MSG(src->type != RDD::ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL, ERR_INVALID_PARAMETER, "Only BLAS resources can be compacted.");
+	ERR_FAIL_COND_V_MSG(src->invalidated, ERR_INVALID_PARAMETER, "Source BLAS has not been built or was invalidated.");
+
+	AccelerationStructure *dst = acceleration_structure_owner.get_or_null(p_destination);
+	ERR_FAIL_NULL_V_MSG(dst, ERR_INVALID_PARAMETER, "Destination BLAS argument is not valid.");
+	ERR_FAIL_COND_V_MSG(dst->type != RDD::ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL, ERR_INVALID_PARAMETER, "The compaction destination must be a BLAS.");
+
+	draw_graph.add_blas_compact(src->driver_id, dst->driver_id, dst->draw_tracker, src->draw_tracker);
+
+	dst->invalidated = false;
+
+	return OK;
+}
+
 /**********************************/
 /**** HIT SHADER BINDING TABLE ****/
 /**********************************/

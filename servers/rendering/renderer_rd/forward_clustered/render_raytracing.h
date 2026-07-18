@@ -287,11 +287,21 @@ struct RTProceduralState {
 };
 
 struct RTSurfaceData {
+	/// Static-BLAS compaction lifecycle (P2). Compaction is asynchronous: the
+	/// build records a compacted size, a later frame copies into a right-sized
+	/// allocation, swaps the RID, and defers the source free.
+	enum class BlasCompaction : uint8_t {
+		INELIGIBLE, // Updatable/fast-build BLAS, or the driver has no support.
+		PENDING, // Built with ALLOW_COMPACTION; waiting on the recorded size.
+		DONE, // Compacted, or measured not worth the copy.
+	};
+
 	RID blas;
 	RT_GeometryData geometry = {};
 	Transform3D aabb_transform;
 	bool is_compressed = false;
 	uint64_t blas_size = 0;
+	BlasCompaction compaction = BlasCompaction::INELIGIBLE;
 };
 
 /// Inputs for a surface backed by a per-frame-deformed vertex buffer.
@@ -500,6 +510,21 @@ class RenderRaytracing {
 	LocalVector<uint32_t> instance_flags;
 	LocalVector<uint8_t> instance_masks; // Per-instance ray mask (0x00 = invisible to rays, 0xFF = normal)
 	LocalVector<uint32_t> sbt_offsets; // 0 = default material hit group
+
+	// P2: static-BLAS compaction. Candidates are collected during the surface
+	// walk (pointers stay valid until build_acceleration_structures later the
+	// same frame) and processed there under a per-frame budget so concurrent
+	// old + new + copy allocations stay bounded.
+	static constexpr uint32_t MAX_BLAS_COMPACTIONS_PER_FRAME = 8;
+	LocalVector<RTSurfaceData *> compaction_candidates;
+	bool blas_compaction_supported = false;
+	bool blas_compaction_support_checked = false;
+	uint32_t compacted_blas_count = 0;
+	uint64_t compacted_blas_bytes_saved = 0;
+
+	bool _blas_compaction_enabled();
+	void _collect_compaction_candidate(RTSurfaceData *p_surf_data);
+	void _process_blas_compactions();
 
 	HashMap<RenderSceneBuffersRD *, RTViewportState *> viewport_states;
 

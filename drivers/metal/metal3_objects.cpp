@@ -1567,6 +1567,18 @@ void MDCommandBuffer::acceleration_structure_refit(MDAccelerationStructure *p_ac
 	retain_resource(reinterpret_cast<CFTypeRef>(p_scratch_buffer));
 }
 
+void MDCommandBuffer::acceleration_structure_compact(MDAccelerationStructure *p_source, MDAccelerationStructure *p_destination) {
+	DEV_ASSERT(command_buffer() != nullptr);
+	end();
+
+	NS::SharedPtr<MTL::AccelerationStructureCommandEncoder> encoder = NS::RetainPtr(command_buffer()->accelerationStructureCommandEncoder());
+	p_source->encode_compact_into(encoder.get(), p_destination);
+	encoder->endEncoding();
+
+	retain_resource(reinterpret_cast<CFTypeRef>(p_source->accel.get()));
+	retain_resource(reinterpret_cast<CFTypeRef>(p_destination->accel.get()));
+}
+
 void MDCommandBuffer::reset() {
 	push_constant_binding = UINT32_MAX;
 	push_constant_data_len = 0;

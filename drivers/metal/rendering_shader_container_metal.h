@@ -132,6 +132,13 @@ public:
 		SHA256Digest hash; ///< SHA 256 hash of the shader code
 		uint32_t source_size = 0; ///< size of the source code in the returned bytes
 		uint32_t library_size = 0; ///< size of the compiled library in the returned bytes, 0 if it is not compiled
+		/// Explicit traversal-lowering metadata (P3). Bitmasks of
+		/// MetalRTShaderLowering::TraversalClassBits recorded at compile time:
+		/// which native intersector classes were injected into this stage's MSL
+		/// and which were eligible. Cache validation compares them against the
+		/// active lane instead of re-parsing the source.
+		uint32_t rt_traversal_applied_mask = 0;
+		uint32_t rt_traversal_eligible_mask = 0;
 	};
 
 	struct UniformData {
@@ -203,7 +210,8 @@ private:
 	MetalDeviceProfile::MinimumRequirements inspect_spirv(const ReflectShader &p_shader);
 
 public:
-	static constexpr uint32_t FORMAT_VERSION = 2;
+	// Version 3: StageData gained the traversal-lowering metadata masks.
+	static constexpr uint32_t FORMAT_VERSION = 3;
 
 	void set_export_mode(bool p_export_mode) { export_mode = p_export_mode; }
 	void set_device_profile(const MetalDeviceProfile *p_device_profile) { device_profile = p_device_profile; }

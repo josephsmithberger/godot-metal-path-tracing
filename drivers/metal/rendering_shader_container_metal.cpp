@@ -790,24 +790,31 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 				}
 			}
 
-			// Native-intersector lane for ALL_OPAQUE pipelines; see
-			// MetalRTShaderLowering::patch_scene_ray_query_to_intersector for the
-			// full story. Default on for the Apple9+ hardware-RT tier, where Apple recommends the
-			// intersector over intersection_query (measured 47.5 -> 64 fps at
-			// 1080p/4spp/2bounce on M5); pre-Apple9 tiers keep the query path
-			// until a benefit is measured there. GODOT_MTL_RT_INTERSECTOR=1
-			// forces the lane on for A/B runs, =0 forces the query path.
-			// The patch is all-or-nothing: if any anchor is missing it leaves
-			// the source untouched and the query path keeps working.
-			if (_use_rt_intersector()) {
-				MetalRTShaderLowering::IntersectorPatchResult patch = MetalRTShaderLowering::patch_scene_ray_query_to_intersector(source);
-				if (patch.applied()) {
-					print_verbose("Metal RT: intersector fast path patched into " + String(shader_name.get_data()));
-				} else {
-					print_verbose(vformat("Metal RT: intersector fast path not applied to %s: [%s] %s", String(shader_name.get_data()),
-							MetalRTShaderLowering::intersector_patch_status_name(patch.status), patch.detail));
+			// Native-intersector lane, driven by the traversal-class registry in
+			// MetalRTShaderLowering (P3): each declared class is applied
+			// transactionally and the per-stage metadata records what was
+			// injected and what was eligible. Default on for the Apple9+
+			// hardware-RT tier, where Apple recommends the intersector over
+			// intersection_query (measured 47.5 -> 64 fps at 1080p/4spp/2bounce
+			// on M5); pre-Apple9 tiers keep the query path until a benefit is
+			// measured there. GODOT_MTL_RT_INTERSECTOR=1 forces the lane on for
+			// A/B runs, =0 forces the query path. When the lane is off the
+			// source is only probed so cache validation still knows this MSL
+			// was compiled for the query path.
+			const bool use_intersector = _use_rt_intersector();
+			MetalRTShaderLowering::TraversalLoweringResult lowering =
+					MetalRTShaderLowering::apply_traversal_lowering(source, /*p_apply=*/use_intersector);
+			stage_data.rt_traversal_applied_mask = use_intersector ? lowering.applied_class_mask : 0;
+			stage_data.rt_traversal_eligible_mask = lowering.eligible_class_mask;
+			if (lowering.kernel_status == MetalRTShaderLowering::IntersectorPatchStatus::APPLIED) {
+				for (const MetalRTShaderLowering::TraversalClassOutcome &outcome : lowering.classes) {
+					print_verbose(vformat("Metal RT: traversal class %s -> %s for %s: %s",
+							MetalRTShaderLowering::traversal_class_name(outcome.class_bit),
+							MetalRTShaderLowering::traversal_class_status_name(outcome.status),
+							String(shader_name.get_data()), outcome.detail));
 				}
-			} else if (OS::get_singleton()->get_environment("GODOT_MTL_RT_INTERSECTOR") == "0") {
+			}
+			if (!use_intersector && OS::get_singleton()->get_environment("GODOT_MTL_RT_INTERSECTOR") == "0") {
 				print_verbose("Metal RT: intersector fast path disabled by GODOT_MTL_RT_INTERSECTOR=0 for " + String(shader_name.get_data()));
 			}
 		}
@@ -965,7 +972,6 @@ bool RenderingShaderContainerMetal::is_rt_intersector_lane_compatible() const {
 	}
 
 	const bool expected_intersector = _use_rt_intersector();
-	Vector<uint8_t> decompressed_code;
 	for (uint32_t shader_index = 0; shader_index < shaders.size(); shader_index++) {
 		const RenderingShaderContainer::Shader &shader = shaders[shader_index];
 		const StageData &shader_data = mtl_shaders[shader_index];
@@ -973,25 +979,11 @@ bool RenderingShaderContainerMetal::is_rt_intersector_lane_compatible() const {
 			continue;
 		}
 
-		if (shader.code_decompressed_size > 0) {
-			decompressed_code.resize(shader.code_decompressed_size);
-			if (!decompress_code(shader.code_compressed_bytes.ptr(), shader.code_compressed_bytes.size(), shader.code_compression_flags,
-						decompressed_code.ptrw(), decompressed_code.size())) {
-				return false;
-			}
-		} else {
-			decompressed_code = shader.code_compressed_bytes;
-		}
-		if (shader_data.source_size > (uint32_t)decompressed_code.size()) {
-			return false;
-		}
-		std::string source(reinterpret_cast<const char *>(decompressed_code.ptr()), shader_data.source_size);
-		const bool compiled_intersector = source.find("godot_trace_material_intersector(") != std::string::npos;
-		bool eligible = compiled_intersector;
-		if (!eligible) {
-			std::string patched_source = source;
-			eligible = MetalRTShaderLowering::patch_scene_ray_query_to_intersector(patched_source).applied();
-		}
+		// P3: the compile-time traversal metadata replaces source re-parsing.
+		// A stage that was eligible for the opaque intersector class must have
+		// been compiled for the lane that is active now.
+		const bool compiled_intersector = (shader_data.rt_traversal_applied_mask & MetalRTShaderLowering::TRAVERSAL_CLASS_OPAQUE_TRIANGLES) != 0;
+		const bool eligible = (shader_data.rt_traversal_eligible_mask & MetalRTShaderLowering::TRAVERSAL_CLASS_OPAQUE_TRIANGLES) != 0;
 		if (eligible && compiled_intersector != expected_intersector) {
 			print_verbose(vformat("Metal RT: rejecting cached RT shader from the %s lane; the %s lane is active",
 					compiled_intersector ? "intersector" : "query", expected_intersector ? "intersector" : "query"));

@@ -1039,6 +1039,8 @@ public:
 		SUPPORTS_RAYTRACING_PIPELINE,
 		SUPPORTS_HDR_OUTPUT,
 		SUPPORTS_METALFX_DENOISED,
+		// Driver implements the BLAS compacted-size query and copy-and-compact.
+		SUPPORTS_BLAS_COMPACTION,
 	};
 
 	enum SubgroupOperations {

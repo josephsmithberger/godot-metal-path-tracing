@@ -573,6 +573,13 @@ def make_commands(
         parity_environment = {
             **METAL_VALIDATION_ENVIRONMENT,
             "GODOT_MRT_EDITOR_CAPTURE": "1",
+            # The parity contract isolates the traversal-lane variable
+            # (intersector versus forced query). BLAS compaction swaps in a
+            # differently laid out BVH at a GPU-timing-dependent frame, which
+            # legitimately flips exact-tie hits on shared edges, so it is
+            # pinned off here; compaction rendering coverage stays with the
+            # editor/geometry/material scene stages.
+            "GODOT_RT_BLAS_COMPACTION": "0",
         }
         parity_geometry_command = [
             str(binary),

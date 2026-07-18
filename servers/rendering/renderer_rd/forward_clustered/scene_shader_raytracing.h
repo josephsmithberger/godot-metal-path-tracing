@@ -451,6 +451,7 @@ public:
 		RID hit_sbt; // RD::free_rid on swap.
 		RID base_shader; // Immutable for variant lifetime; uniform_set is bound to this.
 		bool owns_base_shader = false; // Generated Metal material variants are owned here.
+		uint64_t base_shader_cache_key = 0; // Nonzero: base_shader is a compute_variant_cache reference, not owned.
 
 		// Parallel to hit_group_slots.
 		LocalVector<RID> per_hg_shaders;
@@ -512,12 +513,43 @@ private:
 	void _bundle_resize_for_slots(PipelineBundle &r_bundle);
 	bool _build_initial_bundle(uint32_t p_rt_flags, PipelineBundle &r_bundle);
 	bool _build_compute_bundle(uint32_t p_rt_flags, PipelineBundle &r_bundle);
-	RID _compile_compute_material_variant(const LocalVector<uint8_t> &p_active_slots, uint32_t p_rt_flags, String &r_error);
-	String _build_compute_material_source(const LocalVector<uint8_t> &p_active_slots, uint32_t p_rt_flags);
 	String _build_compute_material_function(uint32_t p_slot_index, const CustomShaderEntry &p_entry) const;
 	String _build_compute_procedural_function(uint32_t p_slot_index, const CustomShaderEntry &p_entry) const;
 	static void _replace_identifier(String &r_source, const String &p_identifier, const String &p_replacement);
 	void _kick_rebuild_if_idle();
+
+	// Compute-lane aggregate rebuild (P1): one batched compile per burst of
+	// newly ready material slots, run off-thread; the previous pipeline keeps
+	// serving frames until the generation-checked swap at the frame boundary.
+	struct ComputeBuildTask;
+	struct ComputeCompileLane {
+		Mutex mutex;
+		ComputeBuildTask *current = nullptr;
+	};
+	ComputeCompileLane compute_compile_lane;
+
+	// Compiled aggregate kernels keyed by (compute variant, active slot set).
+	// Shared across rt_flags bundles; refcount counts bundle + in-flight task
+	// references, and the entry is freed when it reaches zero.
+	struct ComputeVariantCacheEntry {
+		RID shader;
+		uint32_t refcount = 0;
+	};
+	HashMap<uint64_t, ComputeVariantCacheEntry> compute_variant_cache;
+
+	ComputeBuildTask *_make_compute_build_task(uint32_t p_rt_flags, PipelineBundle &p_bundle);
+	void _run_compute_build_worker(ComputeBuildTask *p_task);
+	static void _run_compute_build_worker_static(void *p_userdata);
+	void _finalize_compute_build(ComputeBuildTask *p_task);
+	void _drop_compute_build_outputs(ComputeBuildTask *p_task);
+	void _kick_compute_rebuild_if_idle();
+	void _drain_compute_lane_blocking();
+	String _build_compute_source_from_snapshot(const ComputeBuildTask &p_task, const LocalVector<uint8_t> &p_active) const;
+	bool _compile_compute_source(const String &p_source, Vector<uint8_t> &r_binary, String &r_error);
+	static uint64_t _compute_aggregate_key(int p_compute_variant, const ComputeBuildTask &p_task, const LocalVector<uint8_t> &p_active);
+	RID _compute_cache_acquire(uint64_t p_key);
+	void _compute_cache_insert(uint64_t p_key, RID p_shader);
+	void _compute_cache_release(uint64_t p_key);
 
 	// Compile lane / worker.
 	void _enqueue_build(PipelineBuildTask *p_task);
