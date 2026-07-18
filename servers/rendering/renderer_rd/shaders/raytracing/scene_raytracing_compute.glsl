@@ -313,12 +313,12 @@ rayQueryEXT rt_query;
 // triangle candidate ever surfaces to the proceed loop. Spec-constant fold.
 #define RT_TRAVERSAL_FLAGS (((RT_FLAGS & RT_FLAG_ALL_OPAQUE) != 0u) ? (RT_RAY_FLAGS | gl_RayFlagsOpaqueEXT) : RT_RAY_FLAGS)
 
-bool trace_material(vec3 origin, vec3 direction, float max_distance, out ComputeHit hit) {
+bool trace_material_query(vec3 origin, vec3 direction, float max_distance, out ComputeHit hit, uint instance_mask) {
 	ComputeProceduralHit procedural_hit;
 	procedural_hit.t = max_distance;
 	procedural_hit.valid = false;
 	rayQueryInitializeEXT(rt_query, tlas, RT_TRAVERSAL_FLAGS,
-			0xFF, origin, 0.001, direction, max_distance);
+			instance_mask, origin, 0.001, direction, max_distance);
 	while (rayQueryProceedEXT(rt_query)) {
 		uint candidate_type = rayQueryGetIntersectionTypeEXT(rt_query, false);
 		if (candidate_type == gl_RayQueryCandidateIntersectionTriangleEXT) {
@@ -342,15 +342,19 @@ bool trace_material(vec3 origin, vec3 direction, float max_distance, out Compute
 	return false;
 }
 
+bool trace_material(vec3 origin, vec3 direction, float max_distance, out ComputeHit hit) {
+	return trace_material_query(origin, direction, max_distance, hit, RT_INSTANCE_MASK_ALL);
+}
+
 // Shadow rays only need any confirmed hit, so they terminate on the first
 // alpha-accepted candidate instead of resolving the closest one.
-bool trace_shadow_blocked(vec3 origin, vec3 direction, float max_distance) {
+bool trace_shadow_blocked_query(vec3 origin, vec3 direction, float max_distance, uint instance_mask) {
 	ComputeProceduralHit procedural_hit;
 	procedural_hit.t = max_distance;
 	procedural_hit.valid = false;
 	rayQueryEXT shadow_query;
 	rayQueryInitializeEXT(shadow_query, tlas, RT_TRAVERSAL_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT,
-			0xFF, origin, 0.001, direction, max_distance);
+			instance_mask, origin, 0.001, direction, max_distance);
 	while (rayQueryProceedEXT(shadow_query)) {
 		uint candidate_type = rayQueryGetIntersectionTypeEXT(shadow_query, false);
 		if (candidate_type == gl_RayQueryCandidateIntersectionTriangleEXT) {
@@ -364,6 +368,10 @@ bool trace_shadow_blocked(vec3 origin, vec3 direction, float max_distance) {
 	uint committed_type = rayQueryGetIntersectionTypeEXT(shadow_query, true);
 	return committed_type == gl_RayQueryCommittedIntersectionTriangleEXT ||
 			committed_type == gl_RayQueryCommittedIntersectionGeneratedEXT;
+}
+
+bool trace_shadow_blocked(vec3 origin, vec3 direction, float max_distance) {
+	return trace_shadow_blocked_query(origin, direction, max_distance, RT_INSTANCE_MASK_ALL);
 }
 
 // clang-format off

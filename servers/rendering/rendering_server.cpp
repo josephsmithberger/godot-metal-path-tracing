@@ -3856,6 +3856,7 @@ void RenderingServer::init() {
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracer/editor_interactive_samples", PROPERTY_HINT_RANGE, "0,8,1"), 1);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracer/editor_interactive_max_bounces", PROPERTY_HINT_RANGE, "1,8,1"), 2);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracer/editor_interactive_settle_msec", PROPERTY_HINT_RANGE, "0,2000,1"), 200);
+	GLOBAL_DEF("rendering/pathtracer/editor_interactive_use_temporal_upscaler", true);
 
 	// OpenGL limits
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/limits/opengl/max_renderable_elements", PROPERTY_HINT_RANGE, "1024,65536,1"), 65536);

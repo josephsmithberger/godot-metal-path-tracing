@@ -123,15 +123,6 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::rt_ensure_texture
 			RD::TEXTURE_USAGE_SAMPLING_BIT |
 			RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
 
-	if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING)) {
-		render_buffers->create_texture(
-				RB_SCOPE_FORWARD_CLUSTERED,
-				RB_TEX_RAYTRACING,
-				RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
-				usage_bits,
-				RD::TEXTURE_SAMPLES_1);
-	}
-
 	if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_DEPTH)) {
 		render_buffers->create_texture(
 				RB_SCOPE_FORWARD_CLUSTERED,
@@ -2073,7 +2064,13 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	if (scene_features.rt && p_render_data->environment.is_valid() && RD::get_singleton()->has_feature(RD::SUPPORTS_METALFX_DENOISED)) {
 		const float *environment_params = RendererEnvironmentStorage::get_singleton()->environment_get_pathtracing_params_ptr(p_render_data->environment);
 		if (environment_params && (uint32_t)environment_params[RSE::PT_PARAM_DENOISER] == RSE::PT_DENOISER_METALFX) {
+#ifdef METAL_MFXTEMPORAL_ENABLED
+			const bool use_interactive_temporal = _editor_interactive_rt_active(p_render_data, rb_data.ptr()) &&
+					_editor_interactive_use_temporal_upscaler(p_render_data);
+			scale_type = use_interactive_temporal ? SCALE_MFX : SCALE_MFX_DENOISED;
+#else
 			scale_type = SCALE_MFX_DENOISED;
+#endif
 			using_taa = false;
 			rb->set_temporal_upscaler_override(true);
 		}
@@ -2270,17 +2267,33 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 		RTViewportState *rt_state = raytracing->build_tlas(p_render_data, rt_flags);
 		if (rt_state) {
-			// ALL_OPAQUE comes from the viewport material table build_tlas just
-			// refreshed, so the pipeline always matches the table this frame
-			// traces against -- including per-viewport disjoint material sets.
+			// Traversal aggregates come from the viewport instance table build_tlas
+			// just refreshed, so the pipeline always matches the TLAS this frame.
 			// GODOT_MTL_RT_NO_ALL_OPAQUE=1 disables the specialization for A/B runs.
 			static const bool all_opaque_disabled = OS::get_singleton()->get_environment("GODOT_MTL_RT_NO_ALL_OPAQUE") == "1";
-			if (!all_opaque_disabled && rt_state->material_table_all_opaque && raytracing->get_shader()->uses_compute_scene_lane()) {
-				rt_flags |= SceneShaderRaytracing::RT_FLAG_ALL_OPAQUE;
+			// Procedural AABBs remain on the unified query path: native and query
+			// traversal can choose different winners at exact triangle/AABB ties.
+			if (!all_opaque_disabled && !rt_state->traversal_has_procedural_instances &&
+					rt_state->traversal_has_opaque_triangles &&
+					raytracing->get_shader()->uses_compute_scene_lane()) {
+				if (rt_state->traversal_has_query_instances) {
+					rt_flags |= SceneShaderRaytracing::RT_FLAG_MIXED_ALPHA;
+				} else {
+					rt_flags |= SceneShaderRaytracing::RT_FLAG_ALL_OPAQUE;
+				}
+			}
+			if ((rt_flags & SceneShaderRaytracing::RT_FLAG_ALL_OPAQUE) != 0) {
 				static bool all_opaque_marker_printed = false;
 				if (!all_opaque_marker_printed) {
 					print_line("METAL_RT_ALL_OPAQUE_PIPELINE=active");
 					all_opaque_marker_printed = true;
+				}
+			}
+			if ((rt_flags & SceneShaderRaytracing::RT_FLAG_MIXED_ALPHA) != 0) {
+				static bool mixed_alpha_marker_printed = false;
+				if (!mixed_alpha_marker_printed) {
+					print_line("METAL_RT_MIXED_ALPHA_PIPELINE=active");
+					mixed_alpha_marker_printed = true;
 				}
 			}
 			rt_uniform_set = raytracing->update_uniform_set(rt_state, p_render_data, rt_flags);
@@ -2675,9 +2688,8 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		// Make sure BDA referenced buffers are registered as dependencies, otherwise GPU hangs may occur, or render graph will not be able to order the dependencies correctly.
 		raytracing->register_raytracing_buffer_dependencies(raytracing_list);
 
-		// Raytracing dispatches at internal (pre-upscale) size because the RT
-		// output texture is allocated at that resolution; FSR/upscaler runs
-		// afterward as a separate compute pass.
+		// Raytracing writes the main internal (pre-upscale) color texture;
+		// FSR/upscaler runs afterward as a separate compute pass.
 		Size2i rt_size = rb->get_internal_size();
 		RD::get_singleton()->raytracing_list_trace_rays(raytracing_list, 0, raytracing->get_shader()->get_hit_sbt(rt_flags), rt_size.width, rt_size.height, 1);
 		RD::get_singleton()->raytracing_list_end();
@@ -5806,17 +5818,17 @@ void RenderForwardClustered::_update_shader_quality_settings() {
 
 // Raytracing methods
 
-uint32_t RenderForwardClustered::_apply_editor_interactive_rt_quality(uint32_t p_rt_flags, const RenderDataRD *p_render_data, RenderBufferDataForwardClustered *p_rb_data) {
+bool RenderForwardClustered::_editor_interactive_rt_active(const RenderDataRD *p_render_data, RenderBufferDataForwardClustered *p_rb_data) {
 #ifdef TOOLS_ENABLED
 	// A running game is a separate process, so this only ever affects viewports
 	// rendered inside the editor.
 	if (!Engine::get_singleton()->is_editor_hint() || p_rb_data == nullptr || p_render_data == nullptr || p_render_data->scene_data == nullptr) {
-		return p_rt_flags;
+		return false;
 	}
 
 	const int interactive_samples = GLOBAL_GET_CACHED(int, "rendering/pathtracer/editor_interactive_samples");
 	if (interactive_samples <= 0) {
-		return p_rt_flags;
+		return false;
 	}
 
 	const uint64_t settle_msec = uint64_t(MAX(0, GLOBAL_GET_CACHED(int, "rendering/pathtracer/editor_interactive_settle_msec")));
@@ -5831,16 +5843,46 @@ uint32_t RenderForwardClustered::_apply_editor_interactive_rt_quality(uint32_t p
 		p_rb_data->pt_last_camera_motion_msec = now_msec;
 	}
 
-	if (p_rb_data->pt_last_camera_motion_msec == 0 || now_msec - p_rb_data->pt_last_camera_motion_msec > settle_msec) {
+	return p_rb_data->pt_last_camera_motion_msec != 0 &&
+			now_msec - p_rb_data->pt_last_camera_motion_msec <= settle_msec;
+#else
+	return false;
+#endif
+}
+
+bool RenderForwardClustered::_editor_interactive_use_temporal_upscaler(const RenderDataRD *p_render_data) const {
+#if defined(TOOLS_ENABLED) && defined(METAL_MFXTEMPORAL_ENABLED) && defined(METAL_MFXDENOISED_ENABLED)
+	if (!GLOBAL_GET_CACHED(bool, "rendering/pathtracer/editor_interactive_use_temporal_upscaler") ||
+			p_render_data == nullptr || !p_render_data->environment.is_valid()) {
+		return false;
+	}
+	const float *params = RendererEnvironmentStorage::get_singleton()->environment_get_pathtracing_params_ptr(p_render_data->environment);
+	return params != nullptr && (uint32_t)params[RSE::PT_PARAM_DENOISER] == RSE::PT_DENOISER_METALFX &&
+			RD::get_singleton()->has_feature(RD::SUPPORTS_METALFX_DENOISED);
+#else
+	return false;
+#endif
+}
+
+uint32_t RenderForwardClustered::_apply_editor_interactive_rt_quality(uint32_t p_rt_flags, const RenderDataRD *p_render_data, RenderBufferDataForwardClustered *p_rb_data) {
+#ifdef TOOLS_ENABLED
+	if (!_editor_interactive_rt_active(p_render_data, p_rb_data)) {
 		return p_rt_flags;
 	}
 
 	const int interactive_bounces = GLOBAL_GET_CACHED(int, "rendering/pathtracer/editor_interactive_max_bounces");
+	const int interactive_samples = GLOBAL_GET_CACHED(int, "rendering/pathtracer/editor_interactive_samples");
 	// Only ever reduce; a scene authored below the interactive budget keeps its
 	// own values rather than being scaled up while navigating.
 	const uint32_t samples = MIN((uint32_t)interactive_samples, SceneShaderRaytracing::rt_flags_get_sample_count(p_rt_flags));
 	const uint32_t bounces = MIN((uint32_t)interactive_bounces, SceneShaderRaytracing::rt_flags_get_max_bounces(p_rt_flags));
-	return SceneShaderRaytracing::rt_flags_with_quality(p_rt_flags, samples, bounces);
+	uint32_t flags = SceneShaderRaytracing::rt_flags_with_quality(p_rt_flags, samples, bounces);
+	if (_editor_interactive_use_temporal_upscaler(p_render_data)) {
+		// Ordinary MetalFX Temporal does not consume ray-reconstruction guides.
+		// Avoid generating them while navigation invalidates denoiser history.
+		flags &= ~SceneShaderRaytracing::RT_FLAG_DENOISER_GUIDES_ENABLED;
+	}
+	return flags;
 #else
 	return p_rt_flags;
 #endif

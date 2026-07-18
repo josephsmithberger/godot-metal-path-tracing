@@ -1240,12 +1240,12 @@ bool SceneShaderRaytracing::_compile_compute_source(const String &p_source, Vect
 uint64_t SceneShaderRaytracing::_compute_aggregate_key(int p_compute_variant, const ComputeBuildTask &p_task, const LocalVector<uint8_t> &p_active) {
 	// Slot indices are baked into the generated switch cases, so the key must
 	// cover (index, source) pairs, not just the source set.
-	uint64_t h = hash_djintersector_one_64((uint64_t)p_compute_variant + 1);
+	uint64_t h = hash_djb2_one_64((uint64_t)p_compute_variant + 1);
 	for (const ComputeBuildTask::SlotSnapshot &snap : p_task.slots) {
 		if (snap.index < p_active.size() && p_active[snap.index]) {
-			h = hash_djintersector_one_64(snap.index, h);
-			h = hash_djintersector_one_64(snap.source_hash.a, h);
-			h = hash_djintersector_one_64(snap.source_hash.b, h);
+			h = hash_djb2_one_64(snap.index, h);
+			h = hash_djb2_one_64(snap.source_hash.a, h);
+			h = hash_djb2_one_64(snap.source_hash.b, h);
 		}
 	}
 	return h == 0 ? 1 : h;

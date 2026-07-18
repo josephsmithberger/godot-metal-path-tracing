@@ -77,6 +77,80 @@ static bool _msl_has_function_injection_layout(const std::string &p_source, cons
 			p_source.compare(brace - 2, 4, ")\n{\n") == 0;
 }
 
+// SPIRV-Cross threads every resource used by a helper through its generated
+// MSL signature. Extract the parameter names from the public wrapper so an
+// injected call to its masked query implementation forwards those resources
+// without depending on SPIRV-Cross's generated numeric identifiers.
+static bool _msl_get_forwarded_parameters(const std::string &p_source, const char *p_signature_start, uint32_t p_skip_count, std::string &r_parameters) {
+	size_t def_pos = p_source.find(p_signature_start);
+	if (def_pos == std::string::npos) {
+		return false;
+	}
+	size_t open = p_source.find('(', def_pos);
+	if (open == std::string::npos) {
+		return false;
+	}
+
+	LocalVector<std::string> parameters;
+	size_t parameter_start = open + 1;
+	int nesting = 0;
+	for (size_t i = parameter_start; i < p_source.size(); i++) {
+		const char c = p_source[i];
+		if (c == '<' || c == '(' || c == '[') {
+			nesting++;
+		} else if (c == '>' || c == ']') {
+			nesting--;
+		} else if (c == ')' && nesting == 0) {
+			parameters.push_back(p_source.substr(parameter_start, i - parameter_start));
+			break;
+		} else if (c == ')') {
+			nesting--;
+		} else if (c == ',' && nesting == 0) {
+			parameters.push_back(p_source.substr(parameter_start, i - parameter_start));
+			parameter_start = i + 1;
+		}
+	}
+	if (parameters.size() < p_skip_count) {
+		return false;
+	}
+
+	r_parameters.clear();
+	for (uint32_t i = p_skip_count; i < parameters.size(); i++) {
+		const std::string &parameter = parameters[i];
+		size_t end = parameter.find_last_not_of(" \t\r\n");
+		if (end == std::string::npos) {
+			return false;
+		}
+		size_t begin = end;
+		while (begin > 0 && ((parameter[begin - 1] >= 'a' && parameter[begin - 1] <= 'z') ||
+					(parameter[begin - 1] >= 'A' && parameter[begin - 1] <= 'Z') ||
+					(parameter[begin - 1] >= '0' && parameter[begin - 1] <= '9') || parameter[begin - 1] == '_')) {
+			begin--;
+		}
+		if (begin > end || !((parameter[begin] >= 'a' && parameter[begin] <= 'z') ||
+					(parameter[begin] >= 'A' && parameter[begin] <= 'Z') || parameter[begin] == '_')) {
+			return false;
+		}
+		r_parameters += ", " + parameter.substr(begin, end - begin + 1);
+	}
+	return true;
+}
+
+static bool _msl_expand_forwarded_parameters(const std::string &p_source, const char *p_signature_start, std::string &r_dispatch_body) {
+	static constexpr char marker[] = "$GODOT_FORWARDED_PARAMETERS";
+	size_t marker_pos = r_dispatch_body.find(marker);
+	if (marker_pos == std::string::npos) {
+		return true;
+	}
+	const uint32_t fixed_parameter_count = strcmp(p_signature_start, "bool trace_material(") == 0 ? 4 : 3;
+	std::string forwarded;
+	if (!_msl_get_forwarded_parameters(p_source, p_signature_start, fixed_parameter_count, forwarded)) {
+		return false;
+	}
+	r_dispatch_body.replace(marker_pos, strlen(marker), forwarded);
+	return true;
+}
+
 const char *MetalRTShaderLowering::intersector_patch_status_name(IntersectorPatchStatus p_status) {
 	switch (p_status) {
 		case IntersectorPatchStatus::APPLIED:
@@ -129,10 +203,11 @@ struct TraversalClassDesc {
 };
 
 constexpr char OPAQUE_TRIANGLES_HELPERS[] = R"(
-// --- Godot: native-intersector fast path for ALL_OPAQUE pipelines ----------
+// --- Godot: native-intersector fast paths for opaque TLAS partitions -------
 constant bool godot_use_intersector = ((RT_FLAGS & 16u) != 0u); // RT_FLAG_ALL_OPAQUE
+constant bool godot_use_mixed_intersector = ((RT_FLAGS & 32u) != 0u); // RT_FLAG_MIXED_ALPHA
 
-static bool godot_trace_material_intersector(const thread float3 &origin, const thread float3 &direction, float max_distance, thread ComputeHit &hit, raytracing::acceleration_structure<raytracing::instancing> tlas)
+static bool godot_trace_material_intersector(const thread float3 &origin, const thread float3 &direction, float max_distance, uint instance_mask, thread ComputeHit &hit, raytracing::acceleration_structure<raytracing::instancing> tlas)
 {
     raytracing::ray r(origin, direction, 0.001, max_distance);
     raytracing::intersector<raytracing::instancing, raytracing::triangle_data> trace;
@@ -140,7 +215,7 @@ static bool godot_trace_material_intersector(const thread float3 &origin, const 
     trace.force_opacity(raytracing::forced_opacity::opaque);
     trace.set_triangle_cull_mode(raytracing::triangle_cull_mode::back);
     trace.accept_any_intersection(false);
-    auto result = trace.intersect(r, tlas, 0xFFu);
+    auto result = trace.intersect(r, tlas, instance_mask);
     if (result.type != raytracing::intersection_type::triangle)
     {
         return false;
@@ -155,7 +230,7 @@ static bool godot_trace_material_intersector(const thread float3 &origin, const 
     return true;
 }
 
-static bool godot_trace_shadow_blocked_intersector(const thread float3 &origin, const thread float3 &direction, float max_distance, raytracing::acceleration_structure<raytracing::instancing> tlas)
+static bool godot_trace_shadow_blocked_intersector(const thread float3 &origin, const thread float3 &direction, float max_distance, uint instance_mask, raytracing::acceleration_structure<raytracing::instancing> tlas)
 {
     raytracing::ray r(origin, direction, 0.001, max_distance);
     raytracing::intersector<raytracing::instancing, raytracing::triangle_data> trace;
@@ -163,7 +238,7 @@ static bool godot_trace_shadow_blocked_intersector(const thread float3 &origin, 
     trace.force_opacity(raytracing::forced_opacity::opaque);
     trace.set_triangle_cull_mode(raytracing::triangle_cull_mode::back);
     trace.accept_any_intersection(true);
-    auto result = trace.intersect(r, tlas, 0xFFu);
+    auto result = trace.intersect(r, tlas, instance_mask);
     return result.type != raytracing::intersection_type::none;
 }
 
@@ -174,7 +249,19 @@ constexpr TraversalInjection OPAQUE_TRIANGLES_INJECTIONS[] = {
 			"bool trace_material(",
 			"    if (godot_use_intersector)\n"
 			"    {\n"
-			"        return godot_trace_material_intersector(origin, direction, max_distance, hit, tlas);\n"
+			"        return godot_trace_material_intersector(origin, direction, max_distance, 0x01u, hit, tlas);\n"
+			"    }\n"
+			"    if (godot_use_mixed_intersector)\n"
+			"    {\n"
+			"        bool opaque_hit = godot_trace_material_intersector(origin, direction, max_distance, 0x01u, hit, tlas);\n"
+			"        float query_max_distance = opaque_hit ? hit.t : max_distance;\n"
+			"        ComputeHit query_hit = {};\n"
+			"        if (trace_material_query(origin, direction, query_max_distance, query_hit, 0x02u$GODOT_FORWARDED_PARAMETERS))\n"
+			"        {\n"
+			"            hit = query_hit;\n"
+			"            return true;\n"
+			"        }\n"
+			"        return opaque_hit;\n"
 			"    }\n",
 			MetalRTShaderLowering::IntersectorPatchStatus::TRACE_MATERIAL_LAYOUT,
 	},
@@ -182,7 +269,15 @@ constexpr TraversalInjection OPAQUE_TRIANGLES_INJECTIONS[] = {
 			"bool trace_shadow_blocked(",
 			"    if (godot_use_intersector)\n"
 			"    {\n"
-			"        return godot_trace_shadow_blocked_intersector(origin, direction, max_distance, tlas);\n"
+			"        return godot_trace_shadow_blocked_intersector(origin, direction, max_distance, 0x01u, tlas);\n"
+			"    }\n"
+			"    if (godot_use_mixed_intersector)\n"
+			"    {\n"
+			"        if (godot_trace_shadow_blocked_intersector(origin, direction, max_distance, 0x01u, tlas))\n"
+			"        {\n"
+			"            return true;\n"
+			"        }\n"
+			"        return trace_shadow_blocked_query(origin, direction, max_distance, 0x02u$GODOT_FORWARDED_PARAMETERS);\n"
 			"    }\n",
 			MetalRTShaderLowering::IntersectorPatchStatus::TRACE_SHADOW_LAYOUT,
 	},
@@ -192,10 +287,8 @@ constexpr TraversalClassDesc TRAVERSAL_CLASS_REGISTRY[] = {
 	{
 			MetalRTShaderLowering::TRAVERSAL_CLASS_OPAQUE_TRIANGLES,
 			"opaque_triangles",
-			// The opaque intersector body is triangle-only; a variant that
-			// commits procedural bounding boxes must keep the query path.
-			"commit_bounding_box_intersection",
-			"variant commits procedural bounding boxes (intentional exclusion: intersector body is triangle-only)",
+			nullptr,
+			nullptr,
 			OPAQUE_TRIANGLES_HELPERS,
 			OPAQUE_TRIANGLES_INJECTIONS,
 			(uint32_t)(sizeof(OPAQUE_TRIANGLES_INJECTIONS) / sizeof(OPAQUE_TRIANGLES_INJECTIONS[0])),
@@ -324,7 +417,9 @@ MetalRTShaderLowering::TraversalLoweringResult MetalRTShaderLowering::apply_trav
 		if (applied) {
 			trial.insert(_msl_function_insert_pos(trial, first_anchor), desc.helpers);
 			for (uint32_t i = 0; i < desc.injection_count; i++) {
-				if (!_msl_inject_after_function_brace(trial, desc.injections[i].anchor_signature, desc.injections[i].dispatch_body)) {
+				std::string dispatch_body = desc.injections[i].dispatch_body;
+				if (!_msl_expand_forwarded_parameters(trial, desc.injections[i].anchor_signature, dispatch_body) ||
+						!_msl_inject_after_function_brace(trial, desc.injections[i].anchor_signature, dispatch_body.c_str())) {
 					outcome.status = TraversalClassStatus::ANCHOR_MISMATCH;
 					outcome.detail = String(desc.injections[i].anchor_signature) + " did not match the expected SPIRV-Cross layout";
 					applied = false;

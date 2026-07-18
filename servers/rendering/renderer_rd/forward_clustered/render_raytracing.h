@@ -42,7 +42,6 @@
 #include "servers/rendering/renderer_rd/shaders/raytracing/multimesh_merge.glsl.gen.h"
 #include "servers/rendering/rendering_device.h"
 
-#define RB_TEX_RAYTRACING SNAME("raytracing")
 #define RB_TEX_RT_DEPTH SNAME("rt_depth")
 
 #define RB_SCOPE_DLSS_RR SNAME("dlss_rr")
@@ -220,6 +219,22 @@ enum {
 	// Set when the BLAS uses a per-frame-deformed vertex buffer.
 	RT_GEOM_FLAG_DEFORMED = 4u,
 };
+
+// Partition the compute ray-query TLAS into geometry that Metal can traverse
+// with its native opaque intersector and geometry that still needs candidate
+// evaluation. The regular Vulkan RT-pipeline lane keeps using visibility mask
+// 0xFF, which includes both partitions.
+enum : uint8_t {
+	RT_INSTANCE_MASK_OPAQUE_TRIANGLE = 1u << 0,
+	RT_INSTANCE_MASK_QUERY = 1u << 1,
+	RT_INSTANCE_MASK_ALL = RT_INSTANCE_MASK_OPAQUE_TRIANGLE | RT_INSTANCE_MASK_QUERY,
+};
+
+_FORCE_INLINE_ uint8_t rt_instance_traversal_mask(uint32_t p_instance_flags, uint32_t p_geometry_flags) {
+	const bool opaque_triangle = (p_geometry_flags & RT_GEOM_FLAG_PROCEDURAL) == 0 &&
+			(p_instance_flags & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT) != 0;
+	return opaque_triangle ? RT_INSTANCE_MASK_OPAQUE_TRIANGLE : RT_INSTANCE_MASK_QUERY;
+}
 
 enum class RTProceduralBoundsSource : uint8_t {
 	EXPLICIT,
@@ -443,13 +458,12 @@ struct RTViewportState {
 	RID light_buffer;
 	RID params_buffer;
 
-	// Aggregate over this viewport's material table as uploaded by the last
-	// finalize_buffers(): true when no material can reject a traversal
-	// candidate (no alpha scissor, no custom material dispatch). Refreshed by
-	// every build_tlas() for this viewport, so the caller must read it after
-	// build_tlas() returns to select the pipeline for the same frame. Starts
-	// false so a viewport's first frame stays conservative.
-	bool material_table_all_opaque = false;
+	// Traversal aggregates for the instance table uploaded by the last
+	// finalize_buffers(). They select all-opaque or mixed native Metal lanes for
+	// this viewport without making assumptions about a particular scene.
+	bool traversal_has_opaque_triangles = false;
+	bool traversal_has_query_instances = false;
+	bool traversal_has_procedural_instances = false;
 
 	uint32_t frame_counter = 0;
 };

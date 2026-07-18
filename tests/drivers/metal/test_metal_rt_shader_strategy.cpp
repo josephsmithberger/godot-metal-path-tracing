@@ -633,12 +633,16 @@ TEST_CASE("[MetalRT] B2 production MSL rewrite injects closest-hit and shadow in
 	REQUIRE_MESSAGE(patch.applied(), patch.detail);
 	CHECK(String(MetalRTShaderLowering::intersector_patch_status_name(patch.status)) == "applied");
 
-	// The function-constant gate keeps alpha/custom material variants on their
-	// original query path. Only ALL_OPAQUE specializations force opacity.
+	// Function-constant gates select the all-opaque fast path or the mixed
+	// native/query partition. Only native-partition traversal forces opacity.
 	CHECK(source.find("constant bool godot_use_intersector = ((RT_FLAGS & 16u) != 0u)") != std::string::npos);
+	CHECK(source.find("constant bool godot_use_mixed_intersector = ((RT_FLAGS & 32u) != 0u)") != std::string::npos);
 	CHECK(source.find("trace.force_opacity(raytracing::forced_opacity::opaque)") != std::string::npos);
-	CHECK(source.find("return godot_trace_material_intersector(origin, direction, max_distance, hit, tlas)") != std::string::npos);
-	CHECK(source.find("return godot_trace_shadow_blocked_intersector(origin, direction, max_distance, tlas)") != std::string::npos);
+	CHECK(source.find("return godot_trace_material_intersector(origin, direction, max_distance, 0x01u, hit, tlas)") != std::string::npos);
+	CHECK(source.find("return godot_trace_shadow_blocked_intersector(origin, direction, max_distance, 0x01u, tlas)") != std::string::npos);
+	CHECK(source.find("float query_max_distance = opaque_hit ? hit.t : max_distance") != std::string::npos);
+	CHECK(source.find("trace_material_query(origin, direction, query_max_distance, query_hit, 0x02u, _2402, _2566, rt_query, tlas)") != std::string::npos);
+	CHECK(source.find("trace_shadow_blocked_query(origin, direction, max_distance, 0x02u, _2402, _2566, tlas)") != std::string::npos);
 
 	// Match the GLSL/Blender contracts: closest hit does not terminate early,
 	// shadows do, and both preserve the explicit range, mask, and back-face
@@ -648,7 +652,7 @@ TEST_CASE("[MetalRT] B2 production MSL rewrite injects closest-hit and shadow in
 	CHECK(source.find("trace.set_triangle_cull_mode(raytracing::triangle_cull_mode::back)") != std::string::npos);
 	CHECK(source.find("trace.accept_any_intersection(false)") != std::string::npos);
 	CHECK(source.find("trace.accept_any_intersection(true)") != std::string::npos);
-	CHECK(source.find("trace.intersect(r, tlas, 0xFFu)") != std::string::npos);
+	CHECK(source.find("trace.intersect(r, tlas, instance_mask)") != std::string::npos);
 	CHECK(source.find("hit.geometry_idx = result.user_instance_id") != std::string::npos);
 	CHECK(source.find("hit.primitive_idx = result.primitive_id") != std::string::npos);
 	CHECK(source.find("hit.barycentrics = result.triangle_barycentric_coord") != std::string::npos);
@@ -657,8 +661,8 @@ TEST_CASE("[MetalRT] B2 production MSL rewrite injects closest-hit and shadow in
 	// Injection must precede SPIRV-Cross attributes, never split an attribute
 	// from its function definition.
 	size_t helper = source.find("godot_trace_material_intersector");
-	size_t material_attribute = source.find("static inline __attribute__((always_inline))");
 	size_t material_definition = source.find("bool trace_material(");
+	size_t material_attribute = source.rfind("static inline __attribute__((always_inline))", material_definition);
 	REQUIRE(helper != std::string::npos);
 	REQUIRE(material_attribute != std::string::npos);
 	REQUIRE(material_definition != std::string::npos);
@@ -678,15 +682,13 @@ TEST_CASE("[MetalRT] B2 production MSL rewrite reports transactional fallbacks")
 		CHECK(source == original);
 	}
 
-	SUBCASE("procedural/AABB variant") {
+	SUBCASE("procedural/AABB variant keeps native opaque partition eligible") {
 		std::string source = load_msl_rewrite_fixture("intersector_procedural_fixture.metal");
 		REQUIRE_FALSE(source.empty());
-		const std::string original = source;
 		MetalRTShaderLowering::IntersectorPatchResult patch = MetalRTShaderLowering::patch_scene_ray_query_to_intersector(source);
-		CHECK_FALSE(patch.applied());
-		CHECK(patch.status == MetalRTShaderLowering::IntersectorPatchStatus::PROCEDURAL_GEOMETRY);
-		CHECK(String(MetalRTShaderLowering::intersector_patch_status_name(patch.status)) == "procedural_geometry");
-		CHECK(source == original);
+		CHECK(patch.applied());
+		CHECK(source.find("godot_use_mixed_intersector") != std::string::npos);
+		CHECK(source.find("trace.intersect(r, tlas, instance_mask)") != std::string::npos);
 	}
 
 	SUBCASE("missing function constant") {
