@@ -802,6 +802,9 @@ public:
 	};
 
 	virtual AccelerationStructureID tlas_create(uint32_t p_max_instance_count, BitField<AccelerationStructureFlagBits> p_flags) = 0;
+	/// Validates a TLAS build before RenderingDevice mutates dependencies or
+	/// enqueues graph work. Optional backend safety/coherence gates belong here.
+	virtual bool tlas_build_is_valid(AccelerationStructureID p_tlas, VectorView<AccelerationStructureInstance> p_instances) const { return true; }
 	virtual void acceleration_structure_instance_write(uint8_t *r_driver_instance, const AccelerationStructureInstance &p_instance) = 0;
 	virtual void acceleration_structure_free(AccelerationStructureID p_acceleration_structure) = 0;
 	virtual uint32_t acceleration_structure_get_scratch_size_bytes(AccelerationStructureID p_acceleration_structure) = 0;
@@ -814,10 +817,12 @@ public:
 	virtual uint64_t acceleration_structure_get_compacted_size(AccelerationStructureID p_acceleration_structure) { return 0; }
 	/// Returns the bytes currently allocated for the native structure.
 	virtual uint64_t acceleration_structure_get_allocated_size(AccelerationStructureID p_acceleration_structure) { return 0; }
+	/// Returns true only after a queued compact copy has completed successfully.
+	virtual bool acceleration_structure_is_compaction_complete(AccelerationStructureID p_acceleration_structure) { return false; }
 	/// Creates an empty BLAS allocation of exactly `p_size` bytes to serve as a
 	/// compacted-copy destination. It has no geometry and is only valid after
 	/// command_compact_blas() writes into it.
-	virtual AccelerationStructureID blas_create_compacted_target(uint64_t p_size) { return AccelerationStructureID(); }
+	virtual AccelerationStructureID blas_create_compacted_target(AccelerationStructureID p_source, uint64_t p_size) { return AccelerationStructureID(); }
 
 	// ----- PIPELINE -----
 

@@ -498,12 +498,14 @@ private:
 public:
 	virtual AccelerationStructureID blas_create(VectorView<AccelerationStructureGeometry> p_geometries, BitField<AccelerationStructureFlagBits> p_flags) override final;
 	virtual AccelerationStructureID tlas_create(uint32_t p_max_instance_count, BitField<AccelerationStructureFlagBits> p_flags) override final;
+	virtual bool tlas_build_is_valid(AccelerationStructureID p_tlas, VectorView<AccelerationStructureInstance> p_instances) const override final;
 	virtual void acceleration_structure_instance_write(uint8_t *r_driver_instance, const AccelerationStructureInstance &p_instance) override final;
 	virtual void acceleration_structure_free(AccelerationStructureID p_acceleration_structure) override final;
 	virtual uint32_t acceleration_structure_get_scratch_size_bytes(AccelerationStructureID p_acceleration_structure) override final;
 	virtual uint64_t acceleration_structure_get_compacted_size(AccelerationStructureID p_acceleration_structure) override final;
 	virtual uint64_t acceleration_structure_get_allocated_size(AccelerationStructureID p_acceleration_structure) override final;
-	virtual AccelerationStructureID blas_create_compacted_target(uint64_t p_size) override final;
+	virtual bool acceleration_structure_is_compaction_complete(AccelerationStructureID p_acceleration_structure) override final;
+	virtual AccelerationStructureID blas_create_compacted_target(AccelerationStructureID p_source, uint64_t p_size) override final;
 
 	// ----- PIPELINE -----
 

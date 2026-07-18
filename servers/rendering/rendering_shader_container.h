@@ -105,6 +105,7 @@ protected:
 
 	virtual uint32_t _format() const = 0;
 	virtual uint32_t _format_version() const = 0;
+	virtual bool _format_version_supported(uint32_t p_version) const;
 
 	// These methods will always be called with a valid pointer.
 	virtual uint32_t _from_bytes_header_extra_data(const uint8_t *p_bytes);

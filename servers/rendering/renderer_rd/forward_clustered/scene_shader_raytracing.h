@@ -74,6 +74,34 @@ public:
 		return { sanitize_compute_rt_flags(p_rt_flags), p_material_generation };
 	}
 
+	struct ComputeCompileDebounce {
+		uint32_t observed_generation = 0;
+		uint32_t settled_generation = 0;
+		bool armed = false;
+
+		bool is_ready(uint32_t p_generation) {
+			if (p_generation == settled_generation) {
+				return true;
+			}
+			if (!armed || observed_generation != p_generation) {
+				observed_generation = p_generation;
+				armed = true;
+				return false;
+			}
+			settled_generation = p_generation;
+			armed = false;
+			return true;
+		}
+	};
+	template <typename TValue>
+	static bool compute_cache_insert_if_absent(HashMap<uint64_t, TValue> &r_cache, uint64_t p_key, const TValue &p_value) {
+		if (r_cache.has(p_key)) {
+			return false;
+		}
+		r_cache.insert(p_key, p_value);
+		return true;
+	}
+
 	enum ShaderGroup {
 		SHADER_GROUP_BASE, // Always compiled at the beginning.
 		SHADER_GROUP_ADVANCED,
@@ -474,6 +502,9 @@ public:
 	uint32_t compute_variant_compile_count = 0;
 	uint32_t compute_variant_cache_hit_count = 0;
 	uint32_t compute_variant_failure_count = 0;
+	// One quiet finalize pass is required before a newly observed material
+	// generation is compiled, coalescing sequential arrivals into one burst.
+	ComputeCompileDebounce compute_compile_debounce;
 
 	// Single-lane async bundle rebuild (worker: SPIR-V + raytracing_pipeline_create; main: SBT + swap).
 	struct PipelineBuildTask;
@@ -548,7 +579,7 @@ private:
 	bool _compile_compute_source(const String &p_source, Vector<uint8_t> &r_binary, String &r_error);
 	static uint64_t _compute_aggregate_key(int p_compute_variant, const ComputeBuildTask &p_task, const LocalVector<uint8_t> &p_active);
 	RID _compute_cache_acquire(uint64_t p_key);
-	void _compute_cache_insert(uint64_t p_key, RID p_shader);
+	bool _compute_cache_insert(uint64_t p_key, RID p_shader);
 	void _compute_cache_release(uint64_t p_key);
 
 	// Compile lane / worker.

@@ -1542,9 +1542,16 @@ void MDCommandBuffer::acceleration_structure_build(MDAccelerationStructure *p_ac
 	DEV_ASSERT(command_buffer() != nullptr);
 	end();
 
-	NS::SharedPtr<MTL::AccelerationStructureCommandEncoder> encoder = NS::RetainPtr(command_buffer()->accelerationStructureCommandEncoder());
-	p_acceleration_structure->encode_build(encoder.get(), p_scratch_buffer);
+	MTL::CommandBuffer *metal_command_buffer = command_buffer();
+	NS::SharedPtr<MTL::AccelerationStructureCommandEncoder> encoder = NS::RetainPtr(metal_command_buffer->accelerationStructureCommandEncoder());
+	const uint64_t generation = p_acceleration_structure->encode_build(encoder.get(), p_scratch_buffer);
 	encoder->endEncoding();
+	auto completion_state = p_acceleration_structure->completion_state;
+	metal_command_buffer->addCompletedHandler([completion_state, generation](MTL::CommandBuffer *p_command_buffer) {
+		if (p_command_buffer->status() == MTL::CommandBufferStatusCompleted) {
+			completion_state->completed_build.store(generation, std::memory_order_release);
+		}
+	});
 
 	retain_resource(reinterpret_cast<CFTypeRef>(p_acceleration_structure->descriptor.get()));
 	retain_resource(reinterpret_cast<CFTypeRef>(p_acceleration_structure->accel.get()));
@@ -1571,9 +1578,16 @@ void MDCommandBuffer::acceleration_structure_compact(MDAccelerationStructure *p_
 	DEV_ASSERT(command_buffer() != nullptr);
 	end();
 
-	NS::SharedPtr<MTL::AccelerationStructureCommandEncoder> encoder = NS::RetainPtr(command_buffer()->accelerationStructureCommandEncoder());
-	p_source->encode_compact_into(encoder.get(), p_destination);
+	MTL::CommandBuffer *metal_command_buffer = command_buffer();
+	NS::SharedPtr<MTL::AccelerationStructureCommandEncoder> encoder = NS::RetainPtr(metal_command_buffer->accelerationStructureCommandEncoder());
+	const uint64_t generation = p_source->encode_compact_into(encoder.get(), p_destination);
 	encoder->endEncoding();
+	auto completion_state = p_destination->completion_state;
+	metal_command_buffer->addCompletedHandler([completion_state, generation](MTL::CommandBuffer *p_command_buffer) {
+		if (p_command_buffer->status() == MTL::CommandBufferStatusCompleted) {
+			completion_state->completed_compaction.store(generation, std::memory_order_release);
+		}
+	});
 
 	retain_resource(reinterpret_cast<CFTypeRef>(p_source->accel.get()));
 	retain_resource(reinterpret_cast<CFTypeRef>(p_destination->accel.get()));

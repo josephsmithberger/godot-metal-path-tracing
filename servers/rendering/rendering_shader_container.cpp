@@ -812,7 +812,7 @@ bool RenderingShaderContainer::from_bytes(const PackedByteArray &p_bytes) {
 	ERR_FAIL_COND_V_MSG(container_header.magic_number != CONTAINER_MAGIC_NUMBER, false, "Incorrect magic number in shader container.");
 	ERR_FAIL_COND_V_MSG(container_header.version != CONTAINER_VERSION, false, "Shader container version mismatch (expected " + itos(CONTAINER_VERSION) + ", got " + itos(container_header.version) + ").");
 	ERR_FAIL_COND_V_MSG(container_header.format != _format(), false, "Incorrect format in shader container.");
-	ERR_FAIL_COND_V_MSG(container_header.format_version > _format_version(), false, "Unsupported format version in shader container.");
+	ERR_FAIL_COND_V_MSG(!_format_version_supported(container_header.format_version), false, "Unsupported format version in shader container (expected a compatible version up to " + itos(_format_version()) + ", got " + itos(container_header.format_version) + ").");
 
 	// Adjust shaders to the size indicated by the container header.
 	shaders.resize(container_header.shader_count);
@@ -896,6 +896,10 @@ bool RenderingShaderContainer::from_bytes(const PackedByteArray &p_bytes) {
 
 	ERR_FAIL_COND_V_MSG(bytes_offset != (uint64_t)p_bytes.size(), false, "Amount of bytes in the container does not match the amount of bytes read.");
 	return true;
+}
+
+bool RenderingShaderContainer::_format_version_supported(uint32_t p_version) const {
+	return p_version <= _format_version();
 }
 
 PackedByteArray RenderingShaderContainer::to_bytes() const {

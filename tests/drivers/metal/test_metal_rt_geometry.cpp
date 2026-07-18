@@ -46,11 +46,15 @@ static bool submit_build(MTL::CommandQueue *p_queue, MDAccelerationStructure &p_
 	if (!encoder) {
 		return false;
 	}
-	p_structure.encode_build(encoder.get(), p_scratch);
+	const uint64_t build_generation = p_structure.encode_build(encoder.get(), p_scratch);
 	encoder->endEncoding();
 	command->commit();
 	command->waitUntilCompleted();
-	return command->status() == MTL::CommandBufferStatusCompleted && command->error() == nullptr;
+	const bool completed = command->status() == MTL::CommandBufferStatusCompleted && command->error() == nullptr;
+	if (completed) {
+		p_structure.completion_state->completed_build.store(build_generation, std::memory_order_release);
+	}
+	return completed;
 }
 
 static bool submit_refit(MTL::CommandQueue *p_queue, MDAccelerationStructure &p_structure, MTL::Buffer *p_scratch) {

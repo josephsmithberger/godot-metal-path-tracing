@@ -250,6 +250,10 @@ void RenderRaytracing::cleanup_caches() {
 			for (uint32_t j = 0; j < RT_CACHE_CHUNK_SIZE; j++) {
 				RTCacheEntry *entry = &surface_chunks[i][j];
 				if (entry->ptr) {
+					if (entry->ptr->compacted_blas.is_valid() && rd->acceleration_structure_is_valid(entry->ptr->compacted_blas)) {
+						rd->free_rid(entry->ptr->compacted_blas);
+						entry->ptr->compacted_blas = RID();
+					}
 					if (entry->ptr->blas.is_valid() && rd->acceleration_structure_is_valid(entry->ptr->blas)) {
 						rd->free_rid(entry->ptr->blas);
 						entry->ptr->blas = RID();
@@ -591,8 +595,12 @@ RTSurfaceData *RenderRaytracing::process_surface(
 	// Allocate or reuse entry
 	if (!entry->ptr) {
 		entry->ptr = memnew(RTSurfaceData);
-	} else if (entry->ptr->blas.is_valid()) {
-		if (RD::get_singleton()->acceleration_structure_is_valid(entry->ptr->blas)) {
+	} else {
+		if (entry->ptr->compacted_blas.is_valid() && RD::get_singleton()->acceleration_structure_is_valid(entry->ptr->compacted_blas)) {
+			RD::get_singleton()->free_rid(entry->ptr->compacted_blas);
+			entry->ptr->compacted_blas = RID();
+		}
+		if (entry->ptr->blas.is_valid() && RD::get_singleton()->acceleration_structure_is_valid(entry->ptr->blas)) {
 			// A surface edit may replace its vertex or index buffer. RenderingDevice
 			// cascade-frees dependent BLAS RIDs when that happens, even though the
 			// mesh RID may stay unchanged. Only free the cached BLAS if it survived
@@ -1835,10 +1843,34 @@ void RenderRaytracing::_process_blas_compactions() {
 	uint32_t budget = MAX_BLAS_COMPACTIONS_PER_FRAME;
 
 	for (RTSurfaceData *surf : compaction_candidates) {
-		if (budget == 0) {
-			break;
+		if (!surf->blas.is_valid()) {
+			continue;
 		}
-		if (surf->compaction != RTSurfaceData::BlasCompaction::PENDING || !surf->blas.is_valid()) {
+		if (surf->compaction == RTSurfaceData::BlasCompaction::COPYING) {
+			if (!surf->compacted_blas.is_valid() || !rd->acceleration_structure_is_valid(surf->compacted_blas)) {
+				surf->compacted_blas = RID();
+				surf->compaction = RTSurfaceData::BlasCompaction::INELIGIBLE;
+				continue;
+			}
+			if (!rd->blas_is_compaction_complete(surf->compacted_blas)) {
+				continue;
+			}
+			remap.insert(surf->blas, surf->compacted_blas);
+			rd->free_rid(surf->blas);
+			surf->blas = surf->compacted_blas;
+			surf->compacted_blas = RID();
+			surf->blas_size = rd->blas_get_allocated_size(surf->blas);
+			surf->compaction = RTSurfaceData::BlasCompaction::DONE;
+			compacted_blas_count++;
+			if (surf->source_blas_size > surf->blas_size) {
+				compacted_blas_bytes_saved += surf->source_blas_size - surf->blas_size;
+			}
+			continue;
+		}
+		if (surf->compaction != RTSurfaceData::BlasCompaction::PENDING) {
+			continue;
+		}
+		if (budget == 0) {
 			continue;
 		}
 		const uint64_t compacted_size = rd->blas_get_compacted_size(surf->blas);
@@ -1850,7 +1882,7 @@ void RenderRaytracing::_process_blas_compactions() {
 			surf->compaction = RTSurfaceData::BlasCompaction::DONE;
 			continue;
 		}
-		RID target = rd->blas_create_compacted_target(compacted_size);
+		RID target = rd->blas_create_compacted_target(surf->blas, compacted_size);
 		if (!target.is_valid()) {
 			surf->compaction = RTSurfaceData::BlasCompaction::INELIGIBLE;
 			continue;
@@ -1862,17 +1894,11 @@ void RenderRaytracing::_process_blas_compactions() {
 		}
 		rd->set_resource_name(target, "RT BLAS compacted");
 
-		remap.insert(surf->blas, target);
-		// Deferred free: the source stays alive until every submitted command
-		// buffer that references it has completed.
-		rd->free_rid(surf->blas);
-		surf->blas = target;
-		surf->blas_size = compacted_size;
-		surf->compaction = RTSurfaceData::BlasCompaction::DONE;
-		compacted_blas_count++;
-		if (allocated_size > compacted_size) {
-			compacted_blas_bytes_saved += allocated_size - compacted_size;
-		}
+		// Keep the source in every TLAS until the compact command's completion
+		// callback makes the destination safe to publish on a later frame.
+		surf->compacted_blas = target;
+		surf->source_blas_size = allocated_size;
+		surf->compaction = RTSurfaceData::BlasCompaction::COPYING;
 		budget--;
 	}
 	compaction_candidates.clear();
@@ -1919,8 +1945,15 @@ void RenderRaytracing::build_acceleration_structures(RTViewportState *p_state, c
 		if (p_state->tlas.is_valid()) {
 			RD::get_singleton()->free_rid(p_state->tlas);
 		}
-		p_state->tlas_max_instances = needed * 2;
+		const uint64_t standard_limit = RD::get_singleton()->limit_get(RD::LIMIT_MAX_ACCELERATION_STRUCTURE_INSTANCES);
+		// Do not let speculative doubling select an extended-limit TLAS for an
+		// actual instance count that still fits the standard traversal mode.
+		p_state->tlas_max_instances = rt_tlas_growth_capacity(needed, standard_limit);
 		p_state->tlas = RD::get_singleton()->tlas_create(p_state->tlas_max_instances, RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
+		if (!p_state->tlas.is_valid()) {
+			p_state->tlas_built = false;
+			return;
+		}
 		RD::get_singleton()->set_resource_name(p_state->tlas, "RT TLAS");
 		tlas_recreated = true;
 	}
@@ -1958,7 +1991,11 @@ void RenderRaytracing::build_acceleration_structures(RTViewportState *p_state, c
 		return;
 	}
 
-	RD::get_singleton()->tlas_build(p_state->tlas, instances);
+	if (RD::get_singleton()->tlas_build(p_state->tlas, instances) != OK) {
+		p_state->tlas_built = false;
+		p_state->tlas_built_instances.clear();
+		return;
+	}
 	p_state->tlas_built_instances = instances;
 	p_state->tlas_built = true;
 }
@@ -2785,7 +2822,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 			// P2: revisit static BLASes until their recorded compacted size is
 			// consumed in build_acceleration_structures() this frame.
-			if (surf_data->compaction == RTSurfaceData::BlasCompaction::PENDING) {
+			if (surf_data->compaction == RTSurfaceData::BlasCompaction::PENDING ||
+					surf_data->compaction == RTSurfaceData::BlasCompaction::COPYING) {
 				_collect_compaction_candidate(surf_data);
 			}
 

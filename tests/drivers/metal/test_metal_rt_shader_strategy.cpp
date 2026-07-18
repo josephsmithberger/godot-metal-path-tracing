@@ -594,6 +594,37 @@ TEST_CASE("[MetalRT] C7 SPIRV-Cross lane lowers ray query compute to MSL") {
 	CHECK(argbuf.msl_source.contains("intersection_query"));
 }
 
+TEST_CASE("[MetalRT] P3 rejects pre-v3 Metal shader containers before stage decoding") {
+	String glsl_error;
+	Vector<uint8_t> spirv = compile_stage_to_spirv(RDC::SHADER_STAGE_COMPUTE, RAY_QUERY_COMPUTE_GLSL, &glsl_error);
+	REQUIRE_MESSAGE(!spirv.is_empty(), vformat("glslang failed: %s", glsl_error));
+
+	const MetalDeviceProfile *profile = MetalDeviceProfile::get_profile(
+			MetalDeviceProfile::Platform::macOS, MetalDeviceProfile::GPU::Apple8, os_version::MACOS_13_0);
+	REQUIRE(profile != nullptr);
+	Ref<RenderingShaderContainerMetal> current;
+	current.instantiate();
+	current->set_device_profile(profile);
+	Vector<RDC::ShaderStageSPIRVData> stages;
+	stages.resize(1);
+	stages.write[0].shader_stage = RDC::SHADER_STAGE_COMPUTE;
+	stages.write[0].spirv = spirv;
+	REQUIRE(current->set_code_from_spirv("P3_cache_version_probe", stages));
+
+	PackedByteArray bytes = current->to_bytes();
+	REQUIRE(bytes.size() >= 16);
+	const uint32_t old_format_version = 2;
+	memcpy(bytes.ptrw() + 12, &old_format_version, sizeof(old_format_version));
+
+	Ref<RenderingShaderContainerMetal> old;
+	old.instantiate();
+	old->set_device_profile(profile);
+	ERR_PRINT_OFF;
+	const bool loaded = old->from_bytes(bytes);
+	ERR_PRINT_ON;
+	CHECK_FALSE(loaded);
+}
+
 TEST_CASE("[MetalRT] B2 production MSL rewrite injects closest-hit and shadow intersectors") {
 	std::string source = load_msl_rewrite_fixture("intersector_scene_fixture.metal");
 	REQUIRE_FALSE(source.empty());

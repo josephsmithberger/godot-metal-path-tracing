@@ -552,6 +552,40 @@ Error RenderingDevice::tlas_build(RID p_tlas, Span<AccelerationStructureInstance
 	ERR_FAIL_NULL_V_MSG(tlas, ERR_INVALID_PARAMETER, "TLAS argument is not valid.");
 	ERR_FAIL_COND_V_MSG(p_instances.size() > tlas->max_instance_count, ERR_INVALID_PARAMETER, "Exceeded the maximum amount of instances allowed in the TLAS.");
 
+	// Resolve and validate every backend handle before allocating upload space,
+	// changing dependency ownership, or enqueueing a graph command. Backends
+	// use this hook for coherence gates that a void graph command cannot report.
+	LocalVector<RDD::AccelerationStructureInstance> rdd_instances;
+	rdd_instances.resize(p_instances.size());
+	LocalVector<AccelerationStructure *> instance_blases;
+	instance_blases.resize(p_instances.size());
+	for (uint32_t i = 0; i < p_instances.size(); i++) {
+		const AccelerationStructureInstance &rd_instance = p_instances[i];
+		RDD::AccelerationStructureInstance &rdd_instance = rdd_instances[i];
+		rdd_instance.transform = rd_instance.transform;
+		rdd_instance.id = rd_instance.id;
+		rdd_instance.mask = rd_instance.mask;
+		rdd_instance.hit_sbt_offset = _decode_hit_sbt_range_offset(rd_instance.hit_sbt_range);
+		rdd_instance.flags = rd_instance.flags;
+		instance_blases[i] = nullptr;
+
+		if (rd_instance.blas.is_valid()) {
+			ERR_FAIL_COND_V_MSG(!rd_instance.hit_sbt_range, ERR_INVALID_PARAMETER, "Instance " + itos(i) + " has an invalid hit shader binding table range.");
+			AccelerationStructure *blas = acceleration_structure_owner.get_or_null(rd_instance.blas);
+			ERR_FAIL_NULL_V(blas, ERR_INVALID_PARAMETER);
+			ERR_FAIL_COND_V(blas->type != RDD::ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL, ERR_INVALID_PARAMETER);
+			ERR_FAIL_COND_V_MSG(blas->invalidated, ERR_INVALID_PARAMETER, "BLAS either has not been built yet, or has been invalidated by an operation and needs to be rebuilt.");
+			rdd_instance.blas = blas->driver_id;
+			instance_blases[i] = blas;
+		}
+	}
+	if (!driver->tlas_build_is_valid(tlas->driver_id, rdd_instances)) {
+		// A requested rebuild that cannot be encoded must not leave the old TLAS
+		// eligible for tracing as though the new instance set had landed.
+		tlas->invalidated = true;
+		ERR_FAIL_V_MSG(ERR_INVALID_PARAMETER, "TLAS build was rejected by the rendering driver before command enqueue.");
+	}
+
 	Error err = _acceleration_structure_scratch_buffer_create(tlas);
 	ERR_FAIL_COND_V(err != OK, err);
 
@@ -617,23 +651,8 @@ Error RenderingDevice::tlas_build(RID p_tlas, Span<AccelerationStructureInstance
 
 	for (uint32_t i = 0; i < p_instances.size(); i++) {
 		const AccelerationStructureInstance &rd_instance = p_instances[i];
-
-		RDD::AccelerationStructureInstance rdd_instance;
-		rdd_instance.transform = rd_instance.transform;
-		rdd_instance.id = rd_instance.id;
-		rdd_instance.mask = rd_instance.mask;
-		rdd_instance.hit_sbt_offset = _decode_hit_sbt_range_offset(rd_instance.hit_sbt_range);
-		rdd_instance.flags = rd_instance.flags;
-
-		if (rd_instance.blas.is_valid()) {
-			ERR_FAIL_COND_V_MSG(!rd_instance.hit_sbt_range, ERR_INVALID_PARAMETER, "Instance " + itos(i) + " has an invalid hit shader binding table range.");
-
-			AccelerationStructure *blas = acceleration_structure_owner.get_or_null(rd_instance.blas);
-			ERR_FAIL_NULL_V(blas, ERR_INVALID_PARAMETER);
-			ERR_FAIL_COND_V(blas->type != RDD::ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL, ERR_INVALID_PARAMETER);
-			ERR_FAIL_COND_V_MSG(blas->invalidated, ERR_INVALID_PARAMETER, "BLAS either has not been built yet, or has been invalidated by an operation and needs to be rebuilt.");
-			rdd_instance.blas = blas->driver_id;
-
+		AccelerationStructure *blas = instance_blases[i];
+		if (blas != nullptr) {
 			if (!tlas->acceleration_structure_dependencies.has(rd_instance.blas)) {
 				tlas->acceleration_structure_dependencies.insert(rd_instance.blas);
 				blas->acceleration_structure_dependencies.insert(p_tlas);
@@ -644,7 +663,7 @@ Error RenderingDevice::tlas_build(RID p_tlas, Span<AccelerationStructureInstance
 			}
 		}
 
-		driver->acceleration_structure_instance_write(shadow_buffer.ptr() + (instance_size * i), rdd_instance);
+		driver->acceleration_structure_instance_write(shadow_buffer.ptr() + (instance_size * i), rdd_instances[i]);
 	}
 
 	memcpy(instance_buffer.data_ptr + instance_buffer_offset, shadow_buffer.ptr(), instance_size * p_instances.size());
@@ -673,12 +692,28 @@ uint64_t RenderingDevice::blas_get_allocated_size(RID p_blas) {
 	return driver->acceleration_structure_get_allocated_size(blas->driver_id);
 }
 
-RID RenderingDevice::blas_create_compacted_target(uint64_t p_size) {
+bool RenderingDevice::blas_is_compaction_complete(RID p_blas) {
+	_THREAD_SAFE_METHOD_
+
+	AccelerationStructure *blas = acceleration_structure_owner.get_or_null(p_blas);
+	ERR_FAIL_NULL_V_MSG(blas, false, "BLAS argument is not valid.");
+	ERR_FAIL_COND_V_MSG(blas->type != RDD::ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL, false, "Compaction completion is only available for BLAS resources.");
+	if (!driver->acceleration_structure_is_compaction_complete(blas->driver_id)) {
+		return false;
+	}
+	blas->invalidated = false;
+	return true;
+}
+
+RID RenderingDevice::blas_create_compacted_target(RID p_source, uint64_t p_size) {
 	ERR_FAIL_COND_V_MSG(p_size == 0, RID(), "A compacted BLAS target requires a nonzero size.");
+	AccelerationStructure *source = acceleration_structure_owner.get_or_null(p_source);
+	ERR_FAIL_NULL_V_MSG(source, RID(), "Source BLAS argument is not valid.");
+	ERR_FAIL_COND_V_MSG(source->type != RDD::ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL, RID(), "Only a BLAS can be compacted.");
 
 	AccelerationStructure acceleration_structure;
 	acceleration_structure.type = RDD::ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
-	acceleration_structure.driver_id = driver->blas_create_compacted_target(p_size);
+	acceleration_structure.driver_id = driver->blas_create_compacted_target(source->driver_id, p_size);
 	if (!acceleration_structure.driver_id) {
 		// The driver has no compaction support; callers treat this as "skip".
 		return RID();
@@ -713,7 +748,9 @@ Error RenderingDevice::blas_compact(RID p_source, RID p_destination) {
 
 	draw_graph.add_blas_compact(src->driver_id, dst->driver_id, dst->draw_tracker, src->draw_tracker);
 
-	dst->invalidated = false;
+	// The destination remains invalid until the backend completion callback
+	// confirms copyAndCompact finished successfully.
+	dst->invalidated = true;
 
 	return OK;
 }

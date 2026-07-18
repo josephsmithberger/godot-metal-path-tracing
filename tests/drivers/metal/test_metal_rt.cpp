@@ -309,6 +309,32 @@ TEST_CASE("[MetalRT] Backend placeholders own descriptors and preserve metadata"
 	delete pipeline;
 }
 
+TEST_CASE("[MetalRT] P2 compaction metadata and mapped sizes require completion") {
+	NS::SharedPtr<MTL::Device> device = NS::TransferPtr(MTL::CreateSystemDefaultDevice());
+	REQUIRE(device);
+
+	MDAccelerationStructure source(MDAccelerationStructure::Type::BLAS, 8192);
+	source.flags.set_flag(RDD::ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT);
+	source.extended_limits = true;
+	source.compacted_size_buffer = NS::TransferPtr(device->newBuffer(sizeof(uint64_t), MTL::ResourceStorageModeShared));
+	REQUIRE(source.compacted_size_buffer);
+	*static_cast<uint64_t *>(source.compacted_size_buffer->contents()) = 4096;
+
+	source.completion_state->requested_build.store(1, std::memory_order_release);
+	CHECK(source.get_compacted_size() == 0);
+	source.completion_state->completed_build.store(1, std::memory_order_release);
+	CHECK(source.get_compacted_size() == 4096);
+
+	MDAccelerationStructure destination(MDAccelerationStructure::Type::BLAS, 4096);
+	destination.inherit_compaction_metadata_from(source);
+	CHECK(destination.extended_limits);
+	CHECK(destination.flags.has_flag(RDD::ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT));
+	destination.completion_state->requested_compaction.store(1, std::memory_order_release);
+	CHECK_FALSE(destination.is_compaction_complete());
+	destination.completion_state->completed_compaction.store(1, std::memory_order_release);
+	CHECK(destination.is_compaction_complete());
+}
+
 TEST_CASE("[MetalRT] Sizes unbounded argument buffers from the bound descriptor count") {
 	UniformSet shader_set;
 	shader_set.uniforms.resize(1);
@@ -387,13 +413,14 @@ TEST_CASE_PENDING("[MetalRT][GPU] Builds, queries, and refits a single-triangle 
 		NS::SharedPtr<MTL::CommandBuffer> build_command = NS::RetainPtr(queue->commandBuffer());
 		NS::SharedPtr<MTL::AccelerationStructureCommandEncoder> build_encoder = NS::RetainPtr(build_command->accelerationStructureCommandEncoder());
 		REQUIRE(build_encoder);
-		blas.encode_build(build_encoder.get(), scratch.get());
+		const uint64_t build_generation = blas.encode_build(build_encoder.get(), scratch.get());
 		build_encoder->endEncoding();
 		build_command->commit();
 		build_command->waitUntilCompleted();
 
 		REQUIRE(build_command->status() == MTL::CommandBufferStatusCompleted);
 		CHECK(build_command->error() == nullptr);
+		blas.completion_state->completed_build.store(build_generation, std::memory_order_release);
 		CHECK(blas.build_encoded);
 		const uint64_t compacted_size = blas.get_compacted_size();
 		CHECK(compacted_size > 0);

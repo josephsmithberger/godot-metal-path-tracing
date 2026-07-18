@@ -1001,6 +1001,12 @@ uint32_t RenderingShaderContainerMetal::_format_version() const {
 	return FORMAT_VERSION;
 }
 
+bool RenderingShaderContainerMetal::_format_version_supported(uint32_t p_version) const {
+	// StageData grew in v3. Reading a v1/v2 payload using the current struct
+	// size would misalign every following stage before the cache is rejected.
+	return p_version == FORMAT_VERSION;
+}
+
 Ref<RenderingShaderContainer> RenderingShaderContainerFormatMetal::create_container() const {
 	Ref<RenderingShaderContainerMetal> result;
 	result.instantiate();

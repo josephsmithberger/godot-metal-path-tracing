@@ -67,6 +67,16 @@ static bool _msl_inject_after_function_brace(std::string &r_source, const char *
 	return true;
 }
 
+static bool _msl_has_function_injection_layout(const std::string &p_source, const char *p_signature_start) {
+	size_t def_pos = p_source.find(p_signature_start);
+	if (def_pos == std::string::npos) {
+		return false;
+	}
+	size_t brace = p_source.find('{', def_pos);
+	return brace >= 2 && brace + 1 < p_source.size() &&
+			p_source.compare(brace - 2, 4, ")\n{\n") == 0;
+}
+
 const char *MetalRTShaderLowering::intersector_patch_status_name(IntersectorPatchStatus p_status) {
 	switch (p_status) {
 		case IntersectorPatchStatus::APPLIED:
@@ -263,7 +273,12 @@ MetalRTShaderLowering::TraversalLoweringResult MetalRTShaderLowering::apply_trav
 	result.kernel_status = IntersectorPatchStatus::APPLIED;
 	result.kernel_detail = "kernel prerequisites hold";
 
-	std::string source = p_source;
+	// Probe-only calls are on the query lane. Avoid copying and injecting the
+	// full generated MSL merely to discard it after collecting eligibility.
+	std::string source;
+	if (p_apply) {
+		source = p_source;
+	}
 	bool modified = false;
 
 	for (const TraversalClassDesc &desc : TRAVERSAL_CLASS_REGISTRY) {
@@ -279,6 +294,25 @@ MetalRTShaderLowering::TraversalLoweringResult MetalRTShaderLowering::apply_trav
 		if (desc.exclude_if_present != nullptr && p_source.find(desc.exclude_if_present) != std::string::npos) {
 			outcome.status = TraversalClassStatus::EXCLUDED;
 			outcome.detail = desc.exclusion_detail;
+			result.classes.push_back(outcome);
+			continue;
+		}
+
+		if (!p_apply) {
+			bool eligible = true;
+			for (uint32_t i = 0; i < desc.injection_count; i++) {
+				if (!_msl_has_function_injection_layout(p_source, desc.injections[i].anchor_signature)) {
+					outcome.status = TraversalClassStatus::ANCHOR_MISMATCH;
+					outcome.detail = String(desc.injections[i].anchor_signature) + " did not match the expected SPIRV-Cross layout";
+					eligible = false;
+					break;
+				}
+			}
+			if (eligible) {
+				result.eligible_class_mask |= desc.class_bit;
+				outcome.status = TraversalClassStatus::APPLIED;
+				outcome.detail = String(desc.name) + " native lane eligible (probe only)";
+			}
 			result.classes.push_back(outcome);
 			continue;
 		}
