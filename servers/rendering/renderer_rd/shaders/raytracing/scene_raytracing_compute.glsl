@@ -189,18 +189,29 @@ ComputeHitData compute_hit_data(ComputeHit hit, mat4 object_to_world, mat4 world
 	get_triangle_indices_ex(geometry, hit.primitive_idx, i0, i1, i2);
 	vec3 bary = vec3(1.0 - hit.barycentrics.x - hit.barycentrics.y,
 			hit.barycentrics.x, hit.barycentrics.y);
-	result.uv = fetch_uv(geometry, i0, i1, i2, bary);
-	result.color = fetch_color(geometry, i0, i1, i2, bary);
+	MaterialData hit_material = materials[hit.geometry_idx];
+	bool needs_full_attributes = (hit_material.flags & (RT_MAT_FLAG_HAS_NORMAL_MAP | RT_MAT_FLAG_CUSTOM_SHADER)) != 0u;
+	bool needs_uv = (hit_material.flags & (RT_MAT_FLAG_HAS_NORMAL_MAP | RT_MAT_FLAG_HAS_EMISSION_TEX |
+										 RT_MAT_FLAG_CUSTOM_SHADER | RT_MAT_FLAG_HAS_ALBEDO_TEX | RT_MAT_FLAG_HAS_ORM_TEX)) != 0u;
+	result.uv = needs_uv ? fetch_uv(geometry, i0, i1, i2, bary) : vec2(0.0);
+	result.color = needs_full_attributes ? fetch_color(geometry, i0, i1, i2, bary) : vec4(1.0);
 
-	TBNResult tbn = fetch_tbn(geometry, i0, i1, i2, bary);
 	mat3 model_rotation = mat3(object_to_world);
 	mat3 normal_matrix = mat3(
 			normalize(model_rotation[0]),
 			normalize(model_rotation[1]),
 			normalize(model_rotation[2]));
-	result.geometry_normal = normalize(normal_matrix * tbn.normal);
-	result.tangent = normalize(normal_matrix * tbn.tangent);
-	result.bitangent = cross(result.geometry_normal, result.tangent) * tbn.bitangent_sign;
+	if (needs_full_attributes) {
+		TBNResult tbn = fetch_tbn(geometry, i0, i1, i2, bary);
+		result.geometry_normal = normalize(normal_matrix * tbn.normal);
+		result.tangent = normalize(normal_matrix * tbn.tangent);
+		result.bitangent = cross(result.geometry_normal, result.tangent) * tbn.bitangent_sign;
+	} else {
+		TBNResult normal_only = fetch_tbn(geometry, i0, i1, i2, bary);
+		result.geometry_normal = normalize(normal_matrix * normal_only.normal);
+		result.tangent = vec3(1.0, 0.0, 0.0);
+		result.bitangent = vec3(0.0, 0.0, 1.0);
+	}
 	if (!hit.front_face) {
 		result.geometry_normal = -result.geometry_normal;
 	}
@@ -213,7 +224,7 @@ vec4 sample_bindless_texture(uint texture_index, vec2 uv) {
 }
 
 vec4 sample_material_texture(uint texture_index, vec2 uv, uint material_flags) {
-	if ((material_flags & 4u) != 0u) {
+	if ((material_flags & RT_MAT_FLAG_POINT_FILTER) != 0u) {
 		return texture(sampler2D(bindless_textures[nonuniformEXT(texture_index)], SAMPLER_NEAREST_REPEAT), uv);
 	}
 	return sample_bindless_texture(texture_index, uv);
@@ -224,7 +235,7 @@ MaterialResult evaluate_hg0(ComputeHitData hit) {
 	vec2 uv = hit.uv * material.uv1_scale + material.uv1_offset;
 
 	vec3 final_normal = hit.geometry_normal;
-	if ((material.flags & 1u) != 0u) {
+	if ((material.flags & RT_MAT_FLAG_HAS_NORMAL_MAP) != 0u) {
 		vec3 tangent_normal;
 		tangent_normal.xy = sample_bindless_texture(material.normal_texture_idx, uv).xy * 2.0 - 1.0;
 		tangent_normal.z = sqrt(max(0.0, 1.0 - dot(tangent_normal.xy, tangent_normal.xy)));
@@ -232,8 +243,10 @@ MaterialResult evaluate_hg0(ComputeHitData hit) {
 		final_normal = normalize(mix(hit.geometry_normal, mapped, material.normal_map_depth));
 	}
 
-	vec4 albedo_texture = sample_material_texture(material.albedo_texture_idx, uv, material.flags);
-	vec3 orm = sample_material_texture(material.orm_texture_idx, uv, material.flags).rgb;
+	vec4 albedo_texture = (material.flags & RT_MAT_FLAG_HAS_ALBEDO_TEX) != 0u ?
+			sample_material_texture(material.albedo_texture_idx, uv, material.flags) : vec4(1.0);
+	vec3 orm = (material.flags & RT_MAT_FLAG_HAS_ORM_TEX) != 0u ?
+			sample_material_texture(material.orm_texture_idx, uv, material.flags).rgb : vec3(1.0);
 
 	MaterialResult result;
 	result.albedo = albedo_texture.rgb * material.albedo_color.rgb;
@@ -243,7 +256,7 @@ MaterialResult evaluate_hg0(ComputeHitData hit) {
 	result.metalness = saturate(orm.b * material.metallic);
 	result.specular = material.specular;
 	result.emissive = vec3(0.0);
-	if ((material.flags & 2u) != 0u) {
+	if ((material.flags & RT_MAT_FLAG_HAS_EMISSION_TEX) != 0u) {
 		result.emissive = sample_material_texture(material.emission_texture_idx, uv, material.flags).rgb *
 				material.emission_color * material.emission_strength * scene_data_block.data.emissive_exposure_normalization;
 	}
@@ -285,8 +298,8 @@ bool ray_query_candidate_accepts(rayQueryEXT query, vec3 origin, vec3 direction)
 	ComputeHit candidate;
 	load_query_candidate_hit(query, candidate);
 	MaterialData candidate_material = materials[candidate.geometry_idx];
-	bool needs_alpha_test = (candidate_material.flags & 8u) != 0u;
-	if ((candidate_material.flags & 16u) != 0u && candidate_material.dispatch_index != 0u) {
+	bool needs_alpha_test = (candidate_material.flags & RT_MAT_FLAG_ALPHA_SCISSOR) != 0u;
+	if ((candidate_material.flags & RT_MAT_FLAG_CUSTOM_SHADER) != 0u && candidate_material.dispatch_index != 0u) {
 		needs_alpha_test = true;
 	}
 	if (!needs_alpha_test) {

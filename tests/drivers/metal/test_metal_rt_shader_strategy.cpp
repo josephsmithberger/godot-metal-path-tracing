@@ -228,13 +228,13 @@ constant uint RT_FLAGS_tmp [[function_constant(0)]];
 constant uint RT_FLAGS = is_function_constant_defined(RT_FLAGS_tmp) ? RT_FLAGS_tmp : 0u;
 
 static inline __attribute__((always_inline))
-bool trace_material(thread const float3& origin, thread const float3& direction, thread const float& max_distance, thread ComputeHit& hit, const raytracing::acceleration_structure<raytracing::instancing> tlas)
+bool trace_material_query(thread const float3& origin, thread const float3& direction, thread const float& max_distance, thread ComputeHit& hit, thread const uint& instance_mask, const raytracing::acceleration_structure<raytracing::instancing> tlas)
 {
 	raytracing::intersection_query<raytracing::instancing, raytracing::triangle_data> query;
 	raytracing::intersection_params params;
 	params.force_opacity(raytracing::forced_opacity::opaque);
 	params.set_triangle_cull_mode(raytracing::triangle_cull_mode::back);
-	query.reset(raytracing::ray(origin, direction, 0.001, max_distance), tlas, 0xFFu, params);
+	query.reset(raytracing::ray(origin, direction, 0.001, max_distance), tlas, instance_mask, params);
 	while (query.next())
 	{
 		query.commit_triangle_intersection();
@@ -254,19 +254,31 @@ bool trace_material(thread const float3& origin, thread const float3& direction,
 }
 
 static inline __attribute__((always_inline))
-bool trace_shadow_blocked(thread const float3& origin, thread const float3& direction, thread const float& max_distance, const raytracing::acceleration_structure<raytracing::instancing> tlas)
+bool trace_material(thread const float3& origin, thread const float3& direction, thread const float& max_distance, thread ComputeHit& hit, const raytracing::acceleration_structure<raytracing::instancing> tlas)
+{
+	return trace_material_query(origin, direction, max_distance, hit, 0xFFu, tlas);
+}
+
+static inline __attribute__((always_inline))
+bool trace_shadow_blocked_query(thread const float3& origin, thread const float3& direction, thread const float& max_distance, thread const uint& instance_mask, const raytracing::acceleration_structure<raytracing::instancing> tlas)
 {
 	raytracing::intersection_query<raytracing::instancing, raytracing::triangle_data> query;
 	raytracing::intersection_params params;
 	params.force_opacity(raytracing::forced_opacity::opaque);
 	params.set_triangle_cull_mode(raytracing::triangle_cull_mode::back);
 	params.accept_any_intersection(true);
-	query.reset(raytracing::ray(origin, direction, 0.001, max_distance), tlas, 0xFFu, params);
+	query.reset(raytracing::ray(origin, direction, 0.001, max_distance), tlas, instance_mask, params);
 	while (query.next())
 	{
 		query.commit_triangle_intersection();
 	}
 	return query.get_committed_intersection_type() == raytracing::intersection_type::triangle;
+}
+
+static inline __attribute__((always_inline))
+bool trace_shadow_blocked(thread const float3& origin, thread const float3& direction, thread const float& max_distance, const raytracing::acceleration_structure<raytracing::instancing> tlas)
+{
+	return trace_shadow_blocked_query(origin, direction, max_distance, 0xFFu, tlas);
 }
 
 kernel void b2_trace_parity(

@@ -82,6 +82,14 @@ struct InstanceMotionData {
 // ============================================================================
 // MATERIAL DATA (matches C++ layout, 112 bytes)
 // ============================================================================
+const uint RT_MAT_FLAG_HAS_NORMAL_MAP = 1u;
+const uint RT_MAT_FLAG_HAS_EMISSION_TEX = 2u;
+const uint RT_MAT_FLAG_POINT_FILTER = 4u;
+const uint RT_MAT_FLAG_ALPHA_SCISSOR = 8u;
+const uint RT_MAT_FLAG_CUSTOM_SHADER = 16u;
+const uint RT_MAT_FLAG_HAS_ALBEDO_TEX = 32u;
+const uint RT_MAT_FLAG_HAS_ORM_TEX = 64u;
+
 struct MaterialData {
 	uint albedo_texture_idx;
 	uint normal_texture_idx;
@@ -95,7 +103,7 @@ struct MaterialData {
 	float metallic;
 	float roughness;
 	float ao_strength;
-	uint flags; // Bit 0: has_normal_map, Bit 1: has_emission
+	uint flags; // RT_MAT_FLAG_* bitset.
 
 	vec2 uv1_scale; // UV1 scale (default 1,1)
 	vec2 uv1_offset; // UV1 offset (default 0,0)

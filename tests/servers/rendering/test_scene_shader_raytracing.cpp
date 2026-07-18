@@ -146,13 +146,15 @@ TEST_CASE("[MetalRT] MATERIAL material ABI carries dispatch, alpha, identity, an
 	CHECK(offsetof(RT_MaterialData, dispatch_index) == 100);
 	CHECK(offsetof(RT_MaterialData, material_id) == 104);
 	CHECK((RT_MAT_FLAG_ALPHA_SCISSOR & RT_MAT_FLAG_CUSTOM_SHADER) == 0);
+	CHECK((RT_MAT_FLAG_HAS_ALBEDO_TEX & RT_MAT_FLAG_HAS_ORM_TEX) == 0);
+	CHECK((RT_MAT_FLAG_HAS_ALBEDO_TEX | RT_MAT_FLAG_HAS_ORM_TEX) == (32u | 64u));
 
 	RT_MaterialData material = {};
 	material.uniform_address = 0x1020304050607080ULL;
 	material.alpha_scissor_threshold = 0.47f;
 	material.dispatch_index = 19;
 	material.material_id = 73;
-	material.flags = RT_MAT_FLAG_ALPHA_SCISSOR | RT_MAT_FLAG_CUSTOM_SHADER;
+	material.flags = RT_MAT_FLAG_ALPHA_SCISSOR | RT_MAT_FLAG_CUSTOM_SHADER | RT_MAT_FLAG_HAS_ALBEDO_TEX;
 	CHECK(material.uniform_address == 0x1020304050607080ULL);
 	CHECK(material.alpha_scissor_threshold == doctest::Approx(0.47f));
 	CHECK(material.dispatch_index == 19);

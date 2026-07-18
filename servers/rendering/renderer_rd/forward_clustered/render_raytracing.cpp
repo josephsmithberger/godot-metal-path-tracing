@@ -1515,6 +1515,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	RID albedo_rd = get_material_texture("texture_albedo", true);
 	if (albedo_rd.is_valid()) {
 		mat.albedo_texture_idx = bindless_block->add_texture(albedo_rd);
+		mat.flags |= RT_MAT_FLAG_HAS_ALBEDO_TEX;
 	}
 
 	RID normal_rd = get_material_texture("texture_normal");
@@ -1531,10 +1532,12 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	RID orm_rd = get_material_texture("texture_orm");
 	if (orm_rd.is_valid()) {
 		mat.orm_texture_idx = bindless_block->add_texture(orm_rd);
+		mat.flags |= RT_MAT_FLAG_HAS_ORM_TEX;
 	} else {
 		RID roughness_rd = get_material_texture("texture_roughness");
 		if (roughness_rd.is_valid()) {
 			mat.orm_texture_idx = bindless_block->add_texture(roughness_rd);
+			mat.flags |= RT_MAT_FLAG_HAS_ORM_TEX;
 		}
 	}
 
