@@ -185,6 +185,8 @@ enum {
 	RT_MAT_FLAG_POINT_FILTER = 4u,
 	RT_MAT_FLAG_ALPHA_SCISSOR = 8u,
 	RT_MAT_FLAG_CUSTOM_SHADER = 16u,
+	RT_MAT_FLAG_HAS_ALBEDO_TEX = 32u,
+	RT_MAT_FLAG_HAS_ORM_TEX = 64u,
 };
 
 _FORCE_INLINE_ bool rt_material_cache_needs_refresh(bool p_has_data, uint32_t p_cached_rid_version, uint16_t p_cached_counter, uint32_t p_rid_version, uint16_t p_counter) {

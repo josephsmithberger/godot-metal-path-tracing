@@ -93,9 +93,9 @@ vec4 sample_bindless_texture_point(uint tex_idx, vec2 uv) {
 	return texture(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_NEAREST_REPEAT), uv);
 }
 
-/// Sample with the appropriate filter based on material flags (bit 2 = point filtering).
+/// Sample with the appropriate filter based on material flags.
 vec4 sample_material_texture(uint tex_idx, vec2 uv, uint mat_flags) {
-	if ((mat_flags & 4u) != 0u) {
+	if ((mat_flags & RT_MAT_FLAG_POINT_FILTER) != 0u) {
 		return sample_bindless_texture_point(tex_idx, uv);
 	}
 	return sample_bindless_texture(tex_idx, uv);

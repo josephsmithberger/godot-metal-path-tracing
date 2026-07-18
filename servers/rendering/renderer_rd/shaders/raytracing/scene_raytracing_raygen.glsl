@@ -367,7 +367,7 @@ void main() {
 	// Normal mapping.
 	vec3 tangent_space_normal = vec3(0.0, 0.0, 1.0);
 	vec3 final_normal = h.geometry_normal;
-	if ((mat.flags & 1u) != 0u) {
+	if ((mat.flags & RT_MAT_FLAG_HAS_NORMAL_MAP) != 0u) {
 		vec3 normal_sample = sample_bindless_texture(mat.normal_texture_idx, uv).rgb;
 		tangent_space_normal.xy = normal_sample.xy * 2.0 - 1.0;
 		tangent_space_normal.z = sqrt(max(0.0, 1.0 - dot(tangent_space_normal.xy, tangent_space_normal.xy)));
@@ -375,14 +375,16 @@ void main() {
 	}
 
 	// Texture sampling.
-	vec4 albedo_tex = sample_material_texture(mat.albedo_texture_idx, uv, mat.flags);
+	vec4 albedo_tex = (mat.flags & RT_MAT_FLAG_HAS_ALBEDO_TEX) != 0u ?
+			sample_material_texture(mat.albedo_texture_idx, uv, mat.flags) : vec4(1.0);
 	vec3 albedo = albedo_tex.rgb * mat.albedo_color.rgb;
-	vec3 orm = sample_material_texture(mat.orm_texture_idx, uv, mat.flags).rgb;
+	vec3 orm = (mat.flags & RT_MAT_FLAG_HAS_ORM_TEX) != 0u ?
+			sample_material_texture(mat.orm_texture_idx, uv, mat.flags).rgb : vec3(1.0);
 	float roughness = saturate(orm.g * mat.roughness);
 	float metalness = saturate(orm.b * mat.metallic);
 
 	vec3 emissive = vec3(0.0);
-	if ((mat.flags & 2u) != 0u) {
+	if ((mat.flags & RT_MAT_FLAG_HAS_EMISSION_TEX) != 0u) {
 		emissive = sample_material_texture(mat.emission_texture_idx, uv, mat.flags).rgb * mat.emission_color * mat.emission_strength;
 		emissive *= scene_data_block.data.emissive_exposure_normalization;
 	}
@@ -513,11 +515,12 @@ void main() {
 	}
 #else
 	// HG0: Standard material alpha test.
-	vec2 uv = fetch_uv(geom, i0, i1, i2, bary);
 	MaterialData mat = materials[geometry_idx];
-	uv = uv * mat.uv1_scale + mat.uv1_offset;
-	float alpha = texture(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv).a;
-	alpha *= mat.albedo_color.a;
+	float alpha = mat.albedo_color.a;
+	if ((mat.flags & RT_MAT_FLAG_HAS_ALBEDO_TEX) != 0u) {
+		vec2 uv = fetch_uv(geom, i0, i1, i2, bary) * mat.uv1_scale + mat.uv1_offset;
+		alpha *= texture(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv).a;
+	}
 
 	if (alpha < 0.5) {
 		ignoreIntersectionEXT;
