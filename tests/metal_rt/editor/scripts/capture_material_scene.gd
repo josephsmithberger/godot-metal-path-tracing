@@ -40,11 +40,11 @@ void fragment() {
 
 const REJECTED_SHADER := """
 shader_type spatial;
-float c15_helper(float value) {
+float material_helper(float value) {
 	return value * value;
 }
 void fragment() {
-	ALBEDO = vec3(c15_helper(0.8), 0.05, 0.05);
+	ALBEDO = vec3(material_helper(0.8), 0.05, 0.05);
 }
 """
 
@@ -107,7 +107,7 @@ func _process(_delta: float) -> void:
 		print("METAL_RT_FIXTURE_REVISION=%s" % FIXTURE_REVISION)
 		print("METAL_RT_CAPTURE_LABEL=%s" % capture_label)
 		if OS.get_environment("GODOT_MTL_DISABLE_RAYTRACING") != "1":
-			print("METAL_RT_C15_MATERIAL_DISPATCH=passed")
+			print("METAL_RT_MATERIAL_DISPATCH=passed")
 			print("METAL_RT_ALPHA_TEST=passed")
 			print("METAL_RT_CUSTOM_SHADER_RELOAD=passed")
 		get_tree().quit()
@@ -115,7 +115,7 @@ func _process(_delta: float) -> void:
 
 func _build_material_fixtures() -> void:
 	var checker: Texture2D = load("res://fixtures/checker.svg")
-	var cutout: Texture2D = load("res://fixtures/c15_cutout.svg")
+	var cutout: Texture2D = load("res://fixtures/material_cutout.svg")
 
 	var floor_material := StandardMaterial3D.new()
 	floor_material.albedo_color = Color(0.3, 0.32, 0.36)
@@ -200,7 +200,7 @@ func _capture(kind: String) -> void:
 	var path := artifact_dir.path_join("e2_materials_%s_%s.png" % [capture_label, kind])
 	var error := captured.save_png(path)
 	if error != OK:
-		push_error("Failed to save C15 editor capture %s: %s" % [path, error_string(error)])
+		push_error("Failed to save MATERIAL editor capture %s: %s" % [path, error_string(error)])
 
 
 func _configure_capture_camera() -> void:
@@ -243,6 +243,6 @@ func _write_manifest() -> void:
 	var manifest_path := artifact_dir.path_join("e2_materials_%s_manifest.json" % capture_label)
 	var file := FileAccess.open(manifest_path, FileAccess.WRITE)
 	if file == null:
-		push_error("Failed to open C15 manifest: %s" % manifest_path)
+		push_error("Failed to open MATERIAL manifest: %s" % manifest_path)
 		return
 	file.store_string(JSON.stringify(manifest, "  ") + "\n")

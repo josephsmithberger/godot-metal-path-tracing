@@ -36,7 +36,7 @@
 
 #include <string>
 
-// Chunk C7 shader-lowering lane for ray-tracing SPIR-V.
+// Shader-lowering shader-lowering lane for ray-tracing SPIR-V.
 //
 // This is the probe half of the shader strategy documented in
 // docs/rt_metal_port/shader_strategy.md: it runs a single SPIR-V stage
@@ -68,7 +68,7 @@ public:
 		}
 	};
 
-	// P3: explicit traversal-lowering metadata.
+	// TRAVERSAL_METADATA: explicit traversal-lowering metadata.
 	//
 	// Every traversal class the compute scene kernel could dispatch through the
 	// native metal::raytracing::intersector is declared in a registry (see

@@ -791,7 +791,7 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 			}
 
 			// Native-intersector lane, driven by the traversal-class registry in
-			// MetalRTShaderLowering (P3): each declared class is applied
+			// MetalRTShaderLowering (TRAVERSAL_METADATA): each declared class is applied
 			// transactionally and the per-stage metadata records what was
 			// injected and what was eligible. Default on for the Apple9+
 			// hardware-RT tier, where Apple recommends the intersector over
@@ -979,7 +979,7 @@ bool RenderingShaderContainerMetal::is_rt_intersector_lane_compatible() const {
 			continue;
 		}
 
-		// P3: the compile-time traversal metadata replaces source re-parsing.
+		// TRAVERSAL_METADATA: the compile-time traversal metadata replaces source re-parsing.
 		// A stage that was eligible for the opaque intersector class must have
 		// been compiled for the lane that is active now.
 		const bool compiled_intersector = (shader_data.rt_traversal_applied_mask & MetalRTShaderLowering::TRAVERSAL_CLASS_OPAQUE_TRIANGLES) != 0;

@@ -76,13 +76,13 @@ TEST_CASE("[MetalRT] path-tracing denoisers use capability-safe values and hints
 	FAIL_CHECK("The Environment pathtracing_denoiser property was not registered.");
 }
 
-TEST_CASE("[MetalRT] C17 serializes the deterministic None denoiser") {
+TEST_CASE("[MetalRT] PRESENTATION serializes the deterministic None denoiser") {
 	Ref<Environment> environment;
 	environment.instantiate();
 	environment->set_pathtracing_enabled(true);
 	environment->set_pathtracing_denoiser(RSE::PT_DENOISER_NONE);
 
-	const String save_path = TestUtils::get_temp_path("c17_environment.tres");
+	const String save_path = TestUtils::get_temp_path("presentation_environment.tres");
 	REQUIRE(ResourceSaver::save(environment, save_path) == OK);
 	Ref<Environment> loaded = ResourceLoader::load(save_path, "Environment", ResourceFormatLoader::CACHE_MODE_IGNORE);
 	REQUIRE(loaded.is_valid());

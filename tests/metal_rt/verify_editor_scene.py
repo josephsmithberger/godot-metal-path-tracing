@@ -23,7 +23,7 @@ class VerificationError(RuntimeError):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Verify the C13 editor-scene capture contract.")
+    parser = argparse.ArgumentParser(description="Verify the EDITOR_SCENE editor-scene capture contract.")
     parser.add_argument("artifact_dir", type=Path)
     return parser.parse_args()
 
@@ -154,7 +154,7 @@ def verify(artifact_dir: Path) -> int:
     metrics_path = artifact_dir / f"{FIXTURE}_metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(
-        "METAL_RT_C13_FIXTURE_VERIFY=passed "
+        "METAL_RT_EDITOR_SCENE_FIXTURE_VERIFY=passed "
         f"beauty_unique={semantic_metrics['beauty_unique_rgb']} "
         f"instance_regions={semantic_metrics['instance_id_object_bins']}"
     )
@@ -166,7 +166,7 @@ def main() -> int:
     try:
         return verify(args.artifact_dir.resolve())
     except (OSError, ImageDiffError, VerificationError) as error:
-        print(f"METAL_RT_C13_FIXTURE_VERIFY=failed error={error}", file=sys.stderr)
+        print(f"METAL_RT_EDITOR_SCENE_FIXTURE_VERIFY=failed error={error}", file=sys.stderr)
         return 1
 
 

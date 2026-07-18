@@ -23,7 +23,7 @@ class VerificationError(RuntimeError):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Verify the C15 Metal material-dispatch capture contract.")
+    parser = argparse.ArgumentParser(description="Verify the MATERIAL Metal material-dispatch capture contract.")
     parser.add_argument("artifact_dir", type=Path)
     return parser.parse_args()
 
@@ -236,7 +236,7 @@ def verify(artifact_dir: Path) -> int:
     metrics_path = artifact_dir / f"{FIXTURE}_metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(
-        "METAL_RT_C15_FIXTURE_VERIFY=passed "
+        "METAL_RT_MATERIAL_FIXTURE_VERIFY=passed "
         f"material_regions={semantics['material_id_regions']} "
         f"alpha_pixels={semantics['alpha_silhouette_pixels']} "
         f"mutation_pixels={semantics['mutation_differing_pixels']} "
@@ -250,7 +250,7 @@ def main() -> int:
     try:
         return verify(args.artifact_dir.resolve())
     except (OSError, ImageDiffError, VerificationError) as error:
-        print(f"METAL_RT_C15_FIXTURE_VERIFY=failed error={error}", file=sys.stderr)
+        print(f"METAL_RT_MATERIAL_FIXTURE_VERIFY=failed error={error}", file=sys.stderr)
         return 1
 
 

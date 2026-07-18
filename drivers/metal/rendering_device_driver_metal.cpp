@@ -2414,7 +2414,7 @@ RDD::AccelerationStructureID RenderingDeviceDriverMetal::_acceleration_structure
 	// must stay an explicit quality/performance tradeoff, not a default.
 	MTL::AccelerationStructureUsage usage = MDAccelerationStructure::usage_from_flags(p_flags);
 	if (p_needs_extended_limits) {
-		// P4: ExtendedLimits is enabled only when the structure actually
+		// ACCELERATION_LIMITS: ExtendedLimits is enabled only when the structure actually
 		// exceeds a standard Metal limit; it trades intersection performance
 		// for the larger limits and obligates the extended_limits intersection
 		// tag on the trace side (see the prepare_tlas_build coherence gate).
@@ -2463,7 +2463,7 @@ RDD::AccelerationStructureID RenderingDeviceDriverMetal::blas_create(VectorView<
 		total_primitives += layouts[i].primitive_count;
 	}
 
-	// P4: explicit standard-limit checks. Exceeding a limit enables
+	// ACCELERATION_LIMITS: explicit standard-limit checks. Exceeding a limit enables
 	// ExtendedLimits on this build; the trace side refuses such structures
 	// until the MSL declares the matching extended_limits intersection tag.
 	const bool needs_extended_limits =
@@ -2552,13 +2552,13 @@ RDD::AccelerationStructureID RenderingDeviceDriverMetal::tlas_create(uint32_t p_
 	desc->setInstanceDescriptorStride(sizeof(MDAccelerationStructureInstance));
 	if (device_properties->features.supports_user_id_instances) {
 		// Godot's instance custom index rides in the UserID descriptor so the
-		// C10 ray-query compute lane can read it as MSL user_instance_id. The
+		// PATH_TRACER ray-query compute lane can read it as MSL user_instance_id. The
 		// record layout is identical either way; at the macOS 11 floor Metal
 		// simply reads the default 64-byte prefix and user IDs stay CPU-side.
 		desc->setInstanceDescriptorType(MTL::AccelerationStructureInstanceDescriptorTypeUserID);
 	}
 
-	// P4: explicit standard-limit check for instance counts. RenderingDevice
+	// ACCELERATION_LIMITS: explicit standard-limit check for instance counts. RenderingDevice
 	// visibility masks are 8-bit, so the standard mask width always holds.
 	const bool needs_extended_limits = (uint64_t)p_max_instance_count > MDAccelerationStructure::STANDARD_LIMIT_MAX_INSTANCES;
 	if (needs_extended_limits) {
@@ -2673,7 +2673,7 @@ RDD::RaytracingPipelineID RenderingDeviceDriverMetal::raytracing_pipeline_create
 	pipeline->shader = (MDShader *)p_layout_defining_shader.id;
 
 	if (pipeline->uses_compute_lane) {
-		// C10: the ray-generation group is the engine's re-expressed ray-query
+		// PATH_TRACER: the ray-generation group is the engine's re-expressed ray-query
 		// compute kernel, compiled through the regular shader container. Build
 		// its pipeline state exactly like a compute pipeline, including
 		// specialization constants (RT_FLAGS et al.).
@@ -2811,7 +2811,7 @@ void RenderingDeviceDriverMetal::command_bind_raytracing_uniform_set(CommandBuff
 }
 
 void RenderingDeviceDriverMetal::command_trace_rays(CommandBufferID p_cmd_buffer, const ShaderBindingTable &p_raygen_sbt, const ShaderBindingTable &p_miss_sbt, const ShaderBindingTable &p_hit_sbt, uint32_t p_width, uint32_t p_height, uint32_t p_depth) {
-	// The compute-lane kernel (C10) inlines raygen/miss/hit logic, so the
+	// The compute-lane kernel (PATH_TRACER) inlines raygen/miss/hit logic, so the
 	// compatibility SBT buffers are not consumed here; instances resolve their
 	// hit-group records engine-side. Pipeline and uniform sets were bound
 	// through the raytracing bind hooks onto the shared compute state.
@@ -3364,9 +3364,9 @@ bool RenderingDeviceDriverMetal::_is_metal_rt_enabled() {
 	metal_rt_gate = metal_rt_evaluate_gate(inputs);
 
 	if (metal_rt_gate.is_enabled()) {
-		print_line("Metal ray tracing: enabled (compute ray-query backend; fallback renderer remains available). C11_GATE=enabled");
+		print_line("Metal ray tracing: enabled (compute ray-query backend; fallback renderer remains available). capability_gate=enabled");
 	} else {
-		WARN_PRINT(vformat("Metal ray tracing: disabled (%s); using non-RT rendering fallback. C11_GATE=disabled:%s", metal_rt_gate.get_description(), metal_rt_gate.get_reason_codes()));
+		WARN_PRINT(vformat("Metal ray tracing: disabled (%s); using non-RT rendering fallback. capability_gate=disabled:%s", metal_rt_gate.get_description(), metal_rt_gate.get_reason_codes()));
 	}
 
 	return metal_rt_gate.is_enabled();

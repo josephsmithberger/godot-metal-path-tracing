@@ -29,7 +29,7 @@
 
 #include "metal_objects_shared.h"
 
-// This deliberately small backend-owned kernel is the C8 execution-path
+// This deliberately small backend-owned kernel is the TRACE_KERNEL execution-path
 // prototype. Even pixels trace the closest-hit path and odd pixels trace the
 // miss path, producing an exact RGBA8 checkerboard that is safe to hash as a
 // golden image on every supported GPU family.
@@ -117,9 +117,9 @@ bool MDRaytracingPipeline::create_trace_one_ray(MTL::Device *p_device, String *r
 	}
 
 	NS::SharedPtr<MTL::IntersectionFunctionTableDescriptor> table_descriptor = NS::TransferPtr(MTL::IntersectionFunctionTableDescriptor::alloc()->init());
-	// Slot zero is always the system opaque-triangle function. C9 reserves one
+	// Slot zero is always the system opaque-triangle function. PIPELINE_MAPPING reserves one
 	// additional stable slot per procedural hit group; those slots are populated
-	// by the C10 compute lowering rather than Vulkan RT-stage functions.
+	// by the PATH_TRACER compute lowering rather than Vulkan RT-stage functions.
 	const uint32_t function_count = MAX(1u, uint32_t(intersection_functions.size()));
 	table_descriptor->setFunctionCount(function_count);
 	intersection_function_table = NS::TransferPtr(state->newIntersectionFunctionTable(table_descriptor.get()));

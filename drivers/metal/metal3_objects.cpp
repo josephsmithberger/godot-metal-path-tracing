@@ -1495,7 +1495,7 @@ void MDCommandBuffer::trace_rays(uint32_t p_width, uint32_t p_height, uint32_t p
 	ERR_FAIL_NULL_MSG(compute.pipeline, "No pipeline is bound for the Metal trace-rays dispatch.");
 	ERR_FAIL_COND_MSG(compute.pipeline->type != MDPipelineType::Raytracing, "The bound Metal pipeline is not a raytracing pipeline.");
 	MDRaytracingPipeline *pipeline = static_cast<MDRaytracingPipeline *>(compute.pipeline);
-	ERR_FAIL_COND_MSG(!pipeline->uses_compute_lane, "The bound Metal raytracing pipeline carries no re-expressed compute kernel; only C10 compute-lane pipelines can be dispatched.");
+	ERR_FAIL_COND_MSG(!pipeline->uses_compute_lane, "The bound Metal raytracing pipeline carries no re-expressed compute kernel; only PATH_TRACER compute-lane pipelines can be dispatched.");
 	ERR_FAIL_COND_MSG(p_width == 0 || p_height == 0 || p_depth == 0, "The Metal trace-rays dimensions must be non-zero.");
 
 	_compute_set_dirty_state();

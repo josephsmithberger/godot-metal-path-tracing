@@ -3839,7 +3839,7 @@ void RenderingServer::init() {
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/limits/cluster_builder/max_clustered_elements", PROPERTY_HINT_RANGE, "32,8192,1"), 512);
 	GLOBAL_DEF("rendering/pathtracer/use_shader_execution_reordering", true);
 	GLOBAL_DEF("rendering/pathtracer/async_shader_compilation", true);
-	// The Metal driver applies the C11 capability gate before exposing its
+	// The Metal driver applies the CAPABILITY_GATE capability gate before exposing its
 	// compute ray-query lane. Disabling this setting forces the regular non-RT
 	// renderer without attempting to create acceleration structures.
 	GLOBAL_DEF_RST("rendering/pathtracer/metal_ray_query_backend", true);

@@ -294,7 +294,7 @@ struct RTProceduralState {
 };
 
 struct RTSurfaceData {
-	/// Static-BLAS compaction lifecycle (P2). Compaction is asynchronous: the
+	/// Static-BLAS compaction lifecycle (BLAS_COMPACTION). Compaction is asynchronous: the
 	/// build records a compacted size, a later frame copies into a right-sized
 	/// allocation, swaps the RID, and defers the source free.
 	enum class BlasCompaction : uint8_t {
@@ -521,7 +521,7 @@ class RenderRaytracing {
 	LocalVector<uint8_t> instance_masks; // Per-instance ray mask (0x00 = invisible to rays, 0xFF = normal)
 	LocalVector<uint32_t> sbt_offsets; // 0 = default material hit group
 
-	// P2: static-BLAS compaction. Candidates are collected during the surface
+	// BLAS_COMPACTION: static-BLAS compaction. Candidates are collected during the surface
 	// walk (pointers stay valid until build_acceleration_structures later the
 	// same frame) and processed there under a per-frame budget so concurrent
 	// old + new + copy allocations stay bounded.

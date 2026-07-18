@@ -17,7 +17,7 @@ class VerificationError(RuntimeError):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Verify the C17 Metal presentation and temporal-reset captures.")
+    parser = argparse.ArgumentParser(description="Verify the PRESENTATION Metal presentation and temporal-reset captures.")
     parser.add_argument("artifact_dir", type=Path)
     return parser.parse_args()
 
@@ -81,7 +81,7 @@ def compare_presentation(reference_path: Path, actual_path: Path, diff_path: Pat
 
 
 def verify(artifact_dir: Path) -> int:
-    manifest = load_json(artifact_dir / "c17_presentation_manifest.json")
+    manifest = load_json(artifact_dir / "presentation_manifest.json")
     required = {
         "fixture": "e0_hg0",
         "fixture_revision": "e0-hg0-v1",
@@ -148,18 +148,18 @@ def verify(artifact_dir: Path) -> int:
 
     metrics: dict[str, dict[str, int]] = {}
     for name in sorted(expected_captures):
-        image_path = artifact_dir / f"c17_{name}.png"
+        image_path = artifact_dir / f"presentation_{name}.png"
         if captures[name] != sha256(image_path):
             raise VerificationError(f"capture digest mismatch: {image_path}")
         metrics[name] = validate_image(image_path)
 
     comparisons: dict[str, dict[str, Any]] = {}
-    native_path = artifact_dir / "c17_presentation_native.png"
+    native_path = artifact_dir / "presentation_native.png"
     for mode in modes:
         if mode == "native":
             continue
-        actual_path = artifact_dir / f"c17_presentation_{mode}.png"
-        diff_path = artifact_dir / f"c17_native_vs_{mode}_diff.png"
+        actual_path = artifact_dir / f"presentation_{mode}.png"
+        diff_path = artifact_dir / f"presentation_native_vs_{mode}_diff.png"
         comparisons[mode] = compare_presentation(native_path, actual_path, diff_path)
 
     sanitized_path = artifact_dir / str(manifest.get("sanitized_environment", ""))
@@ -176,11 +176,11 @@ def verify(artifact_dir: Path) -> int:
         "captures": metrics,
         "native_comparisons": comparisons,
     }
-    (artifact_dir / "c17_presentation_metrics.json").write_text(
+    (artifact_dir / "presentation_metrics.json").write_text(
         json.dumps(result, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    print(f"METAL_RT_C17_PRESENTATION_VERIFY=passed modes={','.join(modes)} captures={len(metrics)}")
+    print(f"METAL_RT_PRESENTATION_VERIFY=passed modes={','.join(modes)} captures={len(metrics)}")
     return 0
 
 
@@ -189,7 +189,7 @@ def main() -> int:
     try:
         return verify(args.artifact_dir.resolve())
     except (OSError, ImageDiffError, VerificationError) as error:
-        print(f"METAL_RT_C17_PRESENTATION_VERIFY=failed error={error}", file=sys.stderr)
+        print(f"METAL_RT_PRESENTATION_VERIFY=failed error={error}", file=sys.stderr)
         return 1
 
 
