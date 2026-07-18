@@ -2407,18 +2407,33 @@ RDD::PipelineID RenderingDeviceDriverMetal::compute_pipeline_create(ShaderID p_s
 
 // ----- ACCELERATION STRUCTURE -----
 
-RDD::AccelerationStructureID RenderingDeviceDriverMetal::_acceleration_structure_create(MDAccelerationStructure::Type p_type, MTL::AccelerationStructureDescriptor *p_desc, BitField<AccelerationStructureFlagBits> p_flags, uint32_t p_max_instance_count) {
+RDD::AccelerationStructureID RenderingDeviceDriverMetal::_acceleration_structure_create(MDAccelerationStructure::Type p_type, MTL::AccelerationStructureDescriptor *p_desc, BitField<AccelerationStructureFlagBits> p_flags, uint32_t p_max_instance_count, bool p_needs_extended_limits) {
 	// ALLOW_COMPACTION affects later command encoding. PREFER_FAST_TRACE maps
 	// to PreferFastIntersection for immutable structures on macOS 26+ (see
 	// usage_from_flags); LOW_MEMORY has no default mapping -- MinimizeMemory
 	// must stay an explicit quality/performance tradeoff, not a default.
-	p_desc->setUsage(MDAccelerationStructure::usage_from_flags(p_flags));
+	MTL::AccelerationStructureUsage usage = MDAccelerationStructure::usage_from_flags(p_flags);
+	if (p_needs_extended_limits) {
+		// P4: ExtendedLimits is enabled only when the structure actually
+		// exceeds a standard Metal limit; it trades intersection performance
+		// for the larger limits and obligates the extended_limits intersection
+		// tag on the trace side (see the prepare_tlas_build coherence gate).
+		if (__builtin_available(macOS 12.0, iOS 15.0, tvOS 15.0, *)) {
+			usage |= MTL::AccelerationStructureUsageExtendedLimits;
+			print_line(vformat("METAL_RT_EXTENDED_LIMITS structure=%s reason=standard-limit-exceeded",
+					p_type == MDAccelerationStructure::Type::BLAS ? "blas" : "tlas"));
+		} else {
+			ERR_FAIL_V_MSG(AccelerationStructureID(), "The scene exceeds Metal's standard acceleration-structure limits and this OS release has no ExtendedLimits support.");
+		}
+	}
+	p_desc->setUsage(usage);
 
 	MTL::AccelerationStructureSizes sizes = device->accelerationStructureSizes(p_desc);
 	uint64_t scratch_size = MDAccelerationStructure::required_scratch_size(sizes, p_flags);
 	ERR_FAIL_COND_V_MSG(scratch_size > UINT32_MAX, AccelerationStructureID(), "Acceleration structure scratch size exceeds the RenderingDevice limit.");
 
 	MDAccelerationStructure *accel_info = memnew(MDAccelerationStructure(p_type, NS::RetainPtr(p_desc), sizes, p_flags, p_max_instance_count));
+	accel_info->extended_limits = p_needs_extended_limits;
 	if (!accel_info->allocate(device)) {
 		memdelete(accel_info);
 		ERR_FAIL_V_MSG(AccelerationStructureID(), "Failed to allocate Metal acceleration structure resources.");
@@ -2441,9 +2456,23 @@ RDD::AccelerationStructureID RenderingDeviceDriverMetal::blas_create(VectorView<
 	}
 	LocalVector<MetalRTGeometryLayout> layouts;
 	layouts.resize(p_geometries.size());
+	uint64_t total_primitives = 0;
 	for (uint32_t i = 0; i < p_geometries.size(); i++) {
 		String validation_error;
 		ERR_FAIL_COND_V_MSG(!MetalRTGeometryLayout::validate(p_geometries[i], extended_vertex_formats, layouts[i], validation_error), AccelerationStructureID(), vformat("Metal BLAS geometry %d is unsupported: %s The geometry was omitted before descriptor creation.", i, validation_error));
+		total_primitives += layouts[i].primitive_count;
+	}
+
+	// P4: explicit standard-limit checks. Exceeding a limit enables
+	// ExtendedLimits on this build; the trace side refuses such structures
+	// until the MSL declares the matching extended_limits intersection tag.
+	const bool needs_extended_limits =
+			total_primitives > MDAccelerationStructure::STANDARD_LIMIT_MAX_PRIMITIVES ||
+			(uint64_t)p_geometries.size() > MDAccelerationStructure::STANDARD_LIMIT_MAX_GEOMETRIES;
+	if (needs_extended_limits) {
+		WARN_PRINT(vformat("Metal BLAS exceeds standard limits (primitives=%d/%d geometries=%d/%d); building with ExtendedLimits.",
+				(int64_t)total_primitives, (int64_t)MDAccelerationStructure::STANDARD_LIMIT_MAX_PRIMITIVES,
+				(int64_t)p_geometries.size(), (int64_t)MDAccelerationStructure::STANDARD_LIMIT_MAX_GEOMETRIES));
 	}
 
 	LocalVector<NS::Object *> geometry_descriptors;
@@ -2508,7 +2537,7 @@ RDD::AccelerationStructureID RenderingDeviceDriverMetal::blas_create(VectorView<
 	NS::SharedPtr<NS::Array> geom_array = NS::TransferPtr(NS::Array::array(geometry_descriptors.ptr(), geometry_descriptors.size())->retain());
 	desc->setGeometryDescriptors(geom_array.get());
 
-	return _acceleration_structure_create(MDAccelerationStructure::Type::BLAS, desc, p_flags);
+	return _acceleration_structure_create(MDAccelerationStructure::Type::BLAS, desc, p_flags, 0, needs_extended_limits);
 }
 
 RDD::AccelerationStructureID RenderingDeviceDriverMetal::tlas_create(uint32_t p_max_instance_count, BitField<AccelerationStructureFlagBits> p_flags) {
@@ -2529,7 +2558,15 @@ RDD::AccelerationStructureID RenderingDeviceDriverMetal::tlas_create(uint32_t p_
 		desc->setInstanceDescriptorType(MTL::AccelerationStructureInstanceDescriptorTypeUserID);
 	}
 
-	return _acceleration_structure_create(MDAccelerationStructure::Type::TLAS, desc, p_flags, p_max_instance_count);
+	// P4: explicit standard-limit check for instance counts. RenderingDevice
+	// visibility masks are 8-bit, so the standard mask width always holds.
+	const bool needs_extended_limits = (uint64_t)p_max_instance_count > MDAccelerationStructure::STANDARD_LIMIT_MAX_INSTANCES;
+	if (needs_extended_limits) {
+		WARN_PRINT(vformat("Metal TLAS exceeds the standard instance limit (%d/%d); building with ExtendedLimits.",
+				(int64_t)p_max_instance_count, (int64_t)MDAccelerationStructure::STANDARD_LIMIT_MAX_INSTANCES));
+	}
+
+	return _acceleration_structure_create(MDAccelerationStructure::Type::TLAS, desc, p_flags, p_max_instance_count, needs_extended_limits);
 }
 
 void RenderingDeviceDriverMetal::acceleration_structure_instance_write(uint8_t *r_driver_instance, const AccelerationStructureInstance &p_instance) {
@@ -2556,6 +2593,33 @@ uint32_t RenderingDeviceDriverMetal::acceleration_structure_get_scratch_size_byt
 	ERR_FAIL_NULL_V_MSG(accel_info, 0, "Metal acceleration structure input parameter is not valid.");
 	ERR_FAIL_COND_V_MSG(accel_info->scratch_size > UINT32_MAX, 0, "Acceleration structure scratch size exceeds the RenderingDevice limit.");
 	return (uint32_t)accel_info->scratch_size;
+}
+
+uint64_t RenderingDeviceDriverMetal::acceleration_structure_get_compacted_size(AccelerationStructureID p_acceleration_structure) {
+	const MDAccelerationStructure *accel_info = (const MDAccelerationStructure *)p_acceleration_structure.id;
+	ERR_FAIL_NULL_V_MSG(accel_info, 0, "Metal acceleration structure input parameter is not valid.");
+	// Zero until the size-writing build has completed on the GPU; the shared
+	// buffer becomes coherent when its command buffer finishes.
+	return accel_info->get_compacted_size();
+}
+
+uint64_t RenderingDeviceDriverMetal::acceleration_structure_get_allocated_size(AccelerationStructureID p_acceleration_structure) {
+	const MDAccelerationStructure *accel_info = (const MDAccelerationStructure *)p_acceleration_structure.id;
+	ERR_FAIL_NULL_V_MSG(accel_info, 0, "Metal acceleration structure input parameter is not valid.");
+	return accel_info->acceleration_structure_size;
+}
+
+RDD::AccelerationStructureID RenderingDeviceDriverMetal::blas_create_compacted_target(uint64_t p_size) {
+	ERR_FAIL_COND_V_MSG(!device_properties->features.supports_raytracing, AccelerationStructureID(), "Acceleration structures are not supported by this device.");
+	ERR_FAIL_COND_V_MSG(p_size == 0, AccelerationStructureID(), "A compacted Metal BLAS target requires a nonzero size.");
+
+	MDAccelerationStructure *accel_info = memnew(MDAccelerationStructure(MDAccelerationStructure::Type::BLAS, p_size));
+	if (!accel_info->allocate(device)) {
+		memdelete(accel_info);
+		ERR_FAIL_V_MSG(AccelerationStructureID(), "Failed to allocate the compacted Metal BLAS target.");
+	}
+	_track_resource(accel_info->accel.get());
+	return AccelerationStructureID(accel_info);
 }
 
 // ----- PIPELINE -----
@@ -2674,6 +2738,23 @@ void RenderingDeviceDriverMetal::command_build_tlas(CommandBufferID p_cmd_buffer
 	ERR_FAIL_COND_MSG(!accel_info->prepare_tlas_build(instance_buffer->metal_buffer.get(), p_instance_offset, p_instance_count), "Metal TLAS instance records, range, or referenced BLAS are invalid.");
 
 	cmd_buffer->acceleration_structure_build(accel_info, scratch_buffer->metal_buffer.get());
+}
+
+void RenderingDeviceDriverMetal::command_compact_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_source, AccelerationStructureID p_destination) {
+	MDCommandBufferBase *cmd_buffer = (MDCommandBufferBase *)p_cmd_buffer.id;
+	MDAccelerationStructure *source = (MDAccelerationStructure *)p_source.id;
+	MDAccelerationStructure *destination = (MDAccelerationStructure *)p_destination.id;
+	ERR_FAIL_NULL_MSG(cmd_buffer, "Metal command buffer input parameter is not valid.");
+	ERR_FAIL_NULL_MSG(source, "Metal source acceleration structure input parameter is not valid.");
+	ERR_FAIL_NULL_MSG(destination, "Metal destination acceleration structure input parameter is not valid.");
+	ERR_FAIL_COND_MSG(source->type != MDAccelerationStructure::Type::BLAS || destination->type != MDAccelerationStructure::Type::BLAS, "Only BLAS resources can be passed to command_compact_blas().");
+	ERR_FAIL_COND_MSG(!source->build_encoded, "Metal BLAS must be built before it can be compacted.");
+	ERR_FAIL_NULL_MSG(destination->accel.get(), "Compacted Metal BLAS target has not been allocated.");
+	const uint64_t compacted_size = source->get_compacted_size();
+	ERR_FAIL_COND_MSG(compacted_size == 0, "Metal BLAS compacted size has not been written; the size-recording build has not completed.");
+	ERR_FAIL_COND_MSG(destination->acceleration_structure_size < compacted_size, "Compacted Metal BLAS target is smaller than the recorded compacted size.");
+
+	cmd_buffer->acceleration_structure_compact(source, destination);
 }
 
 void RenderingDeviceDriverMetal::command_bind_raytracing_pipeline(CommandBufferID p_cmd_buffer, RaytracingPipelineID p_pipeline) {
@@ -3205,6 +3286,9 @@ bool RenderingDeviceDriverMetal::has_feature(Features p_feature) {
 		case SUPPORTS_POINT_SIZE:
 			return true;
 		case SUPPORTS_RAY_QUERY: {
+			return _is_metal_rt_enabled();
+		}
+		case SUPPORTS_BLAS_COMPACTION: {
 			return _is_metal_rt_enabled();
 		}
 		default:

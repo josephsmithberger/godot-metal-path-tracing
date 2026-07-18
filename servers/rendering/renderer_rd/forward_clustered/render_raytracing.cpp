@@ -451,6 +451,9 @@ void RenderRaytracing::prepare_frame() {
 	material_data.clear();
 	motion_indices.clear();
 	motion_transforms.clear();
+	// Compaction candidates never survive a frame; surface eviction below could
+	// otherwise leave dangling pointers in the list.
+	compaction_candidates.clear();
 
 	// Per-frame "touched this frame" lists are cleared here and refilled by
 	// `_access_*_slot` during the build phase. Saves a hashmap walk in
@@ -991,11 +994,20 @@ void RenderRaytracing::_populate_surface_blas(
 		if (p_allow_update) {
 			as_flags.set_flag(RD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT);
 		}
+		// P2: immutable BLASes record their compacted size at build so a later
+		// frame can copy-and-compact them (drivers without support ignore this).
+		const bool compaction_eligible = !p_allow_update && !p_prefer_fast_build && _blas_compaction_enabled();
+		if (compaction_eligible) {
+			as_flags.set_flag(RD::ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT);
+		}
 
 		r_surf_data->blas = RD::get_singleton()->blas_create({ &as_geom, 1 }, as_flags);
 		if (!r_surf_data->blas.is_valid()) {
 			return;
 		}
+		r_surf_data->compaction = compaction_eligible
+				? RTSurfaceData::BlasCompaction::PENDING
+				: RTSurfaceData::BlasCompaction::INELIGIBLE;
 		RD::get_singleton()->set_resource_name(r_surf_data->blas,
 				String(p_vertex_buffer_override.is_valid() ? "RT BLAS deformed [" : "RT BLAS [") + itos(p_cache_key) + "]");
 		r_dirty_blas_list.push_back(r_surf_data->blas);
@@ -1792,7 +1804,99 @@ static bool _rt_instance_equal(const RD::AccelerationStructureInstance &p_a, con
 			p_a.transform == p_b.transform;
 }
 
+bool RenderRaytracing::_blas_compaction_enabled() {
+	if (!blas_compaction_support_checked) {
+		blas_compaction_support_checked = true;
+		// GODOT_RT_BLAS_COMPACTION=0 disables the lane for A/B runs and for
+		// pixel-exact capture comparisons: a compacted BVH can legitimately
+		// resolve exact-tie hits differently at shared edges.
+		blas_compaction_supported = OS::get_singleton()->get_environment("GODOT_RT_BLAS_COMPACTION") != "0" &&
+				RD::get_singleton()->has_feature(RD::SUPPORTS_BLAS_COMPACTION);
+	}
+	return blas_compaction_supported;
+}
+
+void RenderRaytracing::_collect_compaction_candidate(RTSurfaceData *p_surf_data) {
+	// The list is small; multiple instances share one RTSurfaceData per frame.
+	if (compaction_candidates.size() >= MAX_BLAS_COMPACTIONS_PER_FRAME * 4 ||
+			compaction_candidates.has(p_surf_data)) {
+		return;
+	}
+	compaction_candidates.push_back(p_surf_data);
+}
+
+void RenderRaytracing::_process_blas_compactions() {
+	if (compaction_candidates.is_empty()) {
+		return;
+	}
+
+	RD *rd = RD::get_singleton();
+	HashMap<RID, RID> remap; // Old BLAS -> compacted BLAS for this frame's TLAS list.
+	uint32_t budget = MAX_BLAS_COMPACTIONS_PER_FRAME;
+
+	for (RTSurfaceData *surf : compaction_candidates) {
+		if (budget == 0) {
+			break;
+		}
+		if (surf->compaction != RTSurfaceData::BlasCompaction::PENDING || !surf->blas.is_valid()) {
+			continue;
+		}
+		const uint64_t compacted_size = rd->blas_get_compacted_size(surf->blas);
+		if (compacted_size == 0) {
+			continue; // The size-recording build has not completed yet; retry later.
+		}
+		const uint64_t allocated_size = rd->blas_get_allocated_size(surf->blas);
+		if (allocated_size != 0 && compacted_size >= allocated_size) {
+			surf->compaction = RTSurfaceData::BlasCompaction::DONE;
+			continue;
+		}
+		RID target = rd->blas_create_compacted_target(compacted_size);
+		if (!target.is_valid()) {
+			surf->compaction = RTSurfaceData::BlasCompaction::INELIGIBLE;
+			continue;
+		}
+		if (rd->blas_compact(surf->blas, target) != OK) {
+			rd->free_rid(target);
+			surf->compaction = RTSurfaceData::BlasCompaction::DONE;
+			continue;
+		}
+		rd->set_resource_name(target, "RT BLAS compacted");
+
+		remap.insert(surf->blas, target);
+		// Deferred free: the source stays alive until every submitted command
+		// buffer that references it has completed.
+		rd->free_rid(surf->blas);
+		surf->blas = target;
+		surf->blas_size = compacted_size;
+		surf->compaction = RTSurfaceData::BlasCompaction::DONE;
+		compacted_blas_count++;
+		if (allocated_size > compacted_size) {
+			compacted_blas_bytes_saved += allocated_size - compacted_size;
+		}
+		budget--;
+	}
+	compaction_candidates.clear();
+
+	if (!remap.is_empty()) {
+		// This frame's instance list was collected before the swap.
+		for (uint32_t i = 0; i < blass.size(); i++) {
+			const RID *swapped = remap.getptr(blass[i]);
+			if (swapped != nullptr) {
+				blass[i] = *swapped;
+			}
+		}
+		if (OS::get_singleton()->get_environment("GODOT_RT_DUMP_COMPACTION") == "1") {
+			print_line(vformat("RT_BLAS_COMPACTION swapped=%d total=%d saved_bytes=%d",
+					(int)remap.size(), compacted_blas_count, (int64_t)compacted_blas_bytes_saved));
+		}
+	}
+}
+
 void RenderRaytracing::build_acceleration_structures(RTViewportState *p_state, const LocalVector<RID> &p_dirty_blas_list, const LocalVector<RID> &p_dirty_blas_update_list) {
+	RENDER_TIMESTAMP("BLAS Compaction");
+
+	_process_blas_compactions();
+
 	RENDER_TIMESTAMP("BLAS Build");
 
 	for (const RID &blas_rid : p_dirty_blas_list) {
@@ -2677,6 +2781,12 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			if (!surf_data || !surf_data->blas.is_valid()) {
 				surf = surf->next;
 				continue;
+			}
+
+			// P2: revisit static BLASes until their recorded compacted size is
+			// consumed in build_acceleration_structures() this frame.
+			if (surf_data->compaction == RTSurfaceData::BlasCompaction::PENDING) {
+				_collect_compaction_candidate(surf_data);
 			}
 
 			// Resolve material before TLAS so we can skip surfaces whose HG is not live yet (override > surface > mesh).

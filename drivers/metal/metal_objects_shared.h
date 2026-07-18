@@ -750,6 +750,7 @@ public:
 
 	virtual void acceleration_structure_build(MDAccelerationStructure *p_acceleration_structure, MTL::Buffer *p_scratch_buffer) = 0;
 	virtual void acceleration_structure_refit(MDAccelerationStructure *p_acceleration_structure, MTL::Buffer *p_scratch_buffer) = 0;
+	virtual void acceleration_structure_compact(MDAccelerationStructure *p_source, MDAccelerationStructure *p_destination) = 0;
 
 #pragma mark - Raytracing Commands
 
@@ -1293,6 +1294,20 @@ public:
 	BitField<RDD::AccelerationStructureFlagBits> flags = {};
 	/// True after a build has been encoded, allowing a later in-place refit.
 	bool build_encoded = false;
+	/// True when the structure exceeds Metal's standard limits and was built
+	/// with MTLAccelerationStructureUsageExtendedLimits. Tracing such a
+	/// hierarchy requires the `extended_limits` intersection tag in every MSL
+	/// intersector / intersection_query; see the coherence gate in
+	/// prepare_tlas_build().
+	bool extended_limits = false;
+
+	// Standard (non-extended) Metal acceleration-structure limits. Exceeding
+	// any of them requires ExtendedLimits usage on the build and the matching
+	// `extended_limits` intersection tag on the trace side.
+	static constexpr uint64_t STANDARD_LIMIT_MAX_PRIMITIVES = 1ull << 28;
+	static constexpr uint64_t STANDARD_LIMIT_MAX_GEOMETRIES = 1ull << 24;
+	static constexpr uint64_t STANDARD_LIMIT_MAX_INSTANCES = 1ull << 24;
+	static constexpr uint32_t STANDARD_LIMIT_VISIBILITY_MASK_BITS = 8;
 
 	// TLAS only.
 	uint32_t max_instance_count = 0;
@@ -1351,9 +1366,22 @@ public:
 	void encode_build(MTL::AccelerationStructureCommandEncoder *p_encoder, MTL::Buffer *p_scratch_buffer) {
 		p_encoder->buildAccelerationStructure(accel.get(), descriptor.get(), p_scratch_buffer, 0);
 		if (compacted_size_buffer) {
-			p_encoder->writeCompactedAccelerationStructureSize(accel.get(), compacted_size_buffer.get(), 0);
+			if (__builtin_available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
+				// Explicit 64-bit result. The legacy selector writes 32 bits; the
+				// buffer is a zero-initialized 8-byte allocation, so the 64-bit
+				// read in get_compacted_size() is correct for both variants on
+				// this little-endian platform.
+				p_encoder->writeCompactedAccelerationStructureSize(accel.get(), compacted_size_buffer.get(), 0, MTL::DataTypeULong);
+			} else {
+				p_encoder->writeCompactedAccelerationStructureSize(accel.get(), compacted_size_buffer.get(), 0);
+			}
 		}
 		build_encoded = true;
+	}
+
+	void encode_compact_into(MTL::AccelerationStructureCommandEncoder *p_encoder, MDAccelerationStructure *p_destination) const {
+		p_encoder->copyAndCompactAccelerationStructure(accel.get(), p_destination->accel.get());
+		p_destination->build_encoded = true;
 	}
 
 	void encode_refit(MTL::AccelerationStructureCommandEncoder *p_encoder, MTL::Buffer *p_scratch_buffer) {
@@ -1383,6 +1411,12 @@ public:
 			scratch_size(required_scratch_size(p_sizes, p_flags)),
 			flags(p_flags),
 			max_instance_count(p_max_instance_count) {}
+
+	/// Compacted-copy destination: a bare allocation with no descriptor. It is
+	/// populated by copyAndCompact and must never be built or refit directly.
+	MDAccelerationStructure(Type p_type, uint64_t p_size) :
+			type(p_type),
+			acceleration_structure_size(p_size) {}
 };
 
 /*! CPU-written instance record used by the Metal TLAS build path.
@@ -1498,10 +1532,25 @@ inline bool MDAccelerationStructure::prepare_tlas_build(MTL::Buffer *p_instance_
 	for (uint32_t i = 0; i < p_instance_count; i++) {
 		memcpy(&instances[i], instance_bytes + (i * sizeof(MDAccelerationStructureInstance)), sizeof(MDAccelerationStructureInstance));
 		MDAccelerationStructure *blas_info = instances[i].blas;
+		// Visibility masks stay within the standard 8-bit limit; RenderingDevice
+		// carries them as uint8, so extended 16-bit masks are never produced.
 		if (instances[i].requested_mask > UINT8_MAX ||
 				(blas_info != nullptr && (blas_info->type != Type::BLAS || !blas_info->accel || !blas_info->build_encoded))) {
 			return false;
 		}
+		// Coherence gate (P4): the compiled MSL (SPIRV-Cross ray query and the
+		// intersector lowering) does not declare the `extended_limits`
+		// intersection tag, so tracing an extended-limits structure would be
+		// undefined. Oversized structures build correctly but are refused here
+		// with an explicit reason instead of corrupting traversal.
+		if (blas_info != nullptr && blas_info->extended_limits) {
+			WARN_PRINT_ONCE("Metal RT: a BLAS exceeds the standard acceleration-structure limits (built with ExtendedLimits); tracing it requires extended_limits shader support that is not implemented yet, so the TLAS build is refused.");
+			return false;
+		}
+	}
+	if (extended_limits) {
+		WARN_PRINT_ONCE("Metal RT: the TLAS exceeds the standard instance limit (built with ExtendedLimits); tracing it requires extended_limits shader support that is not implemented yet, so the TLAS build is refused.");
+		return false;
 	}
 
 	MDAccelerationStructure *fallback_blas = nullptr;

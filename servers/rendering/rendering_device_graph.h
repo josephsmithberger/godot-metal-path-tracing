@@ -121,6 +121,7 @@ public:
 			TYPE_CAPTURE_TIMESTAMP,
 			TYPE_DRIVER_CALLBACK,
 			TYPE_BOTTOM_LEVEL_ACCELERATION_STRUCTURE_UPDATE,
+			TYPE_BOTTOM_LEVEL_ACCELERATION_STRUCTURE_COMPACT,
 			TYPE_MAX
 		};
 
@@ -346,6 +347,11 @@ private:
 	struct RecordedBottomLevelAccelerationStructureBuildCommand : RecordedCommand {
 		RDD::AccelerationStructureID acceleration_structure;
 		RDD::BufferID scratch_buffer;
+	};
+
+	struct RecordedBottomLevelAccelerationStructureCompactCommand : RecordedCommand {
+		RDD::AccelerationStructureID source_acceleration_structure;
+		RDD::AccelerationStructureID destination_acceleration_structure;
 	};
 
 	struct RecordedTopLevelAccelerationStructureBuildCommand : RecordedCommand {
@@ -893,6 +899,7 @@ public:
 	void begin();
 	void add_blas_build(RDD::AccelerationStructureID p_blas, RDD::BufferID p_scratch_buffer, ResourceTracker *p_dst_tracker, VectorView<ResourceTracker *> p_src_trackers);
 	void add_blas_update(RDD::AccelerationStructureID p_blas, RDD::BufferID p_scratch_buffer, ResourceTracker *p_dst_tracker, VectorView<ResourceTracker *> p_src_trackers);
+	void add_blas_compact(RDD::AccelerationStructureID p_source, RDD::AccelerationStructureID p_destination, ResourceTracker *p_dst_tracker, ResourceTracker *p_src_tracker);
 	void add_tlas_build(RDD::AccelerationStructureID p_tlas, RDD::BufferID p_scratch_buffer, RDD::BufferID p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count, ResourceTracker *p_dst_tracker, VectorView<ResourceTracker *> p_src_trackers);
 	void add_buffer_clear(RDD::BufferID p_dst, ResourceTracker *p_dst_tracker, uint32_t p_offset, uint32_t p_size);
 	void add_buffer_copy(RDD::BufferID p_src, ResourceTracker *p_src_tracker, RDD::BufferID p_dst, ResourceTracker *p_dst_tracker, RDD::BufferCopyRegion p_region);

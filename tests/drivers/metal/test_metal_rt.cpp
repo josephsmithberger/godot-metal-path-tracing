@@ -122,11 +122,23 @@ TEST_CASE("[MetalRT] Acceleration structure metadata maps flags and scratch size
 	sizes.refitScratchBufferSize = 1024;
 	CHECK(MDAccelerationStructure::required_scratch_size(sizes, flags) == 2048);
 
-	BitField<RDD::AccelerationStructureFlagBits> deferred_flags = {};
-	deferred_flags.set_flag(RDD::ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT);
-	deferred_flags.set_flag(RDD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
-	deferred_flags.set_flag(RDD::ACCELERATION_STRUCTURE_LOW_MEMORY_BIT);
-	CHECK(MDAccelerationStructure::usage_from_flags(deferred_flags) == MTL::AccelerationStructureUsageNone);
+	// An immutable AS that doesn't prefer fast build maps PREFER_FAST_TRACE to
+	// PreferFastIntersection on macOS 26+ (Blender's static-AS policy);
+	// ALLOW_COMPACTION and LOW_MEMORY stay deliberately unmapped.
+	BitField<RDD::AccelerationStructureFlagBits> static_flags = {};
+	static_flags.set_flag(RDD::ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT);
+	static_flags.set_flag(RDD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
+	static_flags.set_flag(RDD::ACCELERATION_STRUCTURE_LOW_MEMORY_BIT);
+	if (__builtin_available(macOS 26.0, iOS 26.0, tvOS 26.0, *)) {
+		CHECK(MDAccelerationStructure::usage_from_flags(static_flags) == MTL::AccelerationStructureUsagePreferFastIntersection);
+	} else {
+		CHECK(MDAccelerationStructure::usage_from_flags(static_flags) == MTL::AccelerationStructureUsageNone);
+	}
+
+	// The fast-intersection mapping never applies to updatable or fast-build
+	// structures, so the pre-26 usage is unchanged there on every OS.
+	static_flags.set_flag(RDD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT);
+	CHECK(MDAccelerationStructure::usage_from_flags(static_flags) == MTL::AccelerationStructureUsageRefit);
 }
 
 TEST_CASE("[MetalRT] C14 validates indexed, non-indexed, and compressed geometry layouts") {

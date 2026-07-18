@@ -493,7 +493,7 @@ public:
 	// ----- ACCELERATION STRUCTURE -----
 
 private:
-	AccelerationStructureID _acceleration_structure_create(MDAccelerationStructure::Type p_type, MTL::AccelerationStructureDescriptor *p_desc, BitField<AccelerationStructureFlagBits> p_flags, uint32_t p_max_instance_count = 0);
+	AccelerationStructureID _acceleration_structure_create(MDAccelerationStructure::Type p_type, MTL::AccelerationStructureDescriptor *p_desc, BitField<AccelerationStructureFlagBits> p_flags, uint32_t p_max_instance_count = 0, bool p_needs_extended_limits = false);
 
 public:
 	virtual AccelerationStructureID blas_create(VectorView<AccelerationStructureGeometry> p_geometries, BitField<AccelerationStructureFlagBits> p_flags) override final;
@@ -501,6 +501,9 @@ public:
 	virtual void acceleration_structure_instance_write(uint8_t *r_driver_instance, const AccelerationStructureInstance &p_instance) override final;
 	virtual void acceleration_structure_free(AccelerationStructureID p_acceleration_structure) override final;
 	virtual uint32_t acceleration_structure_get_scratch_size_bytes(AccelerationStructureID p_acceleration_structure) override final;
+	virtual uint64_t acceleration_structure_get_compacted_size(AccelerationStructureID p_acceleration_structure) override final;
+	virtual uint64_t acceleration_structure_get_allocated_size(AccelerationStructureID p_acceleration_structure) override final;
+	virtual AccelerationStructureID blas_create_compacted_target(uint64_t p_size) override final;
 
 	// ----- PIPELINE -----
 
@@ -514,6 +517,7 @@ public:
 	virtual void command_build_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer) override final;
 	virtual void command_update_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer) override final;
 	virtual void command_build_tlas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, BufferID p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count) override final;
+	virtual void command_compact_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_source, AccelerationStructureID p_destination) override final;
 	virtual void command_bind_raytracing_pipeline(CommandBufferID p_cmd_buffer, RaytracingPipelineID p_pipeline) override final;
 	virtual void command_bind_raytracing_uniform_set(CommandBufferID p_cmd_buffer, UniformSetID p_uniform_set, ShaderID p_shader, uint32_t p_set_index) override final;
 	virtual void command_trace_rays(CommandBufferID p_cmd_buffer, const ShaderBindingTable &p_raygen_sbt, const ShaderBindingTable &p_miss_sbt, const ShaderBindingTable &p_hit_sbt, uint32_t p_width, uint32_t p_height, uint32_t p_depth) override final;

@@ -1089,6 +1089,10 @@ void RenderingDeviceGraph::_run_render_commands(int32_t p_level, const RecordedC
 				const RecordedBottomLevelAccelerationStructureBuildCommand *blas_update_command = reinterpret_cast<const RecordedBottomLevelAccelerationStructureBuildCommand *>(command);
 				driver->command_update_blas(r_command_buffer, blas_update_command->acceleration_structure, blas_update_command->scratch_buffer);
 			} break;
+			case RecordedCommand::TYPE_BOTTOM_LEVEL_ACCELERATION_STRUCTURE_COMPACT: {
+				const RecordedBottomLevelAccelerationStructureCompactCommand *blas_compact_command = reinterpret_cast<const RecordedBottomLevelAccelerationStructureCompactCommand *>(command);
+				driver->command_compact_blas(r_command_buffer, blas_compact_command->source_acceleration_structure, blas_compact_command->destination_acceleration_structure);
+			} break;
 			case RecordedCommand::TYPE_TOP_LEVEL_ACCELERATION_STRUCTURE_BUILD: {
 				const RecordedTopLevelAccelerationStructureBuildCommand *tlas_build_command = reinterpret_cast<const RecordedTopLevelAccelerationStructureBuildCommand *>(command);
 				driver->command_build_tlas(r_command_buffer, tlas_build_command->acceleration_structure, tlas_build_command->scratch_buffer, tlas_build_command->instance_buffer, tlas_build_command->instance_offset, tlas_build_command->instance_count);
@@ -1838,6 +1842,19 @@ void RenderingDeviceGraph::add_blas_update(RDD::AccelerationStructureID p_accele
 	usages[resource_count - 1] = RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ_WRITE;
 
 	_add_command_to_graph(trackers.ptr(), usages.ptr(), usages.size(), command_index, command);
+}
+
+void RenderingDeviceGraph::add_blas_compact(RDD::AccelerationStructureID p_source, RDD::AccelerationStructureID p_destination, ResourceTracker *p_dst_tracker, ResourceTracker *p_src_tracker) {
+	int32_t command_index;
+	RecordedBottomLevelAccelerationStructureCompactCommand *command = static_cast<RecordedBottomLevelAccelerationStructureCompactCommand *>(_allocate_command(sizeof(RecordedBottomLevelAccelerationStructureCompactCommand), command_index));
+	command->type = RecordedCommand::TYPE_BOTTOM_LEVEL_ACCELERATION_STRUCTURE_COMPACT;
+	command->self_stages = RDD::PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT;
+	command->source_acceleration_structure = p_source;
+	command->destination_acceleration_structure = p_destination;
+
+	ResourceTracker *trackers[2] = { p_src_tracker, p_dst_tracker };
+	ResourceUsage usages[2] = { RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ, RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ_WRITE };
+	_add_command_to_graph(trackers, usages, 2, command_index, command);
 }
 
 void RenderingDeviceGraph::add_tlas_build(RDD::AccelerationStructureID p_acceleration_structure, RDD::BufferID p_scratch_buffer, RDD::BufferID p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count, ResourceTracker *p_dst_tracker, VectorView<ResourceTracker *> p_src_trackers) {
@@ -2693,6 +2710,7 @@ void RenderingDeviceGraph::end(bool p_reorder_commands, bool p_full_barriers, RD
 			2, // TYPE_CAPTURE_TIMESTAMP
 			5, // TYPE_DRIVER_CALLBACK
 			6, // TYPE_BOTTOM_LEVEL_ACCELERATION_STRUCTURE_UPDATE
+			6, // TYPE_BOTTOM_LEVEL_ACCELERATION_STRUCTURE_COMPACT
 		};
 		static_assert(std_size(PriorityTable) == RecordedCommand::TYPE_MAX, "PriorityTable must have one entry per RecordedCommand::Type");
 

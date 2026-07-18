@@ -68,6 +68,66 @@ public:
 		}
 	};
 
+	// P3: explicit traversal-lowering metadata.
+	//
+	// Every traversal class the compute scene kernel could dispatch through the
+	// native metal::raytracing::intersector is declared in a registry (see
+	// TRAVERSAL_CLASS_REGISTRY in the implementation) instead of being implied
+	// by ad-hoc string rewrites. A class entry names its RT_FLAGS-derived guard
+	// constant (per-class pipeline specialization: Metal folds the inactive
+	// lane out at pipeline creation), its injection anchors in the SPIRV-Cross
+	// output, and — for classes that do not have a native lane yet — the
+	// requirements that block them. The engine applies each class
+	// transactionally and reports a structured per-class outcome, which the
+	// shader container records as reflection metadata for cache validation and
+	// pipeline selection.
+	enum TraversalClassBits : uint32_t {
+		TRAVERSAL_CLASS_NONE = 0,
+		// ALL_OPAQUE pipelines: closest-hit and shadow traversal with forced
+		// opacity. Guarded by RT_FLAG_ALL_OPAQUE (RT_FLAGS bit 4).
+		TRAVERSAL_CLASS_OPAQUE_TRIANGLES = 1 << 0,
+		// Alpha-tested triangles. Requires the intersection-function-table
+		// path: candidates must run the material alpha test as a Metal
+		// intersection function (linked-function compute pipelines plus
+		// per-slot alpha evaluators from the aggregate kernel).
+		TRAVERSAL_CLASS_ALPHA_TRIANGLES = 1 << 1,
+		// Procedural (AABB) geometry. Requires bounding-box intersection
+		// functions in an intersection function table.
+		TRAVERSAL_CLASS_PROCEDURAL = 1 << 2,
+	};
+
+	enum class TraversalClassStatus {
+		APPLIED, // The class's native lane was injected.
+		NOT_IMPLEMENTED, // Declared in the registry; native lane pending.
+		EXCLUDED, // A registry exclusion matched (e.g. procedural content vetoes the triangle-only opaque body).
+		ANCHOR_MISMATCH, // The SPIRV-Cross output drifted from the declared anchor.
+	};
+
+	struct TraversalClassOutcome {
+		uint32_t class_bit = TRAVERSAL_CLASS_NONE;
+		TraversalClassStatus status = TraversalClassStatus::NOT_IMPLEMENTED;
+		String detail;
+	};
+
+	struct TraversalLoweringResult {
+		// Shared kernel prerequisites (trace anchors, RT_FLAGS declaration).
+		IntersectorPatchStatus kernel_status = IntersectorPatchStatus::NOT_SCENE_TRACE_KERNEL;
+		String kernel_detail;
+		uint32_t applied_class_mask = TRAVERSAL_CLASS_NONE; // Lanes injected into the MSL.
+		uint32_t eligible_class_mask = TRAVERSAL_CLASS_NONE; // Lanes whose prerequisites held.
+		Vector<TraversalClassOutcome> classes;
+
+		bool any_applied() const { return applied_class_mask != TRAVERSAL_CLASS_NONE; }
+	};
+
+	// Metadata-driven lowering over the registry. With p_apply=false the
+	// source is only probed (nothing is modified); the result still reports
+	// which classes were eligible, which the container records so cached MSL
+	// compiled for the other traversal lane can be rejected without re-parsing.
+	static TraversalLoweringResult apply_traversal_lowering(std::string &p_source, bool p_apply = true);
+	static const char *traversal_class_name(uint32_t p_class_bit);
+	static const char *traversal_class_status_name(TraversalClassStatus p_status);
+
 	struct Result {
 		bool ok = false;
 		String error;

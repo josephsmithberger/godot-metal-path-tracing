@@ -87,28 +87,38 @@ const char *MetalRTShaderLowering::intersector_patch_status_name(IntersectorPatc
 	return "unknown";
 }
 
-MetalRTShaderLowering::IntersectorPatchResult MetalRTShaderLowering::patch_scene_ray_query_to_intersector(std::string &p_source) {
-	IntersectorPatchResult result;
-	if (p_source.find("bool trace_material(") == std::string::npos ||
-			p_source.find("bool trace_shadow_blocked(") == std::string::npos) {
-		result.status = IntersectorPatchStatus::NOT_SCENE_TRACE_KERNEL;
-		result.detail = "missing trace_material/trace_shadow_blocked anchors (not the scene trace kernel, or SPIRV-Cross output drifted)";
-		return result;
-	}
-	if (p_source.find("commit_bounding_box_intersection") != std::string::npos) {
-		result.status = IntersectorPatchStatus::PROCEDURAL_GEOMETRY;
-		result.detail = "variant commits procedural bounding boxes (intentional exclusion: intersector body is triangle-only)";
-		return result;
-	}
-	size_t rt_flags_pos = p_source.find("constant uint RT_FLAGS ");
-	if (rt_flags_pos == std::string::npos) {
-		result.status = IntersectorPatchStatus::MISSING_RT_FLAGS;
-		result.detail = "missing RT_FLAGS function-constant anchor";
-		return result;
-	}
+// --- P3: traversal-class registry -----------------------------------------
+//
+// Declarative metadata for every traversal class the compute scene kernel can
+// dispatch natively. The engine below is generic; broadening intersector
+// coverage means adding or completing a registry entry, not growing another
+// textual rewrite.
 
-	std::string source = p_source;
-	static constexpr char trace_helpers[] = R"(
+namespace {
+
+struct TraversalInjection {
+	const char *anchor_signature; // Function definition the dispatch is injected into.
+	const char *dispatch_body; // Injected immediately after the opening brace.
+	MetalRTShaderLowering::IntersectorPatchStatus mismatch_status; // Legacy status for anchor drift.
+};
+
+struct TraversalClassDesc {
+	uint32_t class_bit;
+	const char *name;
+	// Nonnull: a symbol whose presence in the variant vetoes this class (the
+	// legacy status names the veto for the compatibility wrapper).
+	const char *exclude_if_present;
+	const char *exclusion_detail;
+	// Guard + native helper functions inserted once before the first anchor.
+	// Null helpers = the class has no native lane yet; `pending_requirements`
+	// documents what unblocks it.
+	const char *helpers;
+	const TraversalInjection *injections;
+	uint32_t injection_count;
+	const char *pending_requirements;
+};
+
+constexpr char OPAQUE_TRIANGLES_HELPERS[] = R"(
 // --- Godot: native-intersector fast path for ALL_OPAQUE pipelines ----------
 constant bool godot_use_intersector = ((RT_FLAGS & 16u) != 0u); // RT_FLAG_ALL_OPAQUE
 
@@ -148,36 +158,206 @@ static bool godot_trace_shadow_blocked_intersector(const thread float3 &origin, 
 }
 
 )";
-	size_t trace_def = source.find("bool trace_material(");
-	if (trace_def == std::string::npos || rt_flags_pos > trace_def) {
-		result.status = IntersectorPatchStatus::INVALID_RT_FLAGS_ORDER;
-		result.detail = "RT_FLAGS constant is not declared before trace_material";
-		return result;
-	}
-	source.insert(_msl_function_insert_pos(source, trace_def), trace_helpers);
 
-	if (!_msl_inject_after_function_brace(source, "bool trace_material(",
-				"    if (godot_use_intersector)\n"
-				"    {\n"
-				"        return godot_trace_material_intersector(origin, direction, max_distance, hit, tlas);\n"
-				"    }\n")) {
-		result.status = IntersectorPatchStatus::TRACE_MATERIAL_LAYOUT;
-		result.detail = "trace_material opening brace did not match the expected SPIRV-Cross layout";
+constexpr TraversalInjection OPAQUE_TRIANGLES_INJECTIONS[] = {
+	{
+			"bool trace_material(",
+			"    if (godot_use_intersector)\n"
+			"    {\n"
+			"        return godot_trace_material_intersector(origin, direction, max_distance, hit, tlas);\n"
+			"    }\n",
+			MetalRTShaderLowering::IntersectorPatchStatus::TRACE_MATERIAL_LAYOUT,
+	},
+	{
+			"bool trace_shadow_blocked(",
+			"    if (godot_use_intersector)\n"
+			"    {\n"
+			"        return godot_trace_shadow_blocked_intersector(origin, direction, max_distance, tlas);\n"
+			"    }\n",
+			MetalRTShaderLowering::IntersectorPatchStatus::TRACE_SHADOW_LAYOUT,
+	},
+};
+
+constexpr TraversalClassDesc TRAVERSAL_CLASS_REGISTRY[] = {
+	{
+			MetalRTShaderLowering::TRAVERSAL_CLASS_OPAQUE_TRIANGLES,
+			"opaque_triangles",
+			// The opaque intersector body is triangle-only; a variant that
+			// commits procedural bounding boxes must keep the query path.
+			"commit_bounding_box_intersection",
+			"variant commits procedural bounding boxes (intentional exclusion: intersector body is triangle-only)",
+			OPAQUE_TRIANGLES_HELPERS,
+			OPAQUE_TRIANGLES_INJECTIONS,
+			(uint32_t)(sizeof(OPAQUE_TRIANGLES_INJECTIONS) / sizeof(OPAQUE_TRIANGLES_INJECTIONS[0])),
+			nullptr,
+	},
+	{
+			MetalRTShaderLowering::TRAVERSAL_CLASS_ALPHA_TRIANGLES,
+			"alpha_triangles",
+			nullptr,
+			nullptr,
+			nullptr,
+			nullptr,
+			0,
+			"intersection-function-table lane: alpha candidates must run the material alpha test as a Metal intersection function (linked-function compute pipelines plus per-slot alpha evaluators from the aggregate kernel), guarded by a dedicated RT_FLAGS bit",
+	},
+	{
+			MetalRTShaderLowering::TRAVERSAL_CLASS_PROCEDURAL,
+			"procedural",
+			nullptr,
+			nullptr,
+			nullptr,
+			nullptr,
+			0,
+			"bounding-box intersection functions in an intersection function table; depends on the alpha_triangles linked-function infrastructure",
+	},
+};
+
+} // namespace
+
+const char *MetalRTShaderLowering::traversal_class_name(uint32_t p_class_bit) {
+	for (const TraversalClassDesc &desc : TRAVERSAL_CLASS_REGISTRY) {
+		if (desc.class_bit == p_class_bit) {
+			return desc.name;
+		}
+	}
+	return "unknown";
+}
+
+const char *MetalRTShaderLowering::traversal_class_status_name(TraversalClassStatus p_status) {
+	switch (p_status) {
+		case TraversalClassStatus::APPLIED:
+			return "applied";
+		case TraversalClassStatus::NOT_IMPLEMENTED:
+			return "not_implemented";
+		case TraversalClassStatus::EXCLUDED:
+			return "excluded";
+		case TraversalClassStatus::ANCHOR_MISMATCH:
+			return "anchor_mismatch";
+	}
+	return "unknown";
+}
+
+MetalRTShaderLowering::TraversalLoweringResult MetalRTShaderLowering::apply_traversal_lowering(std::string &p_source, bool p_apply) {
+	TraversalLoweringResult result;
+
+	// Shared kernel prerequisites: the scene trace anchors and the RT_FLAGS
+	// specialization constant every class guard folds on.
+	if (p_source.find("bool trace_material(") == std::string::npos ||
+			p_source.find("bool trace_shadow_blocked(") == std::string::npos) {
+		result.kernel_status = IntersectorPatchStatus::NOT_SCENE_TRACE_KERNEL;
+		result.kernel_detail = "missing trace_material/trace_shadow_blocked anchors (not the scene trace kernel, or SPIRV-Cross output drifted)";
 		return result;
 	}
-	if (!_msl_inject_after_function_brace(source, "bool trace_shadow_blocked(",
-				"    if (godot_use_intersector)\n"
-				"    {\n"
-				"        return godot_trace_shadow_blocked_intersector(origin, direction, max_distance, tlas);\n"
-				"    }\n")) {
-		result.status = IntersectorPatchStatus::TRACE_SHADOW_LAYOUT;
-		result.detail = "trace_shadow_blocked opening brace did not match the expected SPIRV-Cross layout";
+	size_t rt_flags_pos = p_source.find("constant uint RT_FLAGS ");
+	if (rt_flags_pos == std::string::npos) {
+		result.kernel_status = IntersectorPatchStatus::MISSING_RT_FLAGS;
+		result.kernel_detail = "missing RT_FLAGS function-constant anchor";
 		return result;
+	}
+	if (rt_flags_pos > p_source.find("bool trace_material(")) {
+		result.kernel_status = IntersectorPatchStatus::INVALID_RT_FLAGS_ORDER;
+		result.kernel_detail = "RT_FLAGS constant is not declared before trace_material";
+		return result;
+	}
+	result.kernel_status = IntersectorPatchStatus::APPLIED;
+	result.kernel_detail = "kernel prerequisites hold";
+
+	std::string source = p_source;
+	bool modified = false;
+
+	for (const TraversalClassDesc &desc : TRAVERSAL_CLASS_REGISTRY) {
+		TraversalClassOutcome outcome;
+		outcome.class_bit = desc.class_bit;
+
+		if (desc.helpers == nullptr) {
+			outcome.status = TraversalClassStatus::NOT_IMPLEMENTED;
+			outcome.detail = String("pending: ") + desc.pending_requirements;
+			result.classes.push_back(outcome);
+			continue;
+		}
+		if (desc.exclude_if_present != nullptr && p_source.find(desc.exclude_if_present) != std::string::npos) {
+			outcome.status = TraversalClassStatus::EXCLUDED;
+			outcome.detail = desc.exclusion_detail;
+			result.classes.push_back(outcome);
+			continue;
+		}
+
+		// Transactional per-class application against a scratch copy.
+		std::string trial = source;
+		size_t first_anchor = trial.find(desc.injections[0].anchor_signature);
+		bool applied = first_anchor != std::string::npos;
+		if (applied) {
+			trial.insert(_msl_function_insert_pos(trial, first_anchor), desc.helpers);
+			for (uint32_t i = 0; i < desc.injection_count; i++) {
+				if (!_msl_inject_after_function_brace(trial, desc.injections[i].anchor_signature, desc.injections[i].dispatch_body)) {
+					outcome.status = TraversalClassStatus::ANCHOR_MISMATCH;
+					outcome.detail = String(desc.injections[i].anchor_signature) + " did not match the expected SPIRV-Cross layout";
+					applied = false;
+					break;
+				}
+			}
+		} else {
+			outcome.status = TraversalClassStatus::ANCHOR_MISMATCH;
+			outcome.detail = String(desc.injections[0].anchor_signature) + " anchor not found";
+		}
+
+		if (applied) {
+			source = std::move(trial);
+			modified = true;
+			result.applied_class_mask |= desc.class_bit;
+			result.eligible_class_mask |= desc.class_bit;
+			outcome.status = TraversalClassStatus::APPLIED;
+			outcome.detail = String(desc.name) + " native lane injected";
+		}
+		result.classes.push_back(outcome);
 	}
 
-	p_source = std::move(source);
-	result.status = IntersectorPatchStatus::APPLIED;
-	result.detail = "ALL_OPAQUE closest-hit and shadow helpers injected";
+	if (p_apply && modified) {
+		p_source = std::move(source);
+	}
+	return result;
+}
+
+MetalRTShaderLowering::IntersectorPatchResult MetalRTShaderLowering::patch_scene_ray_query_to_intersector(std::string &p_source) {
+	// Compatibility facade over the traversal-class registry: reports the
+	// opaque-triangle class outcome using the original status vocabulary.
+	IntersectorPatchResult result;
+	TraversalLoweringResult lowering = apply_traversal_lowering(p_source, /*p_apply=*/true);
+	if (lowering.kernel_status != IntersectorPatchStatus::APPLIED) {
+		result.status = lowering.kernel_status;
+		result.detail = lowering.kernel_detail;
+		return result;
+	}
+	for (const TraversalClassOutcome &outcome : lowering.classes) {
+		if (outcome.class_bit != TRAVERSAL_CLASS_OPAQUE_TRIANGLES) {
+			continue;
+		}
+		switch (outcome.status) {
+			case TraversalClassStatus::APPLIED:
+				result.status = IntersectorPatchStatus::APPLIED;
+				result.detail = "ALL_OPAQUE closest-hit and shadow helpers injected";
+				break;
+			case TraversalClassStatus::EXCLUDED:
+				result.status = IntersectorPatchStatus::PROCEDURAL_GEOMETRY;
+				result.detail = outcome.detail;
+				break;
+			case TraversalClassStatus::ANCHOR_MISMATCH: {
+				// Map the failing anchor back to the original status codes.
+				result.status = outcome.detail.begins_with("bool trace_shadow_blocked(")
+						? IntersectorPatchStatus::TRACE_SHADOW_LAYOUT
+						: IntersectorPatchStatus::TRACE_MATERIAL_LAYOUT;
+				result.detail = outcome.detail;
+			} break;
+			case TraversalClassStatus::NOT_IMPLEMENTED:
+				result.status = IntersectorPatchStatus::NOT_SCENE_TRACE_KERNEL;
+				result.detail = outcome.detail;
+				break;
+		}
+		return result;
+	}
+	result.status = IntersectorPatchStatus::NOT_SCENE_TRACE_KERNEL;
+	result.detail = "opaque_triangles class missing from the traversal registry";
 	return result;
 }
 
