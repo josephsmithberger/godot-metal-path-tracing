@@ -42,7 +42,7 @@ TEST_FORCE_LINK(test_metal_rt)
 
 namespace TestMetalRT {
 
-TEST_CASE("[MetalRT] C11 enables the complete supported capability set") {
+TEST_CASE("[MetalRT] CAPABILITY_GATE enables the complete supported capability set") {
 	MetalRTGateInputs inputs;
 	inputs.supports_raytracing = true;
 	inputs.supports_function_pointers = true;
@@ -58,7 +58,7 @@ TEST_CASE("[MetalRT] C11 enables the complete supported capability set") {
 	CHECK(result.get_description().is_empty());
 }
 
-TEST_CASE("[MetalRT] C11 reports every unsupported capability") {
+TEST_CASE("[MetalRT] CAPABILITY_GATE reports every unsupported capability") {
 	MetalRTGateInputs inputs;
 	MetalRTGateResult result = metal_rt_evaluate_gate(inputs);
 
@@ -70,7 +70,7 @@ TEST_CASE("[MetalRT] C11 reports every unsupported capability") {
 	CHECK(result.get_description().contains("2.3"));
 }
 
-TEST_CASE("[MetalRT] C11 explicit opt-outs force the non-RT fallback") {
+TEST_CASE("[MetalRT] CAPABILITY_GATE explicit opt-outs force the non-RT fallback") {
 	MetalRTGateInputs inputs;
 	inputs.supports_raytracing = true;
 	inputs.supports_function_pointers = true;
@@ -141,7 +141,7 @@ TEST_CASE("[MetalRT] Acceleration structure metadata maps flags and scratch size
 	CHECK(MDAccelerationStructure::usage_from_flags(static_flags) == MTL::AccelerationStructureUsageRefit);
 }
 
-TEST_CASE("[MetalRT] C14 validates indexed, non-indexed, and compressed geometry layouts") {
+TEST_CASE("[MetalRT] SCENE_GEOMETRY validates indexed, non-indexed, and compressed geometry layouts") {
 	RDD::AccelerationStructureGeometry geometry;
 	RDD::AccelerationStructureGeometry::Triangles triangles = {};
 	triangles.vertex_buffer = RDD::BufferID(uint64_t(1));
@@ -309,7 +309,7 @@ TEST_CASE("[MetalRT] Backend placeholders own descriptors and preserve metadata"
 	delete pipeline;
 }
 
-TEST_CASE("[MetalRT] P2 compaction metadata and mapped sizes require completion") {
+TEST_CASE("[MetalRT] BLAS_COMPACTION compaction metadata and mapped sizes require completion") {
 	NS::SharedPtr<MTL::Device> device = NS::TransferPtr(MTL::CreateSystemDefaultDevice());
 	REQUIRE(device);
 
@@ -437,7 +437,7 @@ TEST_CASE_PENDING("[MetalRT][GPU] Builds, queries, and refits a single-triangle 
 
 		REQUIRE(refit_command->status() == MTL::CommandBufferStatusCompleted);
 		CHECK(refit_command->error() == nullptr);
-		print_line(vformat("MetalRT C5 BLAS smoke: device=\"%s\" iteration=%d build_size=%d compacted_size=%d build_scratch_size=%d refit_scratch_size=%d", device->name()->utf8String(), iteration + 1, blas.acceleration_structure_size, compacted_size, blas.build_scratch_size, blas.refit_scratch_size));
+		print_line(vformat("MetalRT BLAS BLAS smoke: device=\"%s\" iteration=%d build_size=%d compacted_size=%d build_scratch_size=%d refit_scratch_size=%d", device->name()->utf8String(), iteration + 1, blas.acceleration_structure_size, compacted_size, blas.build_scratch_size, blas.refit_scratch_size));
 	}
 }
 
@@ -552,7 +552,7 @@ TEST_CASE_PENDING("[MetalRT][GPU] Builds a one-instance TLAS referencing a trian
 		CHECK(round_trip.intersection_function_table_offset == instance.hit_sbt_offset);
 		CHECK(round_trip.blas == &blas);
 		CHECK(round_trip.acceleration_structure_index == 0);
-		print_line(vformat("MetalRT C6 TLAS smoke: device=\"%s\" iteration=%d blas_size=%d tlas_size=%d tlas_scratch_size=%d instance_id=%d mask=%d hit_sbt_offset=%d", device->name()->utf8String(), iteration + 1, blas.acceleration_structure_size, tlas.acceleration_structure_size, tlas.build_scratch_size, round_trip.user_id, round_trip.requested_mask, round_trip.intersection_function_table_offset));
+		print_line(vformat("MetalRT TLAS TLAS smoke: device=\"%s\" iteration=%d blas_size=%d tlas_size=%d tlas_scratch_size=%d instance_id=%d mask=%d hit_sbt_offset=%d", device->name()->utf8String(), iteration + 1, blas.acceleration_structure_size, tlas.acceleration_structure_size, tlas.build_scratch_size, round_trip.user_id, round_trip.requested_mask, round_trip.intersection_function_table_offset));
 	}
 }
 

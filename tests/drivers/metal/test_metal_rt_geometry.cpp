@@ -82,7 +82,7 @@ static NS::SharedPtr<MTL::PrimitiveAccelerationStructureDescriptor> make_blas_de
 	return descriptor;
 }
 
-TEST_CASE_PENDING("[MetalRT][GPU] C14 rebuilds real scene geometry through twenty lifetime iterations") {
+TEST_CASE_PENDING("[MetalRT][GPU] SCENE_GEOMETRY rebuilds real scene geometry through twenty lifetime iterations") {
 	NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
 	NS::SharedPtr<MTL::Device> device = NS::TransferPtr(MTL::CreateSystemDefaultDevice());
 	if (!device || !device->supportsRaytracing()) {
@@ -277,13 +277,13 @@ TEST_CASE_PENDING("[MetalRT][GPU] C14 rebuilds real scene geometry through twent
 
 	CHECK(as_rebuild_count == 120);
 	CHECK(as_refit_count == 20);
-	print_line("METAL_RT_C14_SCENE_GEOMETRY=passed");
+	print_line("METAL_RT_SCENE_GEOMETRY_SCENE_GEOMETRY=passed");
 	print_line(vformat("METAL_RT_AS_REBUILD_COUNT=%d", as_rebuild_count));
 	print_line("METAL_RT_RESOURCE_LIFETIME=passed");
-	print_line(vformat("METAL_RT_C14_ITERATIONS=20 METAL_RT_AS_REFIT_COUNT=%d METAL_RT_PEAK_AS_BYTES=%d", as_refit_count, peak_as_bytes));
+	print_line(vformat("METAL_RT_SCENE_GEOMETRY_ITERATIONS=20 METAL_RT_AS_REFIT_COUNT=%d METAL_RT_PEAK_AS_BYTES=%d", as_refit_count, peak_as_bytes));
 }
 
-TEST_CASE_PENDING("[MetalRT][GPU] C16 refits procedural AABBs in mixed geometry through twenty lifetime iterations") {
+TEST_CASE_PENDING("[MetalRT][GPU] PROCEDURAL refits procedural AABBs in mixed geometry through twenty lifetime iterations") {
 	NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
 	NS::SharedPtr<MTL::Device> device = NS::TransferPtr(MTL::CreateSystemDefaultDevice());
 	if (!device || !device->supportsRaytracing()) {
@@ -425,9 +425,9 @@ TEST_CASE_PENDING("[MetalRT][GPU] C16 refits procedural AABBs in mixed geometry 
 	CHECK(procedural_build_count == 20);
 	CHECK(procedural_refit_count == 20);
 	CHECK(mixed_tlas_build_count == 40);
-	print_line("METAL_RT_C16_PROCEDURAL_AS=passed");
+	print_line("METAL_RT_PROCEDURAL_PROCEDURAL_AS=passed");
 	print_line("METAL_RT_MIXED_GEOMETRY_LIFETIME=passed");
-	print_line(vformat("METAL_RT_C16_ITERATIONS=20 METAL_RT_PROCEDURAL_BUILDS=%d METAL_RT_PROCEDURAL_REFITS=%d METAL_RT_MIXED_TLAS_BUILDS=%d METAL_RT_PEAK_AS_BYTES=%d", procedural_build_count, procedural_refit_count, mixed_tlas_build_count, peak_as_bytes));
+	print_line(vformat("METAL_RT_PROCEDURAL_ITERATIONS=20 METAL_RT_PROCEDURAL_BUILDS=%d METAL_RT_PROCEDURAL_REFITS=%d METAL_RT_MIXED_TLAS_BUILDS=%d METAL_RT_PEAK_AS_BYTES=%d", procedural_build_count, procedural_refit_count, mixed_tlas_build_count, peak_as_bytes));
 }
 
 } // namespace TestMetalRTGeometry

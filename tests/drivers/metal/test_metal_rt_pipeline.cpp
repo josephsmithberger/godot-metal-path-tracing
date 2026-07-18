@@ -82,7 +82,7 @@ static bool configure(MDRaytracingPipeline &r_pipeline, SyntheticGroups &p_group
 	return r_pipeline.configure_shader_groups(p_groups.shaders, p_groups.raygen_indices, p_groups.miss_indices, p_groups.hit_groups, 2, r_error);
 }
 
-TEST_CASE("[MetalRT] C9 maps shader groups in stable bind order") {
+TEST_CASE("[MetalRT] PIPELINE_MAPPING maps shader groups in stable bind order") {
 	SyntheticGroups input;
 	MDRaytracingPipeline pipeline;
 	String error;
@@ -113,7 +113,7 @@ TEST_CASE("[MetalRT] C9 maps shader groups in stable bind order") {
 	CHECK(pipeline.shader_groups[5].intersection_function_table_index == UINT32_MAX);
 }
 
-TEST_CASE("[MetalRT] C9 emits deterministic shader-group handles") {
+TEST_CASE("[MetalRT] PIPELINE_MAPPING emits deterministic shader-group handles") {
 	SyntheticGroups input;
 	MDRaytracingPipeline pipeline;
 	REQUIRE(configure(pipeline, input));
@@ -152,7 +152,7 @@ TEST_CASE("[MetalRT] C9 emits deterministic shader-group handles") {
 	CHECK(error.contains("out of range"));
 }
 
-TEST_CASE("[MetalRT] C9 rejects invalid shader-group mappings") {
+TEST_CASE("[MetalRT] PIPELINE_MAPPING rejects invalid shader-group mappings") {
 	SyntheticGroups input;
 	MDRaytracingPipeline pipeline;
 	String error;
@@ -168,7 +168,7 @@ TEST_CASE("[MetalRT] C9 rejects invalid shader-group mappings") {
 	CHECK(error.contains("closest-hit"));
 }
 
-TEST_CASE_PENDING("[MetalRT][GPU] C9 allocates the mapped Metal function table") {
+TEST_CASE_PENDING("[MetalRT][GPU] PIPELINE_MAPPING allocates the mapped Metal function table") {
 	NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
 	NS::SharedPtr<MTL::Device> device = NS::TransferPtr(MTL::CreateSystemDefaultDevice());
 	if (!device || !device->supportsRaytracing()) {
@@ -184,7 +184,7 @@ TEST_CASE_PENDING("[MetalRT][GPU] C9 allocates the mapped Metal function table")
 	CHECK(pipeline.state);
 	CHECK(pipeline.intersection_function_table);
 	CHECK(pipeline.intersection_function_count == 2);
-	print_line(vformat("MetalRT C9 pipeline mapping: device=\"%s\" groups=%d raygen=%d miss=%d hit=%d ift_entries=%d recursion_budget=%d",
+	print_line(vformat("MetalRT PIPELINE_MAPPING pipeline mapping: device=\"%s\" groups=%d raygen=%d miss=%d hit=%d ift_entries=%d recursion_budget=%d",
 			device->name()->utf8String(), pipeline.shader_groups.size(), pipeline.raygen_group_count, pipeline.miss_group_count, pipeline.hit_group_count, pipeline.intersection_function_count, pipeline.max_trace_recursion_depth));
 }
 

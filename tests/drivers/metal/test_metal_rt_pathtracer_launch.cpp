@@ -45,9 +45,9 @@ TEST_FORCE_LINK(test_metal_rt_pathtracer_launch)
 
 namespace TestMetalRTPathtracerLaunch {
 
-// Chunk C10: launch a controlled path-traced scene through the compute-lane
+// Chunk PATH_TRACER: launch a controlled path-traced scene through the compute-lane
 // raytracing pipeline. The kernel below re-expresses the control flow of the
-// fork's `scene_raytracing_raygen.glsl` per the C7 strategy: the raygen loop
+// fork's `scene_raytracing_raygen.glsl` per the SHADER_LOWERING strategy: the raygen loop
 // becomes the compute kernel body, `traceRayEXT` becomes a ray query, and the
 // miss/hit logic is inlined at the call site. The RT-pipeline payload
 // (`PathPayload`) does not survive re-expression by design: it exists to cross
@@ -460,7 +460,7 @@ struct ComputeLaneGroups {
 	}
 };
 
-TEST_CASE("[MetalRT] C10 maps a compute-lane ray-generation group") {
+TEST_CASE("[MetalRT] PATH_TRACER maps a compute-lane ray-generation group") {
 	ComputeLaneGroups input;
 	MDRaytracingPipeline pipeline;
 	String error;
@@ -485,7 +485,7 @@ TEST_CASE("[MetalRT] C10 maps a compute-lane ray-generation group") {
 	CHECK(first->type == MDRaytracingPipeline::ShaderGroupType::EMPTY_HIT);
 }
 
-TEST_CASE("[MetalRT] C10 rejects invalid compute-lane configurations") {
+TEST_CASE("[MetalRT] PATH_TRACER rejects invalid compute-lane configurations") {
 	ComputeLaneGroups input;
 	MDRaytracingPipeline pipeline;
 	String error;
@@ -583,7 +583,7 @@ struct SceneBLAS {
 	}
 };
 
-TEST_CASE_PENDING("[MetalRT][GPU] C10 path-tracer scene launch matches the CPU reference") {
+TEST_CASE_PENDING("[MetalRT][GPU] PATH_TRACER path-tracer scene launch matches the CPU reference") {
 	NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
 	NS::SharedPtr<MTL::Device> device = NS::TransferPtr(MTL::CreateSystemDefaultDevice());
 	if (!device || !device->supportsRaytracing()) {
@@ -591,7 +591,7 @@ TEST_CASE_PENDING("[MetalRT][GPU] C10 path-tracer scene launch matches the CPU r
 		return;
 	}
 	if (__builtin_available(macOS 12.0, iOS 15.0, tvOS 16.0, *)) {
-		// User-ID instance descriptors are available; they are the C10 floor
+		// User-ID instance descriptors are available; they are the PATH_TRACER floor
 		// for shader-visible instance custom indices.
 	} else {
 		MESSAGE("SKIP_REASON=unsupported_os");
@@ -638,7 +638,7 @@ TEST_CASE_PENDING("[MetalRT][GPU] C10 path-tracer scene launch matches the CPU r
 	REQUIRE(floor_blas.build(device.get(), queue.get(), floor_vertices.ptr(), 6));
 	REQUIRE(blocker_blas.build(device.get(), queue.get(), blocker_vertices.ptr(), 6));
 
-	// Two user-ID instances through the C6 instance writer.
+	// Two user-ID instances through the TLAS instance writer.
 	MDAccelerationStructureInstance instances[2];
 	{
 		RDD::AccelerationStructureInstance floor_instance;
@@ -792,11 +792,11 @@ TEST_CASE_PENDING("[MetalRT][GPU] C10 path-tracer scene launch matches the CPU r
 				image->save_png(p_path);
 			}
 		};
-		save_image(gpu_pixels, artifact_dir.path_join("c10_pathtracer_launch_gpu.png"));
-		save_image(cpu_pixels, artifact_dir.path_join("c10_pathtracer_launch_cpu_reference.png"));
+		save_image(gpu_pixels, artifact_dir.path_join("pathtracer_launch_gpu.png"));
+		save_image(cpu_pixels, artifact_dir.path_join("pathtracer_launch_cpu_reference.png"));
 	}
 
-	print_line(vformat("MetalRT C10 path-tracer launch: device=\"%s\" image=%dx%d spp=%d bounces=%d instances=2 max_diff=%f mean_diff=%f",
+	print_line(vformat("MetalRT PATH_TRACER path-tracer launch: device=\"%s\" image=%dx%d spp=%d bounces=%d instances=2 max_diff=%f mean_diff=%f",
 			device->name()->utf8String(), IMAGE_WIDTH, IMAGE_HEIGHT, SAMPLES_PER_PIXEL, MAX_BOUNCES + 1, max_diff, mean_diff));
 }
 

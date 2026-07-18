@@ -74,9 +74,9 @@ static void fill_golden(TracePixel *r_pixels) {
 	}
 }
 
-// C8 deliberately reuses the exact C5/C6 primitive and instance path. Keeping
+// TRACE_KERNEL deliberately reuses the exact BLAS/TLAS primitive and instance path. Keeping
 // the scene local to this test makes the golden dispatch independent from the
-// later RenderingDevice/SBT mapping in C9.
+// later RenderingDevice/SBT mapping in PIPELINE_MAPPING.
 struct TraceScene {
 	NS::SharedPtr<MTL::Buffer> vertex_buffer;
 	NS::SharedPtr<MTL::Buffer> instance_buffer;
@@ -178,7 +178,7 @@ struct TraceScene {
 	}
 };
 
-TEST_CASE("[MetalRT] C8 trace image golden is stable") {
+TEST_CASE("[MetalRT] TRACE_KERNEL trace image golden is stable") {
 	TracePixel golden[IMAGE_WIDTH * IMAGE_HEIGHT];
 	fill_golden(golden);
 	CHECK(fnv1a64(reinterpret_cast<const uint8_t *>(golden), sizeof(golden)) == GOLDEN_FNV1A64);
@@ -194,7 +194,7 @@ TEST_CASE("[MetalRT] C8 trace image golden is stable") {
 	CHECK(error.contains("not supported"));
 }
 
-TEST_CASE_PENDING("[MetalRT][GPU] C8 traces a deterministic RGBA8 hit/miss image") {
+TEST_CASE_PENDING("[MetalRT][GPU] TRACE_KERNEL traces a deterministic RGBA8 hit/miss image") {
 	NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
 	NS::SharedPtr<MTL::Device> device = NS::TransferPtr(MTL::CreateSystemDefaultDevice());
 	if (!device || !device->supportsRaytracing()) {
@@ -245,7 +245,7 @@ TEST_CASE_PENDING("[MetalRT][GPU] C8 traces a deterministic RGBA8 hit/miss image
 		}
 		const uint64_t actual_hash = fnv1a64(reinterpret_cast<const uint8_t *>(actual), sizeof(actual));
 		CHECK(actual_hash == GOLDEN_FNV1A64);
-		print_line(vformat("MetalRT C8 trace smoke: device=\"%s\" iteration=%d image=%dx%d ift_entries=%d golden_fnv1a64=%s",
+		print_line(vformat("MetalRT TRACE_KERNEL trace smoke: device=\"%s\" iteration=%d image=%dx%d ift_entries=%d golden_fnv1a64=%s",
 				device->name()->utf8String(), iteration + 1, IMAGE_WIDTH, IMAGE_HEIGHT, pipeline.intersection_function_count, String::num_uint64(actual_hash, 16).lpad(16, "0")));
 	}
 }

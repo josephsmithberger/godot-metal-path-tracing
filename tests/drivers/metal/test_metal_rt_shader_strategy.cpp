@@ -46,10 +46,10 @@ TEST_FORCE_LINK(test_metal_rt_shader_strategy)
 
 namespace TestMetalRTShaderStrategy {
 
-// Chunk C7 shader-lowering spike. These tests provide the empirical evidence
+// Shader-lowering shader-lowering spike. These tests provide the empirical evidence
 // behind docs/rt_metal_port/shader_strategy.md: which RT shader forms the
 // existing SPIRV-Cross lane can lower to MSL, and that the native
-// metal::raytracing::intersector lane executes correctly against the C5/C6
+// metal::raytracing::intersector lane executes correctly against the BLAS/TLAS
 // acceleration structures.
 
 // Ray-query compute kernel: the shader form the existing SPIRV-Cross lane is
@@ -125,7 +125,7 @@ void main() {
 // Compute-lane facsimile of the material access pattern used by the scene RT
 // shaders: a GPU-addressed material record selects an entry from an unbounded
 // texture array. This deliberately goes through RenderingShaderContainerMetal,
-// not just the small C7 lowering probe.
+// not just the small SHADER_LOWERING lowering probe.
 static const char *BINDLESS_MATERIAL_GLSL = R"GLSL(
 #version 460
 #extension GL_EXT_buffer_reference : require
@@ -194,11 +194,11 @@ kernel void trace_spike(
 }
 )MSL";
 
-// Reduced standalone SPIRV-Cross-shaped scene kernel for the production B2
+// Reduced standalone SPIRV-Cross-shaped scene kernel for the production INTERSECTOR
 // rewrite. The test specializes RT_FLAGS to 0 and ALL_OPAQUE from this same
 // patched library, proving the query and injected intersector bodies against
 // identical rays and acceleration structures.
-static const char *B2_PATCH_PARITY_MSL = R"MSL(
+static const char *INTERSECTOR_PATCH_PARITY_MSL = R"MSL(
 #include <metal_stdlib>
 #include <metal_raytracing>
 
@@ -215,12 +215,12 @@ struct ComputeHit {
 	uint hit_kind;
 };
 
-struct B2Rays {
+struct INTERSECTORRays {
 	float4 origin_tmin[4];
 	float4 direction_tmax[4];
 };
 
-struct B2Results {
+struct INTERSECTORResults {
 	float4 material_shadow[4];
 };
 
@@ -269,10 +269,10 @@ bool trace_shadow_blocked(thread const float3& origin, thread const float3& dire
 	return query.get_committed_intersection_type() == raytracing::intersection_type::triangle;
 }
 
-kernel void b2_trace_parity(
+kernel void intersector_trace_parity(
 		const raytracing::instance_acceleration_structure tlas [[buffer(0)]],
-		const device B2Rays& rays [[buffer(1)]],
-		device B2Results& results [[buffer(2)]],
+		const device INTERSECTORRays& rays [[buffer(1)]],
+		device INTERSECTORResults& results [[buffer(2)]],
 		uint tid [[thread_position_in_grid]])
 {
 	ComputeHit hit = {};
@@ -304,7 +304,7 @@ struct SpikeResultData {
 	float hit_t_primitive_instance[2][4] = {};
 };
 
-struct B2RayData {
+struct INTERSECTORRayData {
 	float origin_tmin[4][4] = {
 		{ 0.0f, -0.25f, -2.0f, 0.001f },
 		{ 0.0f, -0.25f, -2.0f, 0.001f },
@@ -319,7 +319,7 @@ struct B2RayData {
 	};
 };
 
-struct B2ResultData {
+struct INTERSECTORResultData {
 	float material_shadow[4][4] = {};
 };
 
@@ -360,7 +360,7 @@ static bool build_bindless_material_container(const Vector<uint8_t> &p_spirv, Re
 	return true;
 }
 
-// Builds the C5/C6 single-triangle BLAS + one-instance TLAS scene and leaves
+// Builds the BLAS/TLAS single-triangle BLAS + one-instance TLAS scene and leaves
 // both structures ready for a compute dispatch.
 struct SpikeScene {
 	NS::SharedPtr<MTL::Buffer> vertex_buffer;
@@ -516,13 +516,13 @@ static void run_trace_kernel(MTL::Device *p_device, MTL::CommandQueue *p_queue, 
 	CHECK(hit[3] == 0.0f);
 	CHECK(miss[0] == 0.0f);
 	CHECK(miss[1] == -1.0f);
-	print_line(vformat("MetalRT C7 shader spike: device=\"%s\" lane=%s hit=(%f, t=%f, prim=%f, inst=%f) miss=%f",
+	print_line(vformat("MetalRT SHADER_LOWERING shader spike: device=\"%s\" lane=%s hit=(%f, t=%f, prim=%f, inst=%f) miss=%f",
 			p_device->name()->utf8String(), p_label, hit[0], hit[1], hit[2], hit[3], miss[0]));
 }
 
-static bool run_b2_patch_lane(MTL::Device *p_device, MTL::CommandQueue *p_queue, SpikeScene &p_scene,
-		MTL::Library *p_library, uint32_t p_rt_flags, B2ResultData &r_results, String &r_error) {
-	NS::SharedPtr<NS::String> entry_name = NS::TransferPtr(NS::String::alloc()->init("b2_trace_parity", NS::UTF8StringEncoding));
+static bool run_intersector_patch_lane(MTL::Device *p_device, MTL::CommandQueue *p_queue, SpikeScene &p_scene,
+		MTL::Library *p_library, uint32_t p_rt_flags, INTERSECTORResultData &r_results, String &r_error) {
+	NS::SharedPtr<NS::String> entry_name = NS::TransferPtr(NS::String::alloc()->init("intersector_trace_parity", NS::UTF8StringEncoding));
 	NS::SharedPtr<MTL::FunctionConstantValues> constants = NS::TransferPtr(MTL::FunctionConstantValues::alloc()->init());
 	constants->setConstantValue(&p_rt_flags, MTL::DataTypeUInt, NS::UInteger(0));
 	NS::Error *error = nullptr;
@@ -537,7 +537,7 @@ static bool run_b2_patch_lane(MTL::Device *p_device, MTL::CommandQueue *p_queue,
 		return false;
 	}
 
-	B2RayData rays;
+	INTERSECTORRayData rays;
 	NS::SharedPtr<MTL::Buffer> ray_buffer = NS::TransferPtr(p_device->newBuffer(&rays, sizeof(rays), MTL::ResourceStorageModeShared));
 	NS::SharedPtr<MTL::Buffer> result_buffer = NS::TransferPtr(p_device->newBuffer(&r_results, sizeof(r_results), MTL::ResourceStorageModeShared));
 	if (!ray_buffer || !result_buffer) {
@@ -568,7 +568,7 @@ static bool run_b2_patch_lane(MTL::Device *p_device, MTL::CommandQueue *p_queue,
 	return true;
 }
 
-TEST_CASE("[MetalRT] C7 SPIRV-Cross lane lowers ray query compute to MSL") {
+TEST_CASE("[MetalRT] SHADER_LOWERING SPIRV-Cross lane lowers ray query compute to MSL") {
 	String glsl_error;
 	Vector<uint8_t> spirv = compile_stage_to_spirv(RDC::SHADER_STAGE_COMPUTE, RAY_QUERY_COMPUTE_GLSL, &glsl_error);
 	REQUIRE_MESSAGE(!spirv.is_empty(), vformat("glslang failed: %s", glsl_error));
@@ -582,7 +582,7 @@ TEST_CASE("[MetalRT] C7 SPIRV-Cross lane lowers ray query compute to MSL") {
 	CHECK(classic.entry_point == "main0");
 
 	// Tier-2 argument buffers exactly as the container configures them
-	// (pad_argument_buffer_resources on). C9 teaches the small vendored padding
+	// (pad_argument_buffer_resources on). PIPELINE_MAPPING teaches the small vendored padding
 	// switch that acceleration structures occupy the buffer-index namespace.
 	MetalRTShaderLowering::Result padded = MetalRTShaderLowering::lower_spirv(RDC::SHADER_STAGE_COMPUTE, spirv, 3, 0, true, true);
 	REQUIRE_MESSAGE(padded.ok, vformat("SPIRV-Cross padded argument-buffer lowering failed: %s", padded.error));
@@ -594,7 +594,7 @@ TEST_CASE("[MetalRT] C7 SPIRV-Cross lane lowers ray query compute to MSL") {
 	CHECK(argbuf.msl_source.contains("intersection_query"));
 }
 
-TEST_CASE("[MetalRT] P3 rejects pre-v3 Metal shader containers before stage decoding") {
+TEST_CASE("[MetalRT] TRAVERSAL_METADATA rejects pre-v3 Metal shader containers before stage decoding") {
 	String glsl_error;
 	Vector<uint8_t> spirv = compile_stage_to_spirv(RDC::SHADER_STAGE_COMPUTE, RAY_QUERY_COMPUTE_GLSL, &glsl_error);
 	REQUIRE_MESSAGE(!spirv.is_empty(), vformat("glslang failed: %s", glsl_error));
@@ -609,7 +609,7 @@ TEST_CASE("[MetalRT] P3 rejects pre-v3 Metal shader containers before stage deco
 	stages.resize(1);
 	stages.write[0].shader_stage = RDC::SHADER_STAGE_COMPUTE;
 	stages.write[0].spirv = spirv;
-	REQUIRE(current->set_code_from_spirv("P3_cache_version_probe", stages));
+	REQUIRE(current->set_code_from_spirv("TRAVERSAL_METADATA_cache_version_probe", stages));
 
 	PackedByteArray bytes = current->to_bytes();
 	REQUIRE(bytes.size() >= 16);
@@ -625,7 +625,7 @@ TEST_CASE("[MetalRT] P3 rejects pre-v3 Metal shader containers before stage deco
 	CHECK_FALSE(loaded);
 }
 
-TEST_CASE("[MetalRT] B2 production MSL rewrite injects closest-hit and shadow intersectors") {
+TEST_CASE("[MetalRT] INTERSECTOR production MSL rewrite injects closest-hit and shadow intersectors") {
 	std::string source = load_msl_rewrite_fixture("intersector_scene_fixture.metal");
 	REQUIRE_FALSE(source.empty());
 
@@ -666,7 +666,7 @@ TEST_CASE("[MetalRT] B2 production MSL rewrite injects closest-hit and shadow in
 	CHECK(material_attribute < material_definition);
 }
 
-TEST_CASE("[MetalRT] B2 production MSL rewrite reports transactional fallbacks") {
+TEST_CASE("[MetalRT] INTERSECTOR production MSL rewrite reports transactional fallbacks") {
 	SUBCASE("SPIRV-Cross brace drift") {
 		std::string source = load_msl_rewrite_fixture("intersector_anchor_drift_fixture.metal");
 		REQUIRE_FALSE(source.empty());
@@ -866,7 +866,7 @@ TEST_CASE_PENDING("[MetalRT][GPU] Metal container executes bindless GPU-addresse
 			device->name()->utf8String(), bindless_argument_data.size(), result_data[0], result_data[1], result_data[2], result_data[3]));
 }
 
-TEST_CASE("[MetalRT] C7 SPIRV-Cross lane cannot lower RT pipeline stages") {
+TEST_CASE("[MetalRT] SHADER_LOWERING SPIRV-Cross lane cannot lower RT pipeline stages") {
 	struct StageExperiment {
 		RDC::ShaderStage stage;
 		const char *name;
@@ -890,11 +890,11 @@ TEST_CASE("[MetalRT] C7 SPIRV-Cross lane cannot lower RT pipeline stages") {
 		// docs/rt_metal_port/shader_strategy.md must be revisited.
 		bool produced_valid_msl = lowered.ok && !lowered.msl_source.contains("unknown ");
 		CHECK_MESSAGE(!produced_valid_msl, vformat("SPIRV-Cross unexpectedly lowered %s stage; revisit shader strategy", experiment.name));
-		MESSAGE(vformat("C7 %s lowering outcome: ok=%s error=\"%s\"", experiment.name, lowered.ok ? "true" : "false", lowered.error));
+		MESSAGE(vformat("SHADER_LOWERING %s lowering outcome: ok=%s error=\"%s\"", experiment.name, lowered.ok ? "true" : "false", lowered.error));
 	}
 }
 
-TEST_CASE_PENDING("[MetalRT][GPU] C7 SPIRV-Cross ray query kernel traces hit and miss") {
+TEST_CASE_PENDING("[MetalRT][GPU] SHADER_LOWERING SPIRV-Cross ray query kernel traces hit and miss") {
 	NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
 	NS::SharedPtr<MTL::Device> device = NS::TransferPtr(MTL::CreateSystemDefaultDevice());
 	if (!device || !device->supportsRaytracing()) {
@@ -917,7 +917,7 @@ TEST_CASE_PENDING("[MetalRT][GPU] C7 SPIRV-Cross ray query kernel traces hit and
 	run_trace_kernel(device.get(), queue.get(), scene, lowered.msl_source, entry_utf8.get_data(), MTL::LanguageVersion2_4, "spirv_cross_ray_query");
 }
 
-TEST_CASE_PENDING("[MetalRT][GPU] C7 native intersector kernel traces hit and miss") {
+TEST_CASE_PENDING("[MetalRT][GPU] SHADER_LOWERING native intersector kernel traces hit and miss") {
 	NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
 	NS::SharedPtr<MTL::Device> device = NS::TransferPtr(MTL::CreateSystemDefaultDevice());
 	if (!device || !device->supportsRaytracing()) {
@@ -933,7 +933,7 @@ TEST_CASE_PENDING("[MetalRT][GPU] C7 native intersector kernel traces hit and mi
 	run_trace_kernel(device.get(), queue.get(), scene, String::utf8(NATIVE_INTERSECTOR_MSL), "trace_spike", MTL::LanguageVersion2_3, "native_intersector");
 }
 
-TEST_CASE_PENDING("[MetalRT][GPU] B2 production rewrite matches query traversal") {
+TEST_CASE_PENDING("[MetalRT][GPU] INTERSECTOR production rewrite matches query traversal") {
 	NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
 	NS::SharedPtr<MTL::Device> device = NS::TransferPtr(MTL::CreateSystemDefaultDevice());
 	if (!device || !device->supportsRaytracing()) {
@@ -941,7 +941,7 @@ TEST_CASE_PENDING("[MetalRT][GPU] B2 production rewrite matches query traversal"
 		return;
 	}
 
-	std::string patched_source(B2_PATCH_PARITY_MSL);
+	std::string patched_source(INTERSECTOR_PATCH_PARITY_MSL);
 	MetalRTShaderLowering::IntersectorPatchResult patch = MetalRTShaderLowering::patch_scene_ray_query_to_intersector(patched_source);
 	REQUIRE_MESSAGE(patch.applied(), patch.detail);
 	CHECK(patched_source.find("intersection_query") != std::string::npos);
@@ -952,18 +952,18 @@ TEST_CASE_PENDING("[MetalRT][GPU] B2 production rewrite matches query traversal"
 	compile_options->setLanguageVersion(MTL::LanguageVersion2_4);
 	NS::SharedPtr<NS::String> source_string = NS::TransferPtr(NS::String::alloc()->init(patched_source.c_str(), NS::UTF8StringEncoding));
 	NS::SharedPtr<MTL::Library> library = NS::TransferPtr(device->newLibrary(source_string.get(), compile_options.get(), &error));
-	REQUIRE_MESSAGE(library, vformat("B2 patched MSL compile failed: %s", error ? error->localizedDescription()->utf8String() : "unknown error"));
+	REQUIRE_MESSAGE(library, vformat("INTERSECTOR patched MSL compile failed: %s", error ? error->localizedDescription()->utf8String() : "unknown error"));
 
 	NS::SharedPtr<MTL::CommandQueue> queue = NS::TransferPtr(device->newCommandQueue());
 	REQUIRE(queue);
 	SpikeScene scene;
 	REQUIRE(scene.build(device.get(), queue.get()));
 
-	B2ResultData query_results;
-	B2ResultData intersector_results;
+	INTERSECTORResultData query_results;
+	INTERSECTORResultData intersector_results;
 	String lane_error;
-	REQUIRE_MESSAGE(run_b2_patch_lane(device.get(), queue.get(), scene, library.get(), 0u, query_results, lane_error), lane_error);
-	REQUIRE_MESSAGE(run_b2_patch_lane(device.get(), queue.get(), scene, library.get(), 16u, intersector_results, lane_error), lane_error);
+	REQUIRE_MESSAGE(run_intersector_patch_lane(device.get(), queue.get(), scene, library.get(), 0u, query_results, lane_error), lane_error);
+	REQUIRE_MESSAGE(run_intersector_patch_lane(device.get(), queue.get(), scene, library.get(), 16u, intersector_results, lane_error), lane_error);
 
 	for (uint32_t ray_index = 0; ray_index < 4; ray_index++) {
 		for (uint32_t component = 0; component < 4; component++) {
@@ -980,7 +980,7 @@ TEST_CASE_PENDING("[MetalRT][GPU] B2 production rewrite matches query traversal"
 		CHECK(query_results.material_shadow[ray_index][2] == 0.0f);
 		CHECK(query_results.material_shadow[ray_index][3] == -1.0f);
 	}
-	print_line(vformat("MetalRT B2 traversal parity: device=\"%s\" rays=4 closest=passed shadow=passed t_min=passed t_max=passed",
+	print_line(vformat("MetalRT INTERSECTOR traversal parity: device=\"%s\" rays=4 closest=passed shadow=passed t_min=passed t_max=passed",
 			device->name()->utf8String()));
 }
 
