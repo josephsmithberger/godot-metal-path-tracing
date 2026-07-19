@@ -128,10 +128,14 @@ struct API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0)) MetalFeatures {
 	bool supports_timestamp_sampling = false; /**< If true, GPU timestamps can be sampled at encoder stage boundaries. */
 
 	/*!
-	 * Check if argument buffers are fully supported, which requires tier 2 support and no need for argument encoders.
+	 * Check if encoder-free argument buffers are supported. This holds whenever
+	 * argument encoders are not required, i.e. on any Metal 3 device: resource
+	 * handles (MTLResourceID) can be written straight into a buffer and indexed in
+	 * the shader. This includes tier-1 Metal 3 hardware such as Intel Macs (see
+	 * needs_arg_encoders in metal_device_properties.cpp).
 	 */
 	_FORCE_INLINE_ bool argument_buffers_supported() const {
-		return argument_buffers_tier == MTL::ArgumentBuffersTier2 && needs_arg_encoders == false;
+		return needs_arg_encoders == false;
 	}
 
 	/*!

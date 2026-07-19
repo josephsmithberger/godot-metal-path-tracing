@@ -198,6 +198,18 @@ TEST_CASE("[MetalRT] C8 trace image golden is stable") {
 TEST_CASE_PENDING("[MetalRT][GPU] C8 traces a deterministic RGBA8 hit/miss image") {
 	NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
 	NS::SharedPtr<MTL::Device> device = NS::TransferPtr(MTL::CreateSystemDefaultDevice());
+	// Headless/SSH sessions (and some Intel Macs) return no system-default device;
+	// fall back to the first enumerated device so GPU tests can run without a
+	// window-server connection.
+	if (!device) {
+		NS::Array *all_devices = MTL::CopyAllDevices();
+		if (all_devices != nullptr && all_devices->count() > 0) {
+			device = NS::RetainPtr(all_devices->object<MTL::Device>(0));
+		}
+		if (all_devices != nullptr) {
+			all_devices->release();
+		}
+	}
 	if (!device || !device->supportsRaytracing()) {
 		MESSAGE("SKIP_REASON=missing_metal_rt_feature");
 		return;

@@ -3348,7 +3348,7 @@ bool RenderingDeviceDriverMetal::_is_metal_rt_enabled() {
 
 	const MetalFeatures &features = device_properties->features;
 	MetalRTGateInputs inputs;
-#if TARGET_OS_OSX && defined(__aarch64__)
+#if TARGET_OS_OSX && (defined(__aarch64__) || defined(__x86_64__))
 	inputs.supported_platform = true;
 #else
 	inputs.supported_platform = false;
@@ -3568,8 +3568,13 @@ Error RenderingDeviceDriverMetal::_initialize(uint32_t p_device_index, uint32_t 
 		print_verbose("- Metal multiview not supported");
 	}
 
-	// The Metal renderer requires Apple4 family. This is 2017 era A11 chips and newer.
-	if (device_properties->features.highestFamily < MTL::GPUFamilyApple4) {
+	// The Metal renderer requires Apple4 family (2017-era A11 and newer) or, on
+	// Intel/AMD Macs, the mac2 feature set — both provide the required baseline
+	// (image cube arrays, etc.). mac2 devices report no Apple family, so gate on
+	// the actual required feature rather than the Apple-family proxy alone.
+	const bool meets_feature_floor = device_properties->features.highestFamily >= MTL::GPUFamilyApple4 ||
+			device->supportsFamily(MTL::GPUFamilyMac2);
+	if (!meets_feature_floor || !device_properties->features.imageCubeArray) {
 		String error_string = vformat("Your Apple GPU does not support the following features, which are required to use Metal-based renderers in Godot:\n\n");
 		if (!device_properties->features.imageCubeArray) {
 			error_string += "- No support for image cube arrays.\n";
