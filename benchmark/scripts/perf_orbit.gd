@@ -142,6 +142,14 @@ func _process(delta: float) -> void:
 		measure_frames = int(measure_env)
 	if _frame >= WARMUP_FRAMES + measure_frames:
 		_report()
+		# Optional: set GODOT_PERF_SCREENSHOT to a file path to capture the final
+		# measured frame (useful for verifying the render on headless/remote runs).
+		var _shot_path := OS.get_environment("GODOT_PERF_SCREENSHOT")
+		if _shot_path != "":
+			var _img := get_viewport().get_texture().get_image()
+			if _img != null:
+				_img.save_png(_shot_path)
+				print("PERF_ORBIT_SCREENSHOT=%s" % _shot_path)
 		get_tree().quit()
 
 
