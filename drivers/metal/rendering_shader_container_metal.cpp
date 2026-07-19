@@ -226,7 +226,22 @@ Error RenderingShaderContainerMetal::compile_metal_source(const char *p_source, 
 
 bool RenderingShaderContainerMetal::_use_rt_intersector() const {
 	const String intersector_env = OS::get_singleton()->get_environment("GODOT_MTL_RT_INTERSECTOR");
-	return intersector_env == "1" || (intersector_env != "0" && device_profile->gpu >= MetalDeviceProfile::GPU::Apple9);
+	if (intersector_env == "1") {
+		return true;
+	}
+	if (intersector_env == "0") {
+		return false;
+	}
+	// Apple9+ (M3 and newer) have hardware ray tracing, where the intersector lane
+	// is the win. On macOS a profile below Apple7 means an Intel/AMD (mac2) GPU
+	// with no Apple family; the intersector lane measured ~18% faster there too
+	// (Intel Iris Plus 640), so use it for those as well. Apple7/Apple8 (M1/M2)
+	// keep the query lane.
+	if (device_profile->gpu >= MetalDeviceProfile::GPU::Apple9) {
+		return true;
+	}
+	return device_profile->platform == MetalDeviceProfile::Platform::macOS &&
+			device_profile->gpu < MetalDeviceProfile::GPU::Apple7;
 }
 
 #pragma clang diagnostic push
