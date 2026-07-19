@@ -1,0 +1,39 @@
+[gd_scene load_steps=5 format=3]
+
+[ext_resource type="Script" path="res://scripts/perf_orbit.gd" id="1_perf"]
+
+[sub_resource type="ProceduralSkyMaterial" id="ProceduralSkyMaterial_perf"]
+sky_top_color = Color(0.045, 0.09, 0.17, 1)
+sky_horizon_color = Color(0.5, 0.65, 0.8, 1)
+ground_bottom_color = Color(0.025, 0.022, 0.018, 1)
+ground_horizon_color = Color(0.3, 0.28, 0.25, 1)
+
+[sub_resource type="Sky" id="Sky_perf"]
+sky_material = SubResource("ProceduralSkyMaterial_perf")
+
+[sub_resource type="Environment" id="Environment_perf"]
+background_mode = 2
+sky = SubResource("Sky_perf")
+ambient_light_source = 3
+reflected_light_source = 2
+pathtracing_enabled = true
+pathtracing_samples_per_pixel = 4
+pathtracing_max_bounces = 2
+pathtracing_denoiser = 0
+
+[node name="PerfOrbit" type="Node3D"]
+script = ExtResource("1_perf")
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("Environment_perf")
+
+[node name="KeyLight" type="DirectionalLight3D" parent="."]
+rotation_degrees = Vector3(-52, -30, 0)
+light_color = Color(1, 0.9, 0.76, 1)
+light_energy = 2.3
+shadow_enabled = true
+
+[node name="Camera" type="Camera3D" parent="."]
+position = Vector3(0, 4.2, 9)
+current = true
+fov = 48.0
