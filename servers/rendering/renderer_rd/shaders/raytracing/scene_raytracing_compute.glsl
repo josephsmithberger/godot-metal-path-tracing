@@ -365,8 +365,17 @@ bool trace_shadow_blocked_query(vec3 origin, vec3 direction, float max_distance,
 	ComputeProceduralHit procedural_hit;
 	procedural_hit.t = max_distance;
 	procedural_hit.valid = false;
+	// Opaque-shadow scalability path: force the opaque ray flag so no triangle
+	// candidate ever surfaces to the proceed loop, and confirm the first hit
+	// regardless of alpha. Spec-constant fold -- the whole proceed loop below
+	// compiles out. Alpha foliage casts solid shadows; the per-candidate alpha
+	// texture fetches on the divergent shadow lane disappear.
+	uint traversal_flags = RT_TRAVERSAL_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT;
+	if ((RT_FLAGS & RT_FLAG_OPAQUE_SHADOWS) != 0u) {
+		traversal_flags |= gl_RayFlagsOpaqueEXT;
+	}
 	rayQueryEXT shadow_query;
-	rayQueryInitializeEXT(shadow_query, tlas, RT_TRAVERSAL_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT,
+	rayQueryInitializeEXT(shadow_query, tlas, traversal_flags,
 			instance_mask, origin, 0.001, direction, max_distance);
 	while (rayQueryProceedEXT(shadow_query)) {
 		uint candidate_type = rayQueryGetIntersectionTypeEXT(shadow_query, false);
@@ -478,13 +487,10 @@ bool scatter_from_hit(vec3 hit_pos, vec3 geometry_normal, vec3 shading_normal, v
 	return true;
 }
 
-void main() {
-	uvec2 pixel = gl_GlobalInvocationID.xy;
-	uvec2 image_size = uvec2(imageSize(image));
-	if (any(greaterThanEqual(pixel, image_size))) {
-		return;
-	}
-
+// Camera-space primary ray shared by the path-trace and guide-pass entry
+// points; both must derive identical rays so guides line up with the traced
+// image.
+void compute_primary_ray(uvec2 pixel, uvec2 image_size, out vec3 r_origin, out vec3 r_direction) {
 	vec2 pixel_center = vec2(pixel) + vec2(0.5);
 	vec2 in_uv = pixel_center / vec2(image_size);
 	vec2 device_position = in_uv * 2.0 - 1.0;
@@ -493,8 +499,88 @@ void main() {
 			scene_data_block.data.inv_view_matrix[1], scene_data_block.data.inv_view_matrix[2],
 			vec4(0.0, 0.0, 0.0, 1.0)));
 	vec4 target = scene_data_block.data.inv_projection_matrix * vec4(device_position, 1.0, 1.0);
-	vec3 primary_origin = (inv_view * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
-	vec3 primary_direction = (inv_view * vec4(normalize(target.xyz), 0.0)).xyz;
+	r_origin = (inv_view * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+	r_direction = (inv_view * vec4(normalize(target.xyz), 0.0)).xyz;
+}
+
+#ifdef GUIDE_PASS_MODE
+
+// Denoiser guide pass: a standalone kernel that re-traces only the coherent
+// primary ray and emits the DLSS-RR/MetalFX guide surfaces. Keeping this out
+// of the path-trace kernel matters more than the redundant primary trace: the
+// guide code (extra image bindings, albedo math, a conditional trace site)
+// measurably drops the mega-kernel's occupancy for every bounce when compiled
+// into it (~13ms/frame in Bistro at 1080p), while a dedicated pass pays only
+// a few ms of coherent primary-ray work.
+void main() {
+	uvec2 pixel = gl_GlobalInvocationID.xy;
+	uvec2 image_size = uvec2(imageSize(image));
+	if (any(greaterThanEqual(pixel, image_size))) {
+		return;
+	}
+
+	vec3 primary_origin;
+	vec3 primary_direction;
+	compute_primary_ray(pixel, image_size, primary_origin, primary_direction);
+
+	ComputeHit hit;
+	if (!trace_material(primary_origin, primary_direction, 10000.0, hit)) {
+		vec3 sky_color = sample_environment(primary_direction);
+		imageStore(denoiser_diffuse_albedo, ivec2(pixel), vec4(sky_color, 1.0));
+		imageStore(denoiser_specular_albedo, ivec2(pixel), vec4(0.0));
+		imageStore(denoiser_normal_roughness, ivec2(pixel), vec4(-primary_direction, 0.0));
+		imageStore(denoiser_roughness, ivec2(pixel), vec4(0.0));
+		imageStore(denoiser_specular_hit_dist, ivec2(pixel), vec4(-1.0));
+		imageStore(denoiser_strength, ivec2(pixel), vec4(1.0));
+		return;
+	}
+
+	ComputeHitData hit_data = compute_hit_data(hit,
+			current_object_to_world(hit.geometry_idx),
+			current_world_to_object(hit.geometry_idx),
+			primary_origin, primary_direction);
+	MaterialResult material = evaluate_material(hit, hit_data,
+			current_object_to_world(hit.geometry_idx),
+			current_world_to_object(hit.geometry_idx),
+			primary_direction);
+	vec3 view_direction = -primary_direction;
+	vec3 shading_normal = clampShadingNormal(material.normal, hit_data.geometry_normal,
+			view_direction, RT_SHADING_NORMAL_CLAMP_THRESHOLD);
+
+	float NdotV = max(dot(shading_normal, view_direction), 0.0001);
+	float dielectric_f0 = 0.16 * material.specular * material.specular;
+	vec3 diffuse_albedo = DLSSRR_computeDiffuseAlbedo(material.albedo, material.metalness);
+	vec3 specular_albedo = DLSSRR_computeSpecularAlbedo(material.albedo, material.metalness,
+			dielectric_f0, material.roughness, NdotV);
+	imageStore(denoiser_diffuse_albedo, ivec2(pixel), vec4(diffuse_albedo, 1.0));
+	imageStore(denoiser_specular_albedo, ivec2(pixel), vec4(clamp(specular_albedo, vec3(0.0), vec3(1.0)), 1.0));
+	imageStore(denoiser_normal_roughness, ivec2(pixel), vec4(shading_normal, material.roughness));
+	imageStore(denoiser_roughness, ivec2(pixel), vec4(material.roughness));
+	imageStore(denoiser_strength, ivec2(pixel), vec4(0.0));
+
+	float specular_hit_distance = -1.0;
+	if (material.roughness < MAX_DENOISER_SPECULAR_HIT_THRESHOLD) {
+		ComputeHit specular_hit;
+		vec3 specular_direction = reflect(-view_direction, shading_normal);
+		if (trace_material(offset_ray_origin(hit_data.hit_pos, shading_normal), specular_direction, 10000.0, specular_hit)) {
+			specular_hit_distance = specular_hit.t;
+		}
+	}
+	imageStore(denoiser_specular_hit_dist, ivec2(pixel), vec4(specular_hit_distance));
+}
+
+#else // !GUIDE_PASS_MODE
+
+void main() {
+	uvec2 pixel = gl_GlobalInvocationID.xy;
+	uvec2 image_size = uvec2(imageSize(image));
+	if (any(greaterThanEqual(pixel, image_size))) {
+		return;
+	}
+
+	vec3 primary_origin;
+	vec3 primary_direction;
+	compute_primary_ray(pixel, image_size, primary_origin, primary_direction);
 
 	uint samples_per_pixel = RT_GET_SAMPLE_COUNT();
 	uint max_bounces = RT_GET_MAX_BOUNCES();
@@ -533,15 +619,6 @@ void main() {
 					imageStore(rt_velocity_image, ivec2(pixel), vec4(previous_uv - current_uv, 0.0, 0.0));
 				}
 				vec3 sky_color = sample_environment(ray_direction);
-#ifdef DENOISER_GUIDES_ENABLED
-				if (sample_index == 0u && bounce == 0u) {
-					imageStore(denoiser_diffuse_albedo, ivec2(pixel), vec4(sky_color, 1.0));
-					imageStore(denoiser_specular_albedo, ivec2(pixel), vec4(0.0));
-					imageStore(denoiser_normal_roughness, ivec2(pixel), vec4(-ray_direction, 0.0));
-					imageStore(denoiser_roughness, ivec2(pixel), vec4(0.0));
-					imageStore(denoiser_specular_hit_dist, ivec2(pixel), vec4(-1.0));
-				}
-#endif
 				radiance += throughput * sky_color;
 				break;
 			}
@@ -594,29 +671,6 @@ void main() {
 			brdf_material.transmissivness = 0.0;
 			brdf_material.opacity = 1.0;
 
-#ifdef DENOISER_GUIDES_ENABLED
-			if (sample_index == 0u && bounce == 0u) {
-				float NdotV = max(dot(shading_normal, view_direction), 0.0001);
-				vec3 diffuse_albedo = DLSSRR_computeDiffuseAlbedo(material.albedo, material.metalness);
-				vec3 specular_albedo = DLSSRR_computeSpecularAlbedo(material.albedo, material.metalness,
-						brdf_material.dielectricF0, material.roughness, NdotV);
-				imageStore(denoiser_diffuse_albedo, ivec2(pixel), vec4(diffuse_albedo, 1.0));
-				imageStore(denoiser_specular_albedo, ivec2(pixel), vec4(clamp(specular_albedo, vec3(0.0), vec3(1.0)), 1.0));
-				imageStore(denoiser_normal_roughness, ivec2(pixel), vec4(shading_normal, material.roughness));
-				imageStore(denoiser_roughness, ivec2(pixel), vec4(material.roughness));
-
-				float specular_hit_distance = -1.0;
-				if (material.roughness < MAX_DENOISER_SPECULAR_HIT_THRESHOLD) {
-					ComputeHit specular_hit;
-					vec3 specular_direction = reflect(-view_direction, shading_normal);
-					if (trace_material(offset_ray_origin(hit_data.hit_pos, shading_normal), specular_direction, 10000.0, specular_hit)) {
-						specular_hit_distance = specular_hit.t;
-					}
-				}
-				imageStore(denoiser_specular_hit_dist, ivec2(pixel), vec4(specular_hit_distance));
-			}
-#endif
-
 			if (light_count > 0u) {
 				vec3 light_origin = offset_ray_origin(hit_data.hit_pos, hit_data.geometry_normal);
 				vec3 direct = lights_evaluate_direct_lighting(light_origin, shading_normal, view_direction,
@@ -639,3 +693,5 @@ void main() {
 
 	imageStore(image, ivec2(pixel), vec4(total_radiance / float(samples_per_pixel), 1.0));
 }
+
+#endif // !GUIDE_PASS_MODE

@@ -3478,7 +3478,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		uniforms.push_back(u);
 	}
 
-	// Bindings 9-12 and 29: path-tracing denoiser guide buffers.
+	// Bindings 9-12, 29, and 30: path-tracing denoiser guide buffers.
 	bool dlss_rr_enabled = rb_data->dlss_rr_has_buffers();
 	if (dlss_rr_enabled) {
 		// Binding 9: DLSS RR Diffuse Albedo
@@ -3523,6 +3523,15 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			u.binding = 29;
 			u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
 			u.append_id(rb_data->dlss_rr_get_roughness());
+			uniforms.push_back(u);
+		}
+
+		// Binding 30: MetalFX denoise strength mask (1 excludes a pixel).
+		{
+			RD::Uniform u;
+			u.binding = 30;
+			u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
+			u.append_id(rb_data->dlss_rr_get_denoise_strength());
 			uniforms.push_back(u);
 		}
 	}
@@ -3592,6 +3601,23 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		if (bindless_block && bindless_block->is_initialized()) {
 			bindless_block->finalize(shader_rd, 1);
 			bindless_uniform_set = bindless_block->get_uniform_set();
+		}
+	}
+
+	// The compute-lane guide pass runs as its own kernel with the guide image
+	// bindings the path-trace variant no longer declares, so it needs a set
+	// created against its own shader layout. The uniforms list is a superset of
+	// both layouts; uniform_set_create drops entries a shader does not declare.
+	p_state->guide_uniform_set = RID();
+	if (shader && shader->uses_compute_scene_lane() && dlss_rr_enabled &&
+			(p_rt_flags & SceneShaderRaytracing::RT_FLAG_DENOISER_GUIDES_ENABLED) != 0) {
+		RID guide_shader_rd = shader->get_pipeline_shader_rd(p_rt_flags | SceneShaderRaytracing::RT_FLAG_GUIDE_PASS);
+		if (guide_shader_rd.is_valid()) {
+			p_state->guide_uniform_set = RD::get_singleton()->uniform_set_create(
+					uniforms,
+					guide_shader_rd,
+					RenderForwardClustered::SCENE_UNIFORM_SET,
+					/*p_linear_pool=*/true);
 		}
 	}
 

@@ -3839,6 +3839,14 @@ void RenderingServer::init() {
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/limits/cluster_builder/max_clustered_elements", PROPERTY_HINT_RANGE, "32,8192,1"), 512);
 	GLOBAL_DEF("rendering/pathtracer/use_shader_execution_reordering", true);
 	GLOBAL_DEF("rendering/pathtracer/async_shader_compilation", true);
+	// When true, alpha-scissored geometry (e.g. foliage) casts perforated
+	// shadows by running its alpha test on every NEE shadow ray. That per-
+	// candidate test executes on the divergent ray-query lane with the hardware
+	// reorder stage disabled, so in foliage-heavy scenes under many lights it is
+	// the single largest path-tracing cost. Set false to trace shadow rays with
+	// the opaque hardware intersector instead: alpha geometry then casts solid
+	// silhouette shadows, trading shadow fidelity for a large speedup.
+	GLOBAL_DEF("rendering/pathtracer/alpha_tested_shadows", true);
 	// The Metal driver applies the CAPABILITY_GATE capability gate before exposing its
 	// compute ray-query lane. Disabling this setting forces the regular non-RT
 	// renderer without attempting to create acceleration structures.

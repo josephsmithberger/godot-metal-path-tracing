@@ -12,6 +12,11 @@ layout(constant_id = 0) const uint RT_FLAGS = 0u;
 // compile time.
 #define RT_FLAG_ALL_OPAQUE (1u << 4)
 #define RT_FLAG_MIXED_ALPHA (1u << 5)
+// Compute-lane pipeline selector: this rt_flags value belongs to the denoiser
+// guide pass, not the path-trace kernel (see GUIDE_PASS_MODE).
+#define RT_FLAG_GUIDE_PASS (1u << 6)
+// Shadow rays treat alpha-tested geometry as opaque (skip the query partition).
+#define RT_FLAG_OPAQUE_SHADOWS (1u << 7)
 
 // Matches RT_INSTANCE_MASK_* in render_raytracing.h. Opaque triangles can be
 // traversed by Metal's native intersector; alpha and procedural geometry stay
@@ -66,6 +71,7 @@ layout(set = 0, binding = 10, rgba16f) uniform image2D denoiser_specular_albedo;
 layout(set = 0, binding = 11, rgba8_snorm) uniform image2D denoiser_normal_roughness;
 layout(set = 0, binding = 12, r16f) uniform image2D denoiser_specular_hit_dist;
 layout(set = 0, binding = 29, r16f) uniform image2D denoiser_roughness;
+layout(set = 0, binding = 30, r8) uniform image2D denoiser_strength;
 #endif
 
 // Binding 14 is reserved for GlobalShaderUniformData (declared above).

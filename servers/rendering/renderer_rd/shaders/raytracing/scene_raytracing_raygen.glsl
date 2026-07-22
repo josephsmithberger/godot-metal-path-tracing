@@ -208,6 +208,7 @@ void main() {
 			imageStore(denoiser_normal_roughness, pixel, vec4(-gl_WorldRayDirectionEXT, 0.0));
 			imageStore(denoiser_roughness, pixel, vec4(0.0));
 			imageStore(denoiser_specular_hit_dist, pixel, vec4(-1.0));
+			imageStore(denoiser_strength, pixel, vec4(1.0));
 		}
 	}
 #endif

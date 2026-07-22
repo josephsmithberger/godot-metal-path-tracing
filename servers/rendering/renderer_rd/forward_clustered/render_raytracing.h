@@ -50,6 +50,8 @@
 #define RB_TEX_DLSS_RR_NORMAL_ROUGHNESS SNAME("normal_roughness")
 #define RB_TEX_DLSS_RR_ROUGHNESS SNAME("roughness")
 #define RB_TEX_DLSS_RR_SPECULAR_HIT_DIST SNAME("specular_hit_dist")
+#define RB_TEX_DLSS_RR_DENOISE_STRENGTH SNAME("denoise_strength")
+#define RB_TEX_DLSS_RR_TRANSPARENCY_OVERLAY SNAME("transparency_overlay")
 
 class RenderDataRD;
 class RenderSceneBuffersRD;
@@ -466,6 +468,10 @@ struct RTViewportState {
 	bool traversal_has_opaque_triangles = false;
 	bool traversal_has_query_instances = false;
 	bool traversal_has_procedural_instances = false;
+
+	// Transient (linear-pool) uniform set for the compute-lane denoiser guide
+	// pass; rebuilt by update_uniform_set whenever guides are enabled.
+	RID guide_uniform_set;
 
 	uint32_t frame_counter = 0;
 };
