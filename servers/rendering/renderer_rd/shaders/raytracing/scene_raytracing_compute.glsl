@@ -672,7 +672,18 @@ void main() {
 			brdf_material.opacity = 1.0;
 
 			if (light_count > 0u) {
-				vec3 light_origin = offset_ray_origin(hit_data.hit_pos, hit_data.geometry_normal);
+				vec3 shadow_pos = hit_data.hit_pos;
+				if (!hit.procedural) {
+					GeometryData shadow_geom = geometries[hit.geometry_idx];
+					uint s0, s1, s2;
+					get_triangle_indices_ex(shadow_geom, hit.primitive_idx, s0, s1, s2);
+					vec3 shadow_bary = vec3(1.0 - hit.barycentrics.x - hit.barycentrics.y,
+							hit.barycentrics.x, hit.barycentrics.y);
+					shadow_pos = shadow_terminator_hit_pos(shadow_geom, s0, s1, s2, shadow_bary,
+							hit_data.hit_pos, hit_data.geometry_normal,
+							current_object_to_world(hit.geometry_idx));
+				}
+				vec3 light_origin = offset_ray_origin(shadow_pos, hit_data.geometry_normal);
 				vec3 direct = lights_evaluate_direct_lighting(light_origin, shading_normal, view_direction,
 						brdf_material, rng_state, diffuse_bounces > 0u, light_count);
 				radiance += throughput * direct;
