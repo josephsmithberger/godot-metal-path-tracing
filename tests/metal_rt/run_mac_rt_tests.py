@@ -410,7 +410,7 @@ def make_commands(
                 environment={
                     **editor_environment,
                     "GODOT_MRT_CAPTURE_LABEL": "presentation",
-                    "GODOT_MRT_PRESENTATION": "1",
+                    "GODOT_MRT_PRESENTATION_CAPTURE": "1",
                 },
                 required_log_patterns=(
                     "METAL_RT_EDITOR_ROUTE=compute_ray_query",
