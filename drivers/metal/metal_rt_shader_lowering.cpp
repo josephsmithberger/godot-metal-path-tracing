@@ -206,6 +206,7 @@ constexpr char OPAQUE_TRIANGLES_HELPERS[] = R"(
 // --- Godot: native-intersector fast paths for opaque TLAS partitions -------
 constant bool godot_use_intersector = ((RT_FLAGS & 16u) != 0u); // RT_FLAG_ALL_OPAQUE
 constant bool godot_use_mixed_intersector = ((RT_FLAGS & 32u) != 0u); // RT_FLAG_MIXED_ALPHA
+constant bool godot_opaque_shadows = ((RT_FLAGS & 128u) != 0u); // RT_FLAG_OPAQUE_SHADOWS
 
 static bool godot_trace_material_intersector(const thread float3 &origin, const thread float3 &direction, float max_distance, uint instance_mask, thread ComputeHit &hit, raytracing::acceleration_structure<raytracing::instancing> tlas)
 {
@@ -273,6 +274,10 @@ constexpr TraversalInjection OPAQUE_TRIANGLES_INJECTIONS[] = {
 			"    }\n"
 			"    if (godot_use_mixed_intersector)\n"
 			"    {\n"
+			"        if (godot_opaque_shadows)\n"
+			"        {\n"
+			"            return godot_trace_shadow_blocked_intersector(origin, direction, max_distance, 0x03u, tlas);\n"
+			"        }\n"
 			"        if (godot_trace_shadow_blocked_intersector(origin, direction, max_distance, 0x01u, tlas))\n"
 			"        {\n"
 			"            return true;\n"

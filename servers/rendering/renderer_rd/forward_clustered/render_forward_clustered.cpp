@@ -183,6 +183,23 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::dlss_rr_ensure_bu
 			RD::DATA_FORMAT_R16_SFLOAT,
 			usage_bits,
 			RD::TEXTURE_SAMPLES_1);
+
+	// A value of 1 tells MetalFX to leave that pixel out of denoising.
+	render_buffers->create_texture(
+			RB_SCOPE_DLSS_RR,
+			RB_TEX_DLSS_RR_DENOISE_STRENGTH,
+			RD::DATA_FORMAT_R8_UNORM,
+			usage_bits,
+			RD::TEXTURE_SAMPLES_1);
+
+	// Blended raster materials are kept separate from the noisy path-traced
+	// color and supplied through MetalFX's dedicated transparency input.
+	render_buffers->create_texture(
+			RB_SCOPE_DLSS_RR,
+			RB_TEX_DLSS_RR_TRANSPARENCY_OVERLAY,
+			render_buffers->get_base_data_format(),
+			RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT,
+			RD::TEXTURE_SAMPLES_1);
 }
 
 void RenderForwardClustered::RenderBufferDataForwardClustered::dlss_rr_free_buffers() {
@@ -241,6 +258,8 @@ bool RenderForwardClustered::RenderBufferDataForwardClustered::ensure_mfx_denois
 	params.normal_format = RD::DATA_FORMAT_R8G8B8A8_SNORM;
 	params.roughness_format = RD::DATA_FORMAT_R16_SFLOAT;
 	params.specular_hit_distance_format = RD::DATA_FORMAT_R16_SFLOAT;
+	params.denoise_strength_format = RD::DATA_FORMAT_R8_UNORM;
+	params.transparency_overlay_format = render_buffers->get_base_data_format();
 	params.output_format = render_buffers->get_base_data_format();
 	params.motion_vector_scale = render_buffers->get_internal_size();
 	mfx_denoised_context = p_effect->create_context(params);
@@ -2245,6 +2264,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	// Captured from build_tlas/update_uniform_set so the trace-dispatch block
 	// below can bind without RenderRaytracing keeping hidden "current" state.
 	RID rt_uniform_set;
+	RID rt_guide_uniform_set;
 
 	// Create TLAS for raytracing if enabled
 	if (scene_features.rt && rb_data.is_valid() && raytracing && raytracing->get_shader()) {
@@ -2297,6 +2317,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				}
 			}
 			rt_uniform_set = raytracing->update_uniform_set(rt_state, p_render_data, rt_flags);
+			rt_guide_uniform_set = rt_state->guide_uniform_set;
 		}
 	} else if (rb_data.is_valid() && rb_data->dlss_rr_has_buffers()) {
 		// RT disabled: free DLSS RR buffers so DLSS falls back to SR.
@@ -2693,6 +2714,27 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		Size2i rt_size = rb->get_internal_size();
 		RD::get_singleton()->raytracing_list_trace_rays(raytracing_list, 0, raytracing->get_shader()->get_hit_sbt(rt_flags), rt_size.width, rt_size.height, 1);
 		RD::get_singleton()->raytracing_list_end();
+
+		// Compute-lane denoiser guide pass: a standalone kernel re-traces the
+		// coherent primary ray and writes the guide surfaces. Keeping this out
+		// of the path-trace kernel avoids the guide code's occupancy tax on
+		// every bounce (see GUIDE_PASS_MODE in scene_raytracing_compute.glsl).
+		if (rt_guide_uniform_set.is_valid() && raytracing->get_shader()->uses_compute_scene_lane()) {
+			const uint32_t guide_flags = rt_flags | SceneShaderRaytracing::RT_FLAG_GUIDE_PASS;
+			RID guide_pipeline = raytracing->get_shader()->get_raytracing_pipeline(guide_flags);
+			if (guide_pipeline.is_valid()) {
+				RENDER_TIMESTAMP("Denoiser Guides");
+				RD::RaytracingListID guide_list = RD::get_singleton()->raytracing_list_begin();
+				RD::get_singleton()->raytracing_list_bind_raytracing_pipeline(guide_list, guide_pipeline);
+				RD::get_singleton()->raytracing_list_bind_uniform_set(guide_list, rt_guide_uniform_set, 0);
+				if (bindless_set.is_valid()) {
+					RD::get_singleton()->raytracing_list_bind_uniform_set(guide_list, bindless_set, 1);
+				}
+				raytracing->register_raytracing_buffer_dependencies(guide_list);
+				RD::get_singleton()->raytracing_list_trace_rays(guide_list, 0, raytracing->get_shader()->get_hit_sbt(guide_flags), rt_size.width, rt_size.height, 1);
+				RD::get_singleton()->raytracing_list_end();
+			}
+		}
 		if (raytracing->get_shader()->uses_compute_scene_lane()) {
 			static bool editor_scene_markers_printed = false;
 			if (!editor_scene_markers_printed) {
@@ -2880,7 +2922,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_TRANSPARENT, p_render_data);
 	}
 
-	// Skip transparent pass when raytracing handles color.
+	// Ray tracing handles opaque color; blended materials still use this raster pass.
 	if (true) {
 		RENDER_TIMESTAMP("Render 3D Transparent Pass");
 
@@ -2895,9 +2937,20 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			// Motion vectors should not be overwritten by transparent objects.
 			transparent_color_pass_flags &= ~uint32_t(COLOR_PASS_FLAG_MOTION_VECTORS);
 
-			RID alpha_framebuffer = rb_data.is_valid() ? rb_data->get_color_pass_fb(transparent_color_pass_flags) : color_only_framebuffer;
+			const bool use_metalfx_transparency_overlay = scene_features.rt && scale_type == SCALE_MFX_DENOISED && rb_data.is_valid() && rb_data->dlss_rr_has_buffers();
+			RID alpha_framebuffer;
+			BitField<RD::DrawFlags> alpha_draw_flags = RD::DRAW_DEFAULT_ALL;
+			Vector<Color> alpha_clear_colors;
+			if (use_metalfx_transparency_overlay) {
+				alpha_framebuffer = FramebufferCacheRD::get_singleton()->get_cache_multiview(
+						rb->get_view_count(), rb_data->dlss_rr_get_transparency_overlay(), rb->get_depth_texture());
+				alpha_draw_flags = RD::DRAW_CLEAR_COLOR_ALL;
+				alpha_clear_colors.push_back(Color(0.0, 0.0, 0.0, 0.0));
+			} else {
+				alpha_framebuffer = rb_data.is_valid() ? rb_data->get_color_pass_fb(transparent_color_pass_flags) : color_only_framebuffer;
+			}
 			RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, PASS_MODE_COLOR, transparent_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
-			_render_list_with_draw_list(&render_list_params, alpha_framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 0.0f, 0u, p_render_data->render_region);
+			_render_list_with_draw_list(&render_list_params, alpha_framebuffer, alpha_draw_flags, alpha_clear_colors, 0.0f, 0u, p_render_data->render_region);
 		}
 
 		RD::get_singleton()->draw_command_end_label();
@@ -3078,30 +3131,55 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 						p_render_data->scene_data->cam_projection, p_render_data->scene_data->prev_cam_projection);
 				_print_pathtracing_presentation_history_reset(history_reset_reasons);
 
-				RID exposure;
-				if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
-					exposure = luminance->get_current_luminance_buffer(rb);
-				}
-
 				RD::get_singleton()->draw_command_begin_label("MetalFX Denoised Upscaling");
 				RENDER_TIMESTAMP("MetalFX Denoised Upscaling");
-				Vector2 jitter = p_render_data->scene_data->taa_jitter * 0.5f;
-				jitter *= Vector2(1.0, -1.0);
+				// MetalFX expects the subpixel jitter in input pixels (-0.5..0.5),
+				// pointing the way the content was displaced. taa_jitter is an NDC
+				// offset applied in y-down clip space and texture space is also
+				// y-down, so scale by half the internal size without flipping.
+				Vector2 jitter = p_render_data->scene_data->taa_jitter * Vector2(rb->get_internal_size()) * 0.5f;
+
+				// viewToClip must match the transform that produced the depth
+				// texture: reversed-Z remapped to [0,1]. Metal clip space is y-up,
+				// so skip the Vulkan y-flip.
+				Projection depth_correction;
+				depth_correction.set_depth_correction(false, true, true);
+				Projection metalfx_projection = depth_correction * p_render_data->scene_data->cam_projection;
+
+				// MetalFX needs the actual multiplier that will be applied during
+				// tonemapping, not Godot's adapted-luminance denominator. Generate
+				// the required 1x1 R16F texture on the GPU to avoid both an inverted
+				// exposure signal and a CPU readback.
+				RID adapted_luminance = RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
+				float exposure_numerator = rb->get_luminance_multiplier();
+				if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
+					RID current_luminance = luminance->get_current_luminance_buffer(rb);
+					if (current_luminance.is_valid()) {
+						adapted_luminance = current_luminance;
+						exposure_numerator = RSG::camera_attributes->camera_attributes_get_auto_exposure_scale(p_render_data->camera_attributes);
+					}
+				}
+				if (p_render_data->environment.is_valid()) {
+					exposure_numerator *= environment_get_exposure(p_render_data->environment);
+				}
+				RID metalfx_exposure = mfx_temporal_effect->prepare_exposure(rb, adapted_luminance, exposure_numerator);
 
 				for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 					RendererRD::MFXDenoisedEffect::Params params;
 					params.src = rb->get_internal_texture(v);
 					params.depth = rb->get_depth_texture(v);
 					params.motion = rb->get_velocity_buffer(false, v);
-					params.exposure = exposure;
+					params.exposure = metalfx_exposure;
 					params.diffuse_albedo = rb_data->dlss_rr_get_diffuse_albedo(v);
 					params.specular_albedo = rb_data->dlss_rr_get_specular_albedo(v);
 					params.normal = rb_data->dlss_rr_get_normal_roughness(v);
 					params.roughness = rb_data->dlss_rr_get_roughness(v);
 					params.specular_hit_distance = rb_data->dlss_rr_get_specular_hit_dist(v);
+					params.denoise_strength = rb_data->dlss_rr_get_denoise_strength(v);
+					params.transparency_overlay = rb_data->dlss_rr_get_transparency_overlay(v);
 					params.dst = rb->get_upscaled_texture(v);
 					params.jitter_offset = jitter;
-					params.camera_projection = p_render_data->scene_data->cam_projection;
+					params.camera_projection = metalfx_projection;
 					params.camera_transform = p_render_data->scene_data->cam_transform;
 					params.reset = history_reset_reasons != PT_PRESENTATION_HISTORY_RESET_NONE;
 					mfx_denoised_effect->process(rb_data->get_mfx_denoised_context(), params);
@@ -3122,15 +3200,26 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				_print_pathtracing_presentation_history_reset(history_reset_reasons);
 			}
 
-			RID exposure;
+			RID adapted_luminance = RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
+			float exposure_numerator = rb->get_luminance_multiplier();
 			if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
-				exposure = luminance->get_current_luminance_buffer(rb);
+				RID current_luminance = luminance->get_current_luminance_buffer(rb);
+				if (current_luminance.is_valid()) {
+					adapted_luminance = current_luminance;
+					exposure_numerator = RSG::camera_attributes->camera_attributes_get_auto_exposure_scale(p_render_data->camera_attributes);
+				}
 			}
+			if (p_render_data->environment.is_valid()) {
+				exposure_numerator *= environment_get_exposure(p_render_data->environment);
+			}
+			RID exposure = mfx_temporal_effect->prepare_exposure(rb, adapted_luminance, exposure_numerator);
 
 			RD::get_singleton()->draw_command_begin_label("MetalFX Temporal");
-			// Scale to ±0.5.
-			Vector2 jitter = p_render_data->scene_data->taa_jitter * 0.5f;
-			jitter *= Vector2(1.0, -1.0); // Flip y-axis as bottom left is origin.
+			// MetalFX expects the subpixel jitter in input pixels (-0.5..0.5),
+			// pointing the way the content was displaced. taa_jitter is an NDC
+			// offset applied in y-down clip space and texture space is also
+			// y-down, so scale by half the internal size without flipping.
+			Vector2 jitter = p_render_data->scene_data->taa_jitter * Vector2(rb->get_internal_size()) * 0.5f;
 
 			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 				RendererRD::MFXTemporalEffect::Params params;

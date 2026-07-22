@@ -504,6 +504,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 
 		imageStore(denoiser_normal_roughness, pixel, vec4(N, m.roughness));
 		imageStore(denoiser_roughness, pixel, vec4(m.roughness));
+		imageStore(denoiser_strength, pixel, vec4(0.0));
 
 		// Specular hit distance via inline ray query (only for smooth surfaces).
 		float spec_hit_dist = -1.0;

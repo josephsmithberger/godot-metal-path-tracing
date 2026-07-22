@@ -39,6 +39,7 @@
 
 #include "core/templates/paged_allocator.h"
 #include "servers/rendering/renderer_rd/effects/spatial_upscaler.h"
+#include "servers/rendering/renderer_rd/shaders/effects/mfx_exposure.glsl.gen.h"
 #include "servers/rendering/renderer_scene_render.h"
 #include "servers/rendering/rendering_device_driver.h"
 
@@ -102,6 +103,14 @@ struct MFXTemporalContext {
 };
 
 class MFXTemporalEffect {
+	struct ExposurePushConstant {
+		float exposure_numerator = 1.0f;
+	};
+
+	MfxExposureShaderRD exposure_shader;
+	RID exposure_shader_version;
+	RID exposure_pipeline;
+
 	struct CallbackArgs {
 		MFXTemporalEffect *owner = nullptr;
 		MTLFX::TemporalScalerBase *scaler = nullptr;
@@ -159,6 +168,7 @@ public:
 	};
 
 	MFXTemporalContext *create_context(CreateParams p_params) const;
+	RID prepare_exposure(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_adapted_luminance, float p_exposure_numerator);
 
 	struct Params {
 		RID src;
@@ -196,6 +206,8 @@ class MFXDenoisedEffect {
 		RDD::TextureID normal;
 		RDD::TextureID roughness;
 		RDD::TextureID specular_hit_distance;
+		RDD::TextureID denoise_strength;
+		RDD::TextureID transparency_overlay;
 		RDD::TextureID dst;
 		Vector2 jitter_offset;
 		Projection camera_projection;
@@ -214,6 +226,8 @@ class MFXDenoisedEffect {
 				RDD::TextureID p_normal,
 				RDD::TextureID p_roughness,
 				RDD::TextureID p_specular_hit_distance,
+				RDD::TextureID p_denoise_strength,
+				RDD::TextureID p_transparency_overlay,
 				RDD::TextureID p_dst,
 				Vector2 p_jitter_offset,
 				Projection p_camera_projection,
@@ -230,6 +244,8 @@ class MFXDenoisedEffect {
 				normal(p_normal),
 				roughness(p_roughness),
 				specular_hit_distance(p_specular_hit_distance),
+				denoise_strength(p_denoise_strength),
+				transparency_overlay(p_transparency_overlay),
 				dst(p_dst),
 				jitter_offset(p_jitter_offset),
 				camera_projection(p_camera_projection),
@@ -258,6 +274,8 @@ public:
 		RDD::DataFormat normal_format;
 		RDD::DataFormat roughness_format;
 		RDD::DataFormat specular_hit_distance_format;
+		RDD::DataFormat denoise_strength_format;
+		RDD::DataFormat transparency_overlay_format;
 		RDD::DataFormat output_format;
 		Vector2 motion_vector_scale;
 	};
@@ -272,6 +290,8 @@ public:
 		RID normal;
 		RID roughness;
 		RID specular_hit_distance;
+		RID denoise_strength;
+		RID transparency_overlay;
 		RID dst;
 		Vector2 jitter_offset;
 		Projection camera_projection;

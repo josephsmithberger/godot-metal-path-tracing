@@ -144,6 +144,16 @@ public:
 		// query instances. Metal traces the opaque partition with its native
 		// intersector, queries only the second partition, and selects the nearest.
 		RT_FLAG_MIXED_ALPHA = (1 << 5),
+		// Compute-lane internal bit: selects the denoiser guide-pass kernel
+		// instead of the path-trace kernel. Never produced by compute_rt_flags;
+		// the renderer ORs it in when requesting the guide pipeline so guide
+		// generation stays out of the path-trace mega-kernel's register budget.
+		RT_FLAG_GUIDE_PASS = (1 << 6),
+		// Shadow rays skip the alpha-tested query partition and treat every
+		// instance as opaque. Alpha foliage then casts solid-silhouette shadows,
+		// trading shadow fidelity for the cost of the divergent per-candidate
+		// alpha traversal on every NEE shadow ray. Opt-in scalability knob.
+		RT_FLAG_OPAQUE_SHADOWS = (1 << 7),
 	};
 
 	constexpr static uint32_t RT_SAMPLE_COUNT_SHIFT = 21;

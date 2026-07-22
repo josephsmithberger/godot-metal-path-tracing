@@ -201,11 +201,15 @@ public:
 		RID dlss_rr_get_normal_roughness() const { return render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_NORMAL_ROUGHNESS); }
 		RID dlss_rr_get_roughness() const { return render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_ROUGHNESS); }
 		RID dlss_rr_get_specular_hit_dist() const { return render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_SPECULAR_HIT_DIST); }
+		RID dlss_rr_get_denoise_strength() const { return render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_DENOISE_STRENGTH); }
+		RID dlss_rr_get_transparency_overlay() const { return render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_TRANSPARENCY_OVERLAY); }
 		RID dlss_rr_get_diffuse_albedo(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_DIFFUSE_ALBEDO, p_layer, 0); }
 		RID dlss_rr_get_specular_albedo(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_SPECULAR_ALBEDO, p_layer, 0); }
 		RID dlss_rr_get_normal_roughness(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_NORMAL_ROUGHNESS, p_layer, 0); }
 		RID dlss_rr_get_roughness(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_ROUGHNESS, p_layer, 0); }
 		RID dlss_rr_get_specular_hit_dist(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_SPECULAR_HIT_DIST, p_layer, 0); }
+		RID dlss_rr_get_denoise_strength(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_DENOISE_STRENGTH, p_layer, 0); }
+		RID dlss_rr_get_transparency_overlay(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_TRANSPARENCY_OVERLAY, p_layer, 0); }
 
 		RID get_color_only_fb();
 		RID get_color_pass_fb(uint32_t p_color_pass_flags);

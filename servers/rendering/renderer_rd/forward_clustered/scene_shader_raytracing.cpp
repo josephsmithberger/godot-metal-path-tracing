@@ -766,6 +766,12 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(const float *p_env_params, bool
 		flags |= RT_FLAG_SER_ENABLED;
 	}
 
+	// Opaque-shadow scalability path: skip the divergent per-candidate alpha
+	// test on shadow rays and trace them with the opaque hardware intersector.
+	if (!bool(GLOBAL_GET("rendering/pathtracer/alpha_tested_shadows"))) {
+		flags |= RT_FLAG_OPAQUE_SHADOWS;
+	}
+
 	return rt_flags_pack(flags, sample_count, max_bounces);
 }
 
@@ -919,7 +925,7 @@ const SceneShaderRaytracing::PipelineBundle &SceneShaderRaytracing::ensure_pipel
 	if (compute_scene_lane) {
 		ERR_FAIL_COND_V(!compute_shader_version.is_valid(), EMPTY_BUNDLE);
 		PipelineBundle &bundle = pipeline_bundles[p_rt_flags];
-		const int compute_variant = (p_rt_flags & RT_FLAG_DENOISER_GUIDES_ENABLED) != 0 ? 1 : 0;
+		const int compute_variant = (p_rt_flags & RT_FLAG_GUIDE_PASS) != 0 ? 1 : 0;
 		bundle.base_shader = compute_shader.version_get_shader(compute_shader_version, compute_variant);
 		if (!bundle.base_shader.is_valid() || !_build_compute_bundle(p_rt_flags, bundle)) {
 			return EMPTY_BUNDLE;
@@ -1386,7 +1392,7 @@ SceneShaderRaytracing::ComputeBuildTask *SceneShaderRaytracing::_make_compute_bu
 		return nullptr;
 	}
 
-	const int compute_variant = (p_rt_flags & RT_FLAG_DENOISER_GUIDES_ENABLED) != 0 ? 1 : 0;
+	const int compute_variant = (p_rt_flags & RT_FLAG_GUIDE_PASS) != 0 ? 1 : 0;
 	Vector<String> sources = compute_shader.version_build_variant_stage_sources(compute_shader_version, compute_variant);
 	if (sources.size() <= RD::SHADER_STAGE_COMPUTE || sources[RD::SHADER_STAGE_COMPUTE].is_empty()) {
 		WARN_PRINT(vformat("RT: compute template unavailable for variant 0x%x; material dispatch stays generic.", p_rt_flags));
@@ -2417,8 +2423,12 @@ void SceneShaderRaytracing::init(const String p_defines) {
 
 	if (compute_scene_lane) {
 		Vector<String> compute_modes;
+		// Variant 0: path-trace kernel, guide-free for every rt_flags value --
+		// denoiser on/off share it. Variant 1: the standalone guide pass
+		// (selected by RT_FLAG_GUIDE_PASS); it is the only compute variant that
+		// declares the guide image bindings.
 		compute_modes.push_back("\n");
-		compute_modes.push_back("\n#define DENOISER_GUIDES_ENABLED\n");
+		compute_modes.push_back("\n#define DENOISER_GUIDES_ENABLED\n#define GUIDE_PASS_MODE\n");
 		compute_shader.initialize(compute_modes, p_defines);
 	} else {
 		// Raygen: one mode per bitmask of RAYGEN_SHADER_OPTIONS.
