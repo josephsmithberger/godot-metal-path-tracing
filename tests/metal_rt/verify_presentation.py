@@ -135,7 +135,7 @@ def verify(artifact_dir: Path) -> int:
     captures = manifest.get("captures")
     if not isinstance(captures, dict):
         raise VerificationError("manifest is missing capture hashes")
-    expected_captures = {f"presentation_{mode}" for mode in modes} | {
+    expected_captures = set(modes) | {
         "before_camera_cut",
         "after_camera_cut",
         "after_resize",

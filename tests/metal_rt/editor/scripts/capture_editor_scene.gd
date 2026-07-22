@@ -165,7 +165,7 @@ func _process_presentation() -> void:
 			if presentation_phase_frame == 1:
 				_apply_presentation_mode(presentation_modes[presentation_mode_index], capture_viewport)
 			if presentation_phase_frame >= PRESENTATION_MODE_WARMUP_FRAMES:
-				_capture_presentation("presentation_%s" % presentation_modes[presentation_mode_index].name, capture_viewport)
+				_capture_presentation(presentation_modes[presentation_mode_index].name, capture_viewport)
 				presentation_mode_index += 1
 				presentation_phase_frame = 0
 				if presentation_mode_index >= presentation_modes.size():
