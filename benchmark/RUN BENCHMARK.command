@@ -114,7 +114,7 @@ for SPP in "${SPP_VALUES[@]}"; do
 			if [[ "$ARCHITECTURE" == 'arm64' ]]; then WORKLOAD="1920x1080-${SPP}spp-${BOUNCES}bounces-orbit-metal-rt"; else WORKLOAD='1920x1080-orbit-intel-raster-fallback'; fi
 			LOG="$RESULT_DIR/spp-${SPP}-bounces-${BOUNCES}-run-${REPEAT}.log"
 			printf 'Run %d of %d: %s (repeat %d/%d)...\n' "$RUN_NUMBER" "$TOTAL_RUNS" "$WORKLOAD" "$REPEAT" "$REPEATS"
-			GODOT_GPU_PROFILE=1 GODOT_PERF_MEASURE_FRAMES="$MEASURE_FRAMES" GODOT_PERF_SPP="$SPP" GODOT_PERF_BOUNCES="$BOUNCES" GODOT_PERF_DENOISER=0 "$BIN" --path "$PROJECT" "${RENDERING_ARGS[@]}" 2>&1 | tee "$LOG"
+			GODOT_GPU_PROFILE=1 GODOT_PERF_MEASURE_FRAMES="$MEASURE_FRAMES" GODOT_PERF_SPP="$SPP" GODOT_PERF_BOUNCES="$BOUNCES" GODOT_PERF_DENOISER=0 "$BIN" --path "$PROJECT" --disable-vsync "${RENDERING_ARGS[@]}" 2>&1 | tee "$LOG"
 			EXIT_CODE=${PIPESTATUS[0]}
 			if [[ "$EXIT_CODE" -ne 0 ]]; then ANY_FAILURE=1; fi
 			RT_GATE="$(grep -Eo 'C11_GATE=[^[:space:]]+' "$LOG" | tail -1 | cut -d= -f2-)"

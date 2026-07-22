@@ -13,9 +13,9 @@ story, tests, benchmark, and reproducible evidence behind the macOS port.
 
 ![Native Metal path tracing in the Bistro demo](misc/metal_rt_bistro.jpg)
 
-*[Bistro demo](https://github.com/Jamsers/Bistro-Demo-Tweaked) rendered by this fork on Apple Silicon with native Metal ray
-tracing, **4 samples per pixel**, **2 bounces**, and **MetalFX Denoised
-Upscaling enabled**.*
+*[Bistro demo](https://github.com/Jamsers/Bistro-Demo-Tweaked) rendered by the
+current Apple Silicon build with native Metal ray tracing and MetalFX Denoised
+Upscaling enabled.*
 
 ## What it does
 
@@ -71,37 +71,35 @@ hardware, OS, renderer, capability gate, frame-time percentiles, and the GPU
 Pathtracer pass time. Generated results, logs, and builds are intentionally
 ignored.
 
-The results below are two-run means recorded with preview build `de7f299277`
-on 2026-07-18. Each row is one SPP/bounce configuration; the **bold row** is
-the exact **4 SPP / 2 bounce** setup used for the showcase images above.
+The results below are two-run means recorded with build `eeac9e05d` on
+2026-07-22. Each row uses 240 measured frames after warmup at 1920×1080; the
+**bold row** is the **4 SPP / 2 bounce** reference configuration.
 
-| SPP | Bounces | M5 FPS | M5 GPU pass | M3 FPS | M3 GPU pass | M5 vs M3 |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 1 | 321.3 | 2.6 ms | 93.2 | 9.7 ms | 3.4× |
-| 1 | 2 | 262.6 | 3.4 ms | 66.1 | 14.3 ms | 4.0× |
-| 1 | 4 | 231.4 | 4.1 ms | 55.0 | 17.6 ms | 4.2× |
-| 4 | 1 | 102.1 | 9.7 ms | 23.6 | 41.8 ms | 4.3× |
-| **4** | **2** | **70.5** | **14.1 ms** | **15.9** | **62.2 ms** | **4.4×** |
-| 4 | 4 | 57.4 | 17.4 ms | 12.9 | 76.8 ms | 4.5× |
-| 16 | 1 | 25.0 | 39.9 ms | 5.8 | 171.0 ms | 4.3× |
-| 16 | 2 | 17.4 | 57.3 ms | 3.9 | 253.0 ms | 4.4× |
-| 16 | 4 | 14.4 | 69.2 ms | 3.2 | 310.9 ms | 4.5× |
+| SPP | Bounces | M5 FPS | M5 GPU pass |
+| ---: | ---: | ---: | ---: |
+| 1 | 1 | 184.4 | 3.8 ms |
+| 1 | 2 | 119.9 | 4.8 ms |
+| 1 | 4 | 120.0 | 5.6 ms |
+| 4 | 1 | 72.6 | 14.0 ms |
+| **4** | **2** | **53.8** | **18.4 ms** |
+| 4 | 4 | 49.1 | 20.2 ms |
+| 16 | 1 | 22.4 | 44.5 ms |
+| 16 | 2 | 15.5 | 64.2 ms |
+| 16 | 4 | 12.7 | 78.6 ms |
 
-"GPU pass" is the Pathtracer pass time alone; FPS is the whole frame. "M5 vs
-M3" compares mean FPS.
+"GPU pass" is the Pathtracer pass time alone; FPS is the whole frame. The
+first three configurations are constrained by display pacing on this desktop,
+so the GPU pass timing is the more reliable comparison there.
 
 | Machine | Chip | macOS | Metal RT |
 | --- | --- | --- | --- |
 | MacBook Pro (Mac17,2) | Apple M5 (Apple9) | 26.5.2 | enabled |
-| MacBook Air (Mac15,12) | Apple M3 (Apple9) | 26.5.1 | enabled |
-| MacBook Pro (MacBookPro14,1) | Intel i5-7360U | 13.6.6 | not supported |
 
-The Intel machine correctly did **not** produce an RT result: the preview
-binary was arm64-only and macOS rejected it. Intel Mac support is being worked
-on; do not treat the current fallback status as an RT benchmark. PRs that add your own
-benchmark results—with machine details, exact build/commit, matrix settings,
-and a concise result table—would be very welcome. Please leave generated logs,
-`benchmark-results/`, and binaries out of the commit.
+Intel Mac support is being worked on; do not treat a fallback result as an RT
+benchmark. PRs that add your own benchmark results—with machine details, exact
+build/commit, matrix settings, and a concise result table—would be very
+welcome. Please leave generated logs, `benchmark-results/`, and binaries out
+of the commit.
 
 ### Run it
 
