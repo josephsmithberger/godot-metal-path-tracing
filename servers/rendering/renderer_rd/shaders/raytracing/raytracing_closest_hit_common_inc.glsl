@@ -539,7 +539,20 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 
 	uint rt_light_count = uint(get_rt_param(RT_PARAM_LIGHT_COUNT));
 	if (rt_light_count > 0u) {
-		vec3 hit_pos_offset = offset_ray_origin(h.hit_pos, h.geometry_normal);
+		vec3 shadow_pos = h.hit_pos;
+#ifdef RT_HIT_ATTRIBS_DECLARED
+		{
+			GeometryData shadow_geom = geometries[h.geometry_idx];
+			if ((shadow_geom.flags & FLAG_PROCEDURAL) == 0u) {
+				uint s0, s1, s2;
+				get_triangle_indices(shadow_geom, s0, s1, s2);
+				vec3 shadow_bary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
+				shadow_pos = shadow_terminator_hit_pos(shadow_geom, s0, s1, s2, shadow_bary,
+						h.hit_pos, h.geometry_normal, mat4(gl_ObjectToWorldEXT));
+			}
+		}
+#endif
+		vec3 hit_pos_offset = offset_ray_origin(shadow_pos, h.geometry_normal);
 		bool is_indirect = (diffuse_bounces > 0u);
 		vec3 direct_light = lights_evaluate_direct_lighting(
 				hit_pos_offset, N, V, brdf_mat, ps.rng_state, is_indirect, rt_light_count);
