@@ -71,11 +71,12 @@ constexpr MTL::GPUFamily GPUFamilyApple9 = MTL::GPUFamilyApple9;
 
 API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0), visionos(1.0))
 MTL::GPUFamily &operator--(MTL::GPUFamily &p_family) {
+	// Plain decrement. This previously wrapped back to GPUFamilyApple9 when it
+	// dropped below GPUFamilyApple1, which caused the highestFamily detection loop
+	// below to spin forever on devices that support no Apple GPU family at all
+	// (e.g. Intel Macs, which report only mac2/metal3). Letting the value fall
+	// below GPUFamilyApple1 lets that loop's `>=` guard terminate normally.
 	p_family = static_cast<MTL::GPUFamily>(static_cast<int>(p_family) - 1);
-	if (p_family < MTL::GPUFamilyApple1) {
-		p_family = GPUFamilyApple9;
-	}
-
 	return p_family;
 }
 
@@ -141,13 +142,19 @@ void MetalDeviceProperties::init_features(MTL::Device *p_device) {
 		}
 	}
 
-	features.layeredRendering = p_device->supportsFamily(MTL::GPUFamilyApple5);
+	// These capabilities are gated on Apple GPU families, but macOS mac2 hardware
+	// (Intel/AMD Macs) supports them too; the Apple-family checks alone report
+	// false there and would either disable features or fail the renderer feature
+	// floor. mac2 support for cube-map arrays, SIMD-group permute/reduction, and
+	// quad-group permute was verified on Intel Iris Plus 640 (macOS 13, Metal 3).
+	const bool is_mac2 = p_device->supportsFamily(MTL::GPUFamilyMac2);
+	features.layeredRendering = p_device->supportsFamily(MTL::GPUFamilyApple5) || is_mac2;
 	features.multisampleLayeredRendering = p_device->supportsFamily(MTL::GPUFamilyApple7);
-	features.tessellationShader = p_device->supportsFamily(MTL::GPUFamilyApple3);
-	features.imageCubeArray = p_device->supportsFamily(MTL::GPUFamilyApple3);
-	features.quadPermute = p_device->supportsFamily(MTL::GPUFamilyApple4);
-	features.simdPermute = p_device->supportsFamily(MTL::GPUFamilyApple6);
-	features.simdReduction = p_device->supportsFamily(MTL::GPUFamilyApple7);
+	features.tessellationShader = p_device->supportsFamily(MTL::GPUFamilyApple3) || is_mac2;
+	features.imageCubeArray = p_device->supportsFamily(MTL::GPUFamilyApple3) || is_mac2;
+	features.quadPermute = p_device->supportsFamily(MTL::GPUFamilyApple4) || is_mac2;
+	features.simdPermute = p_device->supportsFamily(MTL::GPUFamilyApple6) || is_mac2;
+	features.simdReduction = p_device->supportsFamily(MTL::GPUFamilyApple7) || is_mac2;
 	features.supports_border_color = p_device->supportsFamily(MTL::GPUFamilyApple7);
 	features.argument_buffers_tier = p_device->argumentBuffersSupport();
 	features.supports_image_atomic_32_bit = p_device->supportsFamily(MTL::GPUFamilyApple6);
@@ -171,11 +178,36 @@ void MetalDeviceProperties::init_features(MTL::Device *p_device) {
 	}
 
 	if (__builtin_available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
-		features.needs_arg_encoders = !(p_device->supportsFamily(MTL::GPUFamilyMetal3) && features.argument_buffers_tier == MTL::ArgumentBuffersTier2);
+		// Metal 3 devices support encoder-free argument buffers via resource
+		// handles (MTLResourceID written directly into a plain buffer), regardless
+		// of the reported argument-buffer tier. Verified on Intel Iris Plus 640
+		// (tier 1, Metal 3): sampled textures, non-uniform dynamic indexing, and
+		// writable storage textures all resolve correctly through this path. The
+		// tier only gates the legacy encoder-based argument-buffer layout, which we
+		// do not use on Metal 3, so tier 1 Metal 3 hardware (Intel Macs) no longer
+		// needs argument encoders.
+		features.needs_arg_encoders = !p_device->supportsFamily(MTL::GPUFamilyMetal3);
 	}
 
 	if (String v = OS::get_singleton()->get_environment("GODOT_MTL_DISABLE_ARGUMENT_BUFFERS"); v == "1") {
 		features.use_argument_buffers = false;
+	}
+
+	// Per-device runtime queries are the gating authority for ray tracing; GPU
+	// families are only used to set expectations.
+	if (__builtin_available(macOS 11.0, iOS 14.0, tvOS 16.0, *)) {
+		features.supports_raytracing = p_device->supportsRaytracing();
+		features.supports_function_pointers = p_device->supportsFunctionPointers();
+	}
+	if (__builtin_available(macOS 12.0, iOS 15.0, tvOS 16.0, *)) {
+		features.supports_user_id_instances = features.supports_raytracing;
+	}
+
+	// Apple GPUs only sample counters at stage boundaries; draw/dispatch/blit
+	// boundary sampling reports unsupported, so timestamps have to be emitted by
+	// bracketing encoders rather than written at an arbitrary point in one.
+	if (__builtin_available(macOS 11.0, iOS 14.0, tvOS 16.0, *)) {
+		features.supports_timestamp_sampling = p_device->supportsCounterSampling(MTL::CounterSamplingPointAtStageBoundary);
 	}
 
 	if (__builtin_available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
@@ -186,6 +218,12 @@ void MetalDeviceProperties::init_features(MTL::Device *p_device) {
 		features.metal_fx_temporal = false;
 #endif
 	}
+
+#ifdef METAL_MFXDENOISED_ENABLED
+	if (__builtin_available(macOS 26.0, iOS 18.0, *)) {
+		features.metal_fx_denoised = MTLFX::TemporalDenoisedScalerDescriptor::supportsDevice(p_device);
+	}
+#endif
 }
 
 void MetalDeviceProperties::init_limits(MTL::Device *p_device) {
@@ -232,8 +270,14 @@ void MetalDeviceProperties::init_limits(MTL::Device *p_device) {
 	// FST: Maximum number of color render targets per render pass descriptor.
 	limits.maxColorAttachments = 8;
 
+	// macOS mac2 (Intel/AMD) devices address resources through resource-handle
+	// argument buffers (verified on Intel Iris Plus 640), so they get the same
+	// high per-stage limits as Apple6+ rather than the mobile-era fallback, which
+	// would otherwise force the Clustered renderer down to Mobile.
+	const bool is_mac2 = p_device->supportsFamily(MTL::GPUFamilyMac2);
+
 	// Maximum number of textures the device can access, per stage, from an argument buffer.
-	if (p_device->supportsFamily(MTL::GPUFamilyApple6)) {
+	if (p_device->supportsFamily(MTL::GPUFamilyApple6) || is_mac2) {
 		limits.maxTexturesPerArgumentBuffer = 1'000'000;
 	} else if (p_device->supportsFamily(MTL::GPUFamilyApple4)) {
 		limits.maxTexturesPerArgumentBuffer = 96;
@@ -242,14 +286,14 @@ void MetalDeviceProperties::init_limits(MTL::Device *p_device) {
 	}
 
 	// Maximum number of samplers the device can access, per stage, from an argument buffer.
-	if (p_device->supportsFamily(MTL::GPUFamilyApple6)) {
+	if (p_device->supportsFamily(MTL::GPUFamilyApple6) || is_mac2) {
 		limits.maxSamplersPerArgumentBuffer = 1024;
 	} else {
 		limits.maxSamplersPerArgumentBuffer = 16;
 	}
 
 	// Maximum number of buffers the device can access, per stage, from an argument buffer.
-	if (p_device->supportsFamily(MTL::GPUFamilyApple6)) {
+	if (p_device->supportsFamily(MTL::GPUFamilyApple6) || is_mac2) {
 		limits.maxBuffersPerArgumentBuffer = std::numeric_limits<uint64_t>::max();
 	} else if (p_device->supportsFamily(MTL::GPUFamilyApple4)) {
 		limits.maxBuffersPerArgumentBuffer = 96;

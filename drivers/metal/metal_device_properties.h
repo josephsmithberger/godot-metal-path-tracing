@@ -115,18 +115,27 @@ struct API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0)) MetalFeatures {
 	bool use_argument_buffers = true; /**< If true, argument buffers are can be used instead of slot binding, if available. */
 	bool metal_fx_spatial = false; /**< If true, Metal FX spatial functions are supported. */
 	bool metal_fx_temporal = false; /**< If true, Metal FX temporal functions are supported. */
+	bool metal_fx_denoised = false; /**< If true, MetalFX temporal denoised scaling is supported. */
 	bool supports_gpu_address = false; /**< If true, referencing a GPU address in a shader is supported. */
 	bool supports_image_atomic_32_bit = false; /**< If true, 32-bit atomic operations on images are supported by the GPU. */
 	bool supports_image_atomic_64_bit = false; /**< If true, 64-bit atomic operations on images are supported by the GPU. */
 	bool supports_native_image_atomics = false; /**< If true, native image atomic operations are supported by the OS. */
 	bool supports_border_color = false; /**< If true, sampler border color (clamp-to-border) is supported. Requires Apple7+. */
 	bool supports_residency_sets = false; /**< If true, residency sets (MTLResidencySet) are supported by the OS. */
+	bool supports_raytracing = false; /**< If true, the device supports acceleration structures and the MSL intersector intrinsics. */
+	bool supports_function_pointers = false; /**< If true, visible function tables and function pointers are supported in compute pipelines. */
+	bool supports_user_id_instances = false; /**< If true, TLAS instance descriptors can carry a shader-visible user ID (macOS 12+). */
+	bool supports_timestamp_sampling = false; /**< If true, GPU timestamps can be sampled at encoder stage boundaries. */
 
 	/*!
-	 * Check if argument buffers are fully supported, which requires tier 2 support and no need for argument encoders.
+	 * Check if encoder-free argument buffers are supported. This holds whenever
+	 * argument encoders are not required, i.e. on any Metal 3 device: resource
+	 * handles (MTLResourceID) can be written straight into a buffer and indexed in
+	 * the shader. This includes tier-1 Metal 3 hardware such as Intel Macs (see
+	 * needs_arg_encoders in metal_device_properties.cpp).
 	 */
 	_FORCE_INLINE_ bool argument_buffers_supported() const {
-		return argument_buffers_tier == MTL::ArgumentBuffersTier2 && needs_arg_encoders == false;
+		return needs_arg_encoders == false;
 	}
 
 	/*!
