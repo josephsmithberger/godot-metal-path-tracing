@@ -242,6 +242,11 @@ public:
 	virtual void mesh_surface_remove(RID p_mesh, int p_surface) = 0;
 	virtual void mesh_clear(RID p_mesh) = 0;
 
+	virtual RID mesh_surface_get_vertex_buffer_rd_rid(RID p_mesh, int p_surface) const = 0;
+	virtual RID mesh_surface_get_attribute_buffer_rd_rid(RID p_mesh, int p_surface) const = 0;
+	virtual RID mesh_surface_get_skin_buffer_rd_rid(RID p_mesh, int p_surface) const = 0;
+	virtual RID mesh_surface_get_index_buffer_rd_rid(RID p_mesh, int p_surface) const = 0;
+
 	virtual void mesh_debug_usage(List<RenderingServerTypes::MeshInfo> *r_info) = 0;
 
 	/* MULTIMESH API */
@@ -687,9 +692,7 @@ public:
 	virtual void environment_set_sdfgi_frames_to_update_light(RSE::EnvironmentSDFGIFramesToUpdateLight p_update) = 0;
 
 	// Pathtracing
-	virtual void environment_set_pathtracing(RID p_env, bool p_enable) = 0;
-	virtual void environment_set_pathtracing_params(RID p_env, const PackedFloat32Array &p_params) = 0;
-	virtual PackedFloat32Array environment_get_pathtracing_params(RID p_env) const = 0;
+	virtual void environment_set_pathtracing(RID p_env, bool p_enable, int p_debug_mode, int p_samples_per_pixel, int p_max_bounces, RSE::PathtracingDenoiser p_denoiser) = 0;
 
 	virtual void environment_set_fog(RID p_env, bool p_enable, const Color &p_light_color, float p_light_energy, float p_sun_scatter, float p_density, float p_height, float p_height_density, float p_aerial_perspective, float p_sky_affect, RSE::EnvironmentFogMode p_mode = RSE::EnvironmentFogMode::ENV_FOG_MODE_EXPONENTIAL) = 0;
 	virtual void environment_set_fog_depth(RID p_env, float p_curve, float p_begin, float p_end) = 0;

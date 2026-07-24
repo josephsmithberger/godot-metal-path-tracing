@@ -38,6 +38,7 @@
 #include "servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h"
 #include "servers/rendering/renderer_rd/renderer_compositor_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
+#include "servers/rendering/storage/environment_storage.h"
 
 using namespace RendererSceneRenderImplementation;
 
@@ -63,6 +64,8 @@ struct RaygenShaderOption {
 static constexpr RaygenShaderOption RAYGEN_SHADER_OPTIONS[] = {
 	{ SceneShaderRaytracing::RT_FLAG_DENOISER_GUIDES_ENABLED, "#define DENOISER_GUIDES_ENABLED\n" },
 	{ SceneShaderRaytracing::RT_FLAG_SER_ENABLED, "#define USE_SER\n" },
+	{ SceneShaderRaytracing::RT_FLAG_RAY_QUERY_SHADOWS_ENABLED, "#define USE_RAY_QUERY_SHADOWS\n" },
+
 };
 
 static constexpr uint32_t RAYGEN_SHADER_OPTION_COUNT = sizeof(RAYGEN_SHADER_OPTIONS) / sizeof(RAYGEN_SHADER_OPTIONS[0]);
@@ -530,6 +533,14 @@ void SceneShaderRaytracing::_finalize_uniforms_with_textures(
 		tui.buffer_offset = offset;
 		r_entry.texture_uniforms.push_back(tui);
 
+		if (tex.hint == ShaderLanguage::ShaderNode::Uniform::HINT_ALPHA) {
+			if (r_entry.alpha_texture_buffer_offset != UINT32_MAX) {
+				WARN_PRINT(vformat("Custom RT shader has multiple hint_alpha textures; '%s' will be ignored. Only one hint_alpha texture is supported for ray query alpha testing.", tex.name));
+			} else {
+				r_entry.alpha_texture_buffer_offset = offset;
+			}
+		}
+
 		r_entry.uniform_members += "uint m_" + tex.name + ";\n";
 		raw_uniform_end = offset + 4;
 	}
@@ -674,7 +685,7 @@ void SceneShaderRaytracing::finalize_custom_shaders() {
 		// one aggregate compile per bundle; while it runs off-thread the bundle
 		// keeps its last-known-good pipeline, and the swap happens at a later
 		// frame boundary in drain_completed_compiles().
-		async_compilation_enabled = GLOBAL_GET_CACHED(bool, "rendering/pathtracer/async_shader_compilation");
+		async_compilation_enabled = GLOBAL_GET_CACHED(bool, "rendering/pathtracing/async_shader_compilation");
 		if (async_compilation_enabled) {
 			if (!compute_compile_debounce.is_ready(material_generation)) {
 				// No material may arrive during the intervening finalize pass
@@ -701,7 +712,7 @@ void SceneShaderRaytracing::finalize_custom_shaders() {
 		}
 		return;
 	}
-	async_compilation_enabled = GLOBAL_GET_CACHED(bool, "rendering/pathtracer/async_shader_compilation");
+	async_compilation_enabled = GLOBAL_GET_CACHED(bool, "rendering/pathtracing/async_shader_compilation");
 
 	_kick_rebuild_if_idle(); // Async dispatch only; sync drains below.
 
@@ -742,18 +753,25 @@ bool SceneShaderRaytracing::is_hg_ready_in_bundle(uint32_t p_slot_index, uint32_
 	return b.live_ready_mask[p_slot_index];
 }
 
-uint32_t SceneShaderRaytracing::compute_rt_flags(const float *p_env_params, bool p_fog_enabled) {
+uint32_t SceneShaderRaytracing::compute_rt_flags(RID p_environment, bool p_fog_enabled) {
 	uint32_t flags = RT_FLAG_NONE;
 	uint32_t sample_count = 1;
 	uint32_t max_bounces = 3;
 
-	if (p_env_params) {
-		if (p_env_params[RT_PARAM_VIS_MODE] != 0.0f) {
+	if (p_environment.is_valid()) {
+		RendererEnvironmentStorage *env_storage = RendererEnvironmentStorage::get_singleton();
+
+		if (env_storage->environment_get_pathtracing_debug_mode(p_environment) != 0) {
 			flags |= RT_FLAG_DEBUG_VIS_ENABLED;
 		}
-		sample_count = MAX(1u, (uint32_t)p_env_params[RT_PARAM_SAMPLE_COUNT]);
-		max_bounces = MAX(1u, MIN(8u, (uint32_t)p_env_params[RT_PARAM_MAX_BOUNCES]));
-		if ((uint32_t)p_env_params[RT_PARAM_DENOISER] != RSE::PT_DENOISER_NONE) {
+
+		if (GLOBAL_GET("rendering/pathtracing/use_simple_shadows")) {
+			flags |= RT_FLAG_RAY_QUERY_SHADOWS_ENABLED;
+		}
+
+		sample_count = MAX(1, env_storage->environment_get_pathtracing_samples_per_pixel(p_environment));
+		max_bounces = CLAMP(env_storage->environment_get_pathtracing_max_bounces(p_environment), 1, 8);
+		if (env_storage->environment_get_pathtracing_denoiser(p_environment) != RSE::PT_DENOISER_NONE) {
 			flags |= RT_FLAG_DENOISER_GUIDES_ENABLED;
 		}
 	}
@@ -762,13 +780,13 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(const float *p_env_params, bool
 		flags |= RT_FLAG_FOG_ENABLED;
 	}
 
-	if (GLOBAL_GET("rendering/pathtracer/use_shader_execution_reordering")) {
+	if (GLOBAL_GET("rendering/pathtracing/use_shader_execution_reordering")) {
 		flags |= RT_FLAG_SER_ENABLED;
 	}
 
 	// Opaque-shadow scalability path: skip the divergent per-candidate alpha
 	// test on shadow rays and trace them with the opaque hardware intersector.
-	if (!bool(GLOBAL_GET("rendering/pathtracer/alpha_tested_shadows"))) {
+	if (!bool(GLOBAL_GET("rendering/pathtracing/alpha_tested_shadows"))) {
 		flags |= RT_FLAG_OPAQUE_SHADOWS;
 	}
 
@@ -2417,7 +2435,7 @@ void SceneShaderRaytracing::_join_lane_for_shutdown() {
 }
 
 void SceneShaderRaytracing::init(const String p_defines) {
-	async_compilation_enabled = (bool)GLOBAL_GET("rendering/pathtracer/async_shader_compilation");
+	async_compilation_enabled = (bool)GLOBAL_GET("rendering/pathtracing/async_shader_compilation");
 	compute_scene_lane = !RD::get_singleton()->has_feature(RD::SUPPORTS_RAYTRACING_PIPELINE) &&
 			RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY);
 

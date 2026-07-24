@@ -191,7 +191,13 @@ enum ArrayFormat : uint64_t {
 	ARRAY_FLAG_USES_EMPTY_VERTEX_ARRAY = 1 << (ARRAY_COMPRESS_FLAGS_BASE + 3),
 
 	ARRAY_FLAG_COMPRESS_ATTRIBUTES = 1 << (ARRAY_COMPRESS_FLAGS_BASE + 4),
-	// We leave enough room for up to 5 more compression flags.
+
+	// When set, the surface's vertex, attribute, skin, and index buffers are created with the
+	// `BUFFER_CREATION_AS_STORAGE_BIT` usage bit so they can be bound as storage buffers in
+	// compute shaders. Required to write into them from a compute pipeline through the RIDs
+	// returned by `mesh_surface_get_vertex_buffer_rd_rid` and friends.
+	ARRAY_FLAG_USE_STORAGE_BUFFER = 1 << (ARRAY_COMPRESS_FLAGS_BASE + 5),
+	// We leave enough room for up to 4 more compression flags.
 
 	ARRAY_FLAG_FORMAT_VERSION_BASE = ARRAY_COMPRESS_FLAGS_BASE + 10,
 	ARRAY_FLAG_FORMAT_VERSION_SHIFT = ARRAY_FLAG_FORMAT_VERSION_BASE,
@@ -459,8 +465,8 @@ enum ViewportScaling3DMode {
 	VIEWPORT_SCALING_3D_MODE_FSR2,
 	VIEWPORT_SCALING_3D_MODE_METALFX_SPATIAL,
 	VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL,
-	VIEWPORT_SCALING_3D_MODE_DLSS,
 	VIEWPORT_SCALING_3D_MODE_NEAREST,
+	VIEWPORT_SCALING_3D_MODE_DLSS,
 	VIEWPORT_SCALING_3D_MODE_MAX,
 	VIEWPORT_SCALING_3D_MODE_OFF = 255, // for internal use only
 };
@@ -755,18 +761,6 @@ enum PathtracingDenoiser {
 	PT_DENOISER_NONE = 0,
 	PT_DENOISER_DLSS_RAY_RECONSTRUCTION = 1,
 	PT_DENOISER_METALFX = 2,
-};
-
-// Pathtracing parameter indices for the float[16] params buffer.
-// Must match RT_PARAM_* defines in raytracing_inc.glsl.
-enum PathtracingParamIndex {
-	PT_PARAM_VIS_MODE = 0,
-	PT_PARAM_SAMPLE_COUNT = 1,
-	PT_PARAM_MAX_BOUNCES = 2,
-	PT_PARAM_DENOISER = 3,
-	// Indices 4-13 reserved for future use.
-	PT_PARAM_LIGHT_COUNT = 14,
-	PT_PARAM_FRAME_INDEX = 15,
 };
 
 enum SubSurfaceScatteringQuality {

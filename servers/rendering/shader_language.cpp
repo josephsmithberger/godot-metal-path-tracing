@@ -214,6 +214,7 @@ const char *ShaderLanguage::token_names[TK_MAX] = {
 	"HINT_ROUGHNESS_A",
 	"HINT_ROUGHNESS_GRAY",
 	"HINT_ANISOTROPY_TEXTURE",
+	"HINT_ALPHA_TEXTURE",
 	"HINT_SOURCE_COLOR",
 	"HINT_COLOR_CONVERSION_DISABLED",
 	"HINT_RANGE",
@@ -388,6 +389,7 @@ const ShaderLanguage::KeyWord ShaderLanguage::keyword_list[] = {
 	{ TK_HINT_DEFAULT_BLACK_TEXTURE, "hint_default_black", CF_UNSPECIFIED, {}, {} },
 	{ TK_HINT_DEFAULT_TRANSPARENT_TEXTURE, "hint_default_transparent", CF_UNSPECIFIED, {}, {} },
 	{ TK_HINT_ANISOTROPY_TEXTURE, "hint_anisotropy", CF_UNSPECIFIED, {}, {} },
+	{ TK_HINT_ALPHA_TEXTURE, "hint_alpha", CF_UNSPECIFIED, {}, {} },
 	{ TK_HINT_ROUGHNESS_R, "hint_roughness_r", CF_UNSPECIFIED, {}, {} },
 	{ TK_HINT_ROUGHNESS_G, "hint_roughness_g", CF_UNSPECIFIED, {}, {} },
 	{ TK_HINT_ROUGHNESS_B, "hint_roughness_b", CF_UNSPECIFIED, {}, {} },
@@ -1237,6 +1239,9 @@ String ShaderLanguage::get_uniform_hint_name(ShaderNode::Uniform::Hint p_hint) {
 		} break;
 		case ShaderNode::Uniform::HINT_ANISOTROPY: {
 			result = "hint_anisotropy";
+		} break;
+		case ShaderNode::Uniform::HINT_ALPHA: {
+			result = "hint_alpha";
 		} break;
 		case ShaderNode::Uniform::HINT_SCREEN_TEXTURE: {
 			result = "hint_screen_texture";
@@ -3603,8 +3608,8 @@ bool ShaderLanguage::_validate_function_call(BlockNode *p_block, const FunctionI
 
 	ERR_FAIL_COND_V(p_func->arguments[0]->type != Node::NODE_TYPE_VARIABLE, false);
 
-	StringName name = static_cast<VariableNode *>(p_func->arguments[0])->name.operator String();
-	StringName rname = static_cast<VariableNode *>(p_func->arguments[0])->rname.operator String();
+	StringName name = static_cast<VariableNode *>(p_func->arguments[0])->name.string();
+	StringName rname = static_cast<VariableNode *>(p_func->arguments[0])->rname.string();
 
 	for (int i = 1; i < p_func->arguments.size(); i++) {
 		args.push_back(p_func->arguments[i]->get_datatype());
@@ -5422,7 +5427,7 @@ bool ShaderLanguage::_get_completable_identifier(BlockNode *p_block, CompletionT
 		tk = _get_token();
 
 		if (tk.type == TK_IDENTIFIER) {
-			identifier = identifier.operator String() + tk.text.operator String();
+			identifier = identifier.string() + tk.text.string();
 		} else {
 			_set_tkpos(pos);
 		}
@@ -7753,6 +7758,7 @@ ShaderLanguage::Node *ShaderLanguage::_parse_expression(BlockNode *p_block, cons
 					_set_error(vformat(RTR("Invalid arguments to unary operator '%s': %s."), get_operator_text(op->op), at));
 					return nullptr;
 				}
+				expression.write[i].node = _reduce_expression(p_block, expression.write[i].node);
 				expression.remove_at(i + 1);
 			}
 
@@ -9926,6 +9932,9 @@ Error ShaderLanguage::_parse_shader(const HashMap<StringName, FunctionInfo> &p_f
 								} break;
 								case TK_HINT_ANISOTROPY_TEXTURE: {
 									new_hint = ShaderNode::Uniform::HINT_ANISOTROPY;
+								} break;
+								case TK_HINT_ALPHA_TEXTURE: {
+									new_hint = ShaderNode::Uniform::HINT_ALPHA;
 								} break;
 								case TK_HINT_RANGE: {
 									if (type != TYPE_FLOAT && type != TYPE_INT) {

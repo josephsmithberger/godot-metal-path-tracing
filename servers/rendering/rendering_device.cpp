@@ -272,9 +272,7 @@ Error RenderingDevice::_acceleration_structure_scratch_buffer_create(Acceleratio
 		p_acceleration_structure->scratch_buffer = driver->buffer_create(scratch_size, RDD::BUFFER_USAGE_STORAGE_BIT | RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT, RDD::MEMORY_ALLOCATION_TYPE_GPU, frames_drawn);
 		ERR_FAIL_COND_V(!p_acceleration_structure->scratch_buffer, ERR_CANT_CREATE);
 
-		_THREAD_SAFE_LOCK_
-		buffer_memory += scratch_size;
-		_THREAD_SAFE_UNLOCK_
+		buffer_memory.add(scratch_size);
 	}
 
 	return OK;
@@ -622,9 +620,7 @@ Error RenderingDevice::tlas_build(RID p_tlas, Span<AccelerationStructureInstance
 			ERR_FAIL_V(ERR_CANT_CREATE);
 		}
 
-		_THREAD_SAFE_LOCK_
-		buffer_memory += instance_buffer_size;
-		_THREAD_SAFE_UNLOCK_
+		buffer_memory.add(instance_buffer_size);
 
 		AccelerationStructure::InstanceBuffer instance_buffer;
 		instance_buffer.driver_id = instance_buffer_driver_id;
@@ -762,9 +758,7 @@ Error RenderingDevice::blas_compact(RID p_source, RID p_destination) {
 RDD::BufferID RenderingDevice::_hit_sbt_buffer_create(uint32_t p_buffer_size) {
 	RDD::BufferID buffer = driver->buffer_create(p_buffer_size, RDD::BUFFER_USAGE_TRANSFER_TO_BIT | RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT | RDD::BUFFER_USAGE_SHADER_BINDING_TABLE_BIT, RDD::MEMORY_ALLOCATION_TYPE_GPU, frames_drawn);
 	if (buffer) {
-		_THREAD_SAFE_LOCK_
-		buffer_memory += p_buffer_size;
-		_THREAD_SAFE_UNLOCK_
+		buffer_memory.add(p_buffer_size);
 	}
 
 	return buffer;
@@ -1674,9 +1668,7 @@ RID RenderingDevice::storage_buffer_create(uint32_t p_size_bytes, Span<uint8_t> 
 		_buffer_initialize(&buffer, p_data);
 	}
 
-	_THREAD_SAFE_LOCK_
-	buffer_memory += buffer.size;
-	_THREAD_SAFE_UNLOCK_
+	buffer_memory.add(buffer.size);
 
 	RID id = storage_buffer_owner.make_rid(buffer);
 #ifdef DEV_ENABLED
@@ -1714,9 +1706,7 @@ RID RenderingDevice::texture_buffer_create(uint32_t p_size_elements, DataFormat 
 		_buffer_initialize(&texture_buffer, p_data);
 	}
 
-	_THREAD_SAFE_LOCK_
-	buffer_memory += size_bytes;
-	_THREAD_SAFE_UNLOCK_
+	buffer_memory.add(size_bytes);
 
 	RID id = texture_buffer_owner.make_rid(texture_buffer);
 #ifdef DEV_ENABLED
@@ -1927,7 +1917,7 @@ RID RenderingDevice::texture_create(const TextureFormat &p_format, const Texture
 		_texture_make_mutable(&texture, RID());
 	}
 
-	texture_memory += driver->texture_get_allocation_size(texture.driver_id);
+	texture_memory.add(driver->texture_get_allocation_size(texture.driver_id));
 
 	RID id = texture_owner.make_rid(texture);
 #ifdef DEV_ENABLED
@@ -2001,7 +1991,7 @@ RID RenderingDevice::texture_create_shared(const TextureView &p_view, RID p_with
 
 		texture.shared_fallback->texture = driver->texture_create(alias_format, tv);
 		texture.shared_fallback->raw_reinterpretation = raw_reintepretation;
-		texture_memory += driver->texture_get_allocation_size(texture.shared_fallback->texture);
+		texture_memory.add(driver->texture_get_allocation_size(texture.shared_fallback->texture));
 
 		RDG::ResourceTracker *tracker = RDG::resource_tracker_create();
 		tracker->texture_driver_id = texture.shared_fallback->texture;
@@ -2181,7 +2171,7 @@ RID RenderingDevice::texture_create_shared_from_slice(const TextureView &p_view,
 
 		texture.shared_fallback->texture = driver->texture_create(slice_format, tv);
 		texture.shared_fallback->raw_reinterpretation = raw_reintepretation;
-		texture_memory += driver->texture_get_allocation_size(texture.shared_fallback->texture);
+		texture_memory.add(driver->texture_get_allocation_size(texture.shared_fallback->texture));
 
 		RDG::ResourceTracker *tracker = RDG::resource_tracker_create();
 		tracker->texture_driver_id = texture.shared_fallback->texture;
@@ -2316,7 +2306,6 @@ Error RenderingDevice::_texture_initialize(RID p_texture, uint32_t p_layer, cons
 	get_compressed_image_format_block_dimensions(texture->format, block_w, block_h);
 
 	uint32_t pixel_size = get_image_format_pixel_size(texture->format);
-	uint32_t pixel_rshift = get_compressed_image_format_pixel_rshift(texture->format);
 	uint32_t block_size = get_compressed_image_format_block_byte_size(texture->format);
 
 	// The algorithm operates on two passes, one to figure out the total size the staging buffer will require to allocate and another one where the copy is actually performed.
@@ -2374,11 +2363,10 @@ Error RenderingDevice::_texture_initialize(RID p_texture, uint32_t p_layer, cons
 					}
 				}
 
-				uint32_t pitch = (width * pixel_size * block_w) >> pixel_rshift;
+				uint32_t pitch = get_compressed_image_format_pixels_shifted(texture->format, width * pixel_size * block_w);
 				uint32_t pitch_step = driver->api_trait_get(RDD::API_TRAIT_TEXTURE_DATA_ROW_PITCH_STEP);
 				pitch = STEPIFY(pitch, pitch_step);
-				uint32_t to_allocate = pitch * height;
-				to_allocate >>= pixel_rshift;
+				uint32_t to_allocate = get_compressed_image_format_pixels_shifted(texture->format, pitch * height);
 
 				if (copy_pass) {
 					const uint8_t *read_ptr_mipmap_layer = read_ptr_mipmap + (tight_mip_size / depth) * z;
@@ -2476,7 +2464,6 @@ Error RenderingDevice::texture_update(RID p_texture, uint32_t p_layer, const Vec
 	get_compressed_image_format_block_dimensions(texture->format, block_w, block_h);
 
 	uint32_t pixel_size = get_image_format_pixel_size(texture->format);
-	uint32_t pixel_rshift = get_compressed_image_format_pixel_rshift(texture->format);
 	uint32_t block_size = get_compressed_image_format_block_byte_size(texture->format);
 
 	uint32_t region_size = texture_upload_region_size_px;
@@ -2511,7 +2498,7 @@ Error RenderingDevice::texture_update(RID p_texture, uint32_t p_layer, const Vec
 					uint32_t region_logic_w = MIN(region_size, logic_width - x);
 					uint32_t region_logic_h = MIN(region_size, logic_height - y);
 
-					uint32_t region_pitch = (region_w * pixel_size * block_w) >> pixel_rshift;
+					uint32_t region_pitch = get_compressed_image_format_pixels_shifted(texture->format, region_w * pixel_size * block_w);
 					uint32_t pitch_step = driver->api_trait_get(RDD::API_TRAIT_TEXTURE_DATA_ROW_PITCH_STEP);
 					region_pitch = STEPIFY(region_pitch, pitch_step);
 					uint32_t to_allocate = region_pitch * region_h;
@@ -2614,12 +2601,12 @@ void RenderingDevice::_texture_free_shared_fallback(Texture *p_texture) {
 		}
 
 		if (p_texture->shared_fallback->texture.id != 0) {
-			texture_memory -= driver->texture_get_allocation_size(p_texture->shared_fallback->texture);
+			texture_memory.sub(driver->texture_get_allocation_size(p_texture->shared_fallback->texture));
 			driver->texture_free(p_texture->shared_fallback->texture);
 		}
 
 		if (p_texture->shared_fallback->buffer.id != 0) {
-			buffer_memory -= driver->buffer_get_allocation_size(p_texture->shared_fallback->buffer);
+			buffer_memory.sub(driver->buffer_get_allocation_size(p_texture->shared_fallback->buffer));
 			driver->buffer_free(p_texture->shared_fallback->buffer);
 		}
 
@@ -2754,7 +2741,7 @@ void RenderingDevice::_texture_create_reinterpret_buffer(Texture *p_texture) {
 	uint32_t row_pitch = STEPIFY(p_texture->width * pixel_bytes, row_pitch_step);
 	uint64_t buffer_size = STEPIFY(pixel_bytes * row_pitch * p_texture->height * p_texture->depth, transfer_alignment);
 	p_texture->shared_fallback->buffer = driver->buffer_create(buffer_size, RDD::BUFFER_USAGE_TRANSFER_FROM_BIT | RDD::BUFFER_USAGE_TRANSFER_TO_BIT, RDD::MEMORY_ALLOCATION_TYPE_GPU, frames_drawn);
-	buffer_memory += driver->buffer_get_allocation_size(p_texture->shared_fallback->buffer);
+	buffer_memory.add(driver->buffer_get_allocation_size(p_texture->shared_fallback->buffer));
 
 	RDG::ResourceTracker *tracker = RDG::resource_tracker_create();
 	tracker->buffer_driver_id = p_texture->shared_fallback->buffer;
@@ -3005,10 +2992,8 @@ Error RenderingDevice::texture_get_data_async(RID p_texture, uint32_t p_layer, c
 	uint32_t block_w, block_h;
 	get_compressed_image_format_block_dimensions(tex->format, block_w, block_h);
 
-	uint32_t pixel_size = get_image_format_pixel_size(tex->format);
-	uint32_t pixel_rshift = get_compressed_image_format_pixel_rshift(tex->format);
-
 	uint32_t w, h, d;
+	uint32_t pixel_size = get_image_format_pixel_size(tex->format);
 	uint32_t required_align = driver->api_trait_get(RDD::API_TRAIT_TEXTURE_TRANSFER_ALIGNMENT);
 	uint32_t pitch_step = driver->api_trait_get(RDD::API_TRAIT_TEXTURE_DATA_ROW_PITCH_STEP);
 	uint32_t region_size = texture_download_region_size_px;
@@ -3031,7 +3016,7 @@ Error RenderingDevice::texture_get_data_async(RID p_texture, uint32_t p_layer, c
 
 					uint32_t region_logic_w = MIN(region_size, logic_w - x);
 					uint32_t region_logic_h = MIN(region_size, logic_h - y);
-					uint32_t region_pitch = (region_w * pixel_size * block_w) >> pixel_rshift;
+					uint32_t region_pitch = get_compressed_image_format_pixels_shifted(tex->format, region_w * pixel_size * block_w);
 					region_pitch = STEPIFY(region_pitch, pitch_step);
 
 					uint32_t to_allocate = region_pitch * region_h;
@@ -4040,9 +4025,7 @@ RID RenderingDevice::vertex_buffer_create(uint32_t p_size_bytes, Span<uint8_t> p
 		_buffer_initialize(&buffer, p_data);
 	}
 
-	_THREAD_SAFE_LOCK_
-	buffer_memory += buffer.size;
-	_THREAD_SAFE_UNLOCK_
+	buffer_memory.add(buffer.size);
 
 	RID id = vertex_buffer_owner.make_rid(buffer);
 #ifdef DEV_ENABLED
@@ -4257,9 +4240,7 @@ RID RenderingDevice::index_buffer_create(uint32_t p_index_count, IndexBufferForm
 		_buffer_initialize(&index_buffer, p_data);
 	}
 
-	_THREAD_SAFE_LOCK_
-	buffer_memory += index_buffer.size;
-	_THREAD_SAFE_UNLOCK_
+	buffer_memory.add(index_buffer.size);
 
 	RID id = index_buffer_owner.make_rid(index_buffer);
 #ifdef DEV_ENABLED
@@ -4354,8 +4335,6 @@ RID RenderingDevice::shader_create_from_bytecode(const Vector<uint8_t> &p_shader
 }
 
 RID RenderingDevice::shader_create_from_bytecode_with_samplers(const Vector<uint8_t> &p_shader_binary, RID p_placeholder, const Vector<PipelineImmutableSampler> &p_immutable_samplers) {
-	_THREAD_SAFE_METHOD_
-
 	Ref<RenderingShaderContainer> shader_container = driver->get_shader_container_format().create_container();
 	ERR_FAIL_COND_V(shader_container.is_null(), RID());
 
@@ -4378,6 +4357,8 @@ RID RenderingDevice::shader_create_from_bytecode_with_samplers(const Vector<uint
 
 	RDD::ShaderID shader_id = driver->shader_create_from_container(shader_container, driver_immutable_samplers);
 	ERR_FAIL_COND_V(!shader_id, RID());
+
+	_THREAD_SAFE_METHOD_
 
 	// All good, let's create modules.
 
@@ -4511,9 +4492,7 @@ RID RenderingDevice::uniform_buffer_create(uint32_t p_size_bytes, Span<uint8_t> 
 		_buffer_initialize(&buffer, p_data);
 	}
 
-	_THREAD_SAFE_LOCK_
-	buffer_memory += buffer.size;
-	_THREAD_SAFE_UNLOCK_
+	buffer_memory.add(buffer.size);
 
 	RID id = uniform_buffer_owner.make_rid(buffer);
 #ifdef DEV_ENABLED
@@ -4638,6 +4617,9 @@ RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniform
 					Texture *texture = texture_owner.get_or_null(texture_id);
 					ERR_FAIL_NULL_V_MSG(texture, RID(), "Texture (binding: " + itos(uniform.binding) + ", index " + itos(j) + ") is not a valid texture.");
 
+					ERR_FAIL_COND_V_MSG(texture->type != set_uniform.texture_type, RID(),
+							"Texture (binding: " + itos(uniform.binding) + ", index " + itos(j) + ") needs to have the same type as the uniform.");
+
 					ERR_FAIL_COND_V_MSG(!(texture->usage_flags & TEXTURE_USAGE_SAMPLING_BIT), RID(),
 							"Texture (binding: " + itos(uniform.binding) + ", index " + itos(j) + ") needs the TEXTURE_USAGE_SAMPLING_BIT usage flag set in order to be used as uniform.");
 
@@ -4689,6 +4671,9 @@ RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniform
 					Texture *texture = texture_owner.get_or_null(texture_id);
 					ERR_FAIL_NULL_V_MSG(texture, RID(), "Texture (binding: " + itos(uniform.binding) + ", index " + itos(j) + ") is not a valid texture.");
 
+					ERR_FAIL_COND_V_MSG(texture->type != set_uniform.texture_type, RID(),
+							"Texture (binding: " + itos(uniform.binding) + ", index " + itos(j) + ") needs to have the same type as the uniform.");
+
 					ERR_FAIL_COND_V_MSG(!(texture->usage_flags & TEXTURE_USAGE_SAMPLING_BIT), RID(),
 							"Texture (binding: " + itos(uniform.binding) + ", index " + itos(j) + ") needs the TEXTURE_USAGE_SAMPLING_BIT usage flag set in order to be used as uniform.");
 
@@ -4739,6 +4724,13 @@ RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniform
 
 					ERR_FAIL_NULL_V_MSG(texture, RID(),
 							"Image (binding: " + itos(uniform.binding) + ", index " + itos(j) + ") is not a valid texture.");
+
+					ERR_FAIL_COND_V_MSG(texture->type != set_uniform.texture_type, RID(),
+							"Image (binding: " + itos(uniform.binding) + ", index " + itos(j) + ") needs to have the same texture type as the uniform.");
+
+					if (likely(set_uniform.texture_format != RD::DATA_FORMAT_MAX) && unlikely(texture->format != set_uniform.texture_format)) {
+						print_verbose("Image (binding: " + itos(uniform.binding) + ", index " + itos(j) + ") needs to have the same texture format as the uniform (expected: " + String(FORMAT_NAMES[set_uniform.texture_format]) + ", actual: " + String(FORMAT_NAMES[texture->format]) + ").");
+					}
 
 					ERR_FAIL_COND_V_MSG(!(texture->usage_flags & TEXTURE_USAGE_STORAGE_BIT), RID(),
 							"Image (binding: " + itos(uniform.binding) + ", index " + itos(j) + ") needs the TEXTURE_USAGE_STORAGE_BIT usage flag set in order to be used as uniform.");
@@ -5143,6 +5135,12 @@ RID RenderingDevice::render_pipeline_create(RID p_shader, FramebufferFormatID p_
 			fb_format.render_pass,
 			p_for_render_pass,
 			p_specialization_constants);
+
+	// Don't print error when it's expected.
+	if (unlikely(!pipeline.driver_id && driver->get_driver_workarounds().dont_print_on_render_pipeline_creation_failure)) {
+		return RID();
+	}
+
 	ERR_FAIL_COND_V(!pipeline.driver_id, RID());
 
 	if (pipeline_cache_enabled) {
@@ -5318,9 +5316,7 @@ Error RenderingDevice::_raytracing_pipeline_create_sbt_buffer(RDD::RaytracingPip
 		ERR_FAIL_V(err);
 	}
 
-	_THREAD_SAFE_LOCK_
-	buffer_memory += r_sbt_buffer.size;
-	_THREAD_SAFE_UNLOCK_
+	buffer_memory.add(r_sbt_buffer.size);
 
 	return OK;
 }
@@ -8165,7 +8161,7 @@ void RenderingDevice::_free_pending_resources(int p_frame) {
 		RaytracingPipeline *pipeline = &frames[p_frame].raytracing_pipelines_to_dispose_of.front()->get();
 
 		driver->buffer_free(pipeline->sbt_buffer.driver_id);
-		buffer_memory -= pipeline->sbt_buffer.size;
+		buffer_memory.sub(pipeline->sbt_buffer.size);
 
 		driver->raytracing_pipeline_free(pipeline->driver_id);
 
@@ -8179,11 +8175,7 @@ void RenderingDevice::_free_pending_resources(int p_frame) {
 		driver->acceleration_structure_free(acceleration_structure.driver_id);
 
 		if (acceleration_structure.scratch_buffer) {
-			size_t scratch_size = driver->buffer_get_allocation_size(acceleration_structure.scratch_buffer);
-			_THREAD_SAFE_LOCK_
-			buffer_memory -= scratch_size;
-			_THREAD_SAFE_UNLOCK_
-
+			buffer_memory.sub(driver->buffer_get_allocation_size(acceleration_structure.scratch_buffer));
 			driver->buffer_free(acceleration_structure.scratch_buffer);
 		}
 
@@ -8194,9 +8186,7 @@ void RenderingDevice::_free_pending_resources(int p_frame) {
 				driver->buffer_free(instance_buffer.driver_id);
 			}
 
-			_THREAD_SAFE_LOCK_
-			buffer_memory -= instance_buffer_size * acceleration_structure.instance_buffers.size();
-			_THREAD_SAFE_UNLOCK_
+			buffer_memory.sub(instance_buffer_size * acceleration_structure.instance_buffers.size());
 		}
 
 		frames[p_frame].acceleration_structures_to_dispose_of.pop_front();
@@ -8245,7 +8235,7 @@ void RenderingDevice::_free_pending_resources(int p_frame) {
 
 		_texture_free_shared_fallback(texture);
 
-		texture_memory -= driver->texture_get_allocation_size(texture->driver_id);
+		texture_memory.sub(driver->texture_get_allocation_size(texture->driver_id));
 		driver->texture_free(texture->driver_id);
 
 		frames[p_frame].textures_to_dispose_of.pop_front();
@@ -8255,7 +8245,7 @@ void RenderingDevice::_free_pending_resources(int p_frame) {
 	while (frames[p_frame].buffers_to_dispose_of.front()) {
 		Buffer &buffer = frames[p_frame].buffers_to_dispose_of.front()->get();
 		driver->buffer_free(buffer.driver_id);
-		buffer_memory -= buffer.size;
+		buffer_memory.sub(buffer.size);
 
 		frames[p_frame].buffers_to_dispose_of.pop_front();
 	}
@@ -8272,10 +8262,10 @@ uint32_t RenderingDevice::get_frame_delay() const {
 uint64_t RenderingDevice::get_memory_usage(MemoryType p_type) const {
 	switch (p_type) {
 		case MEMORY_BUFFERS: {
-			return buffer_memory;
+			return buffer_memory.get();
 		}
 		case MEMORY_TEXTURES: {
-			return texture_memory;
+			return texture_memory.get();
 		}
 		case MEMORY_TOTAL: {
 			return driver->get_total_memory_used();

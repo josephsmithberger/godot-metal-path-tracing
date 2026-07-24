@@ -31,6 +31,7 @@
 #include "servers/rendering/renderer_rd/forward_clustered/pathtracing_presentation.h"
 #include "servers/rendering/renderer_rd/forward_clustered/render_raytracing.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h"
+#include "servers/rendering/storage/environment_storage.h"
 #include "tests/test_macros.h"
 
 #include <cstddef>
@@ -101,18 +102,20 @@ TEST_CASE("[MetalRT] PRESENTATION keeps NVIDIA SER disabled on the Metal compute
 }
 
 TEST_CASE("[MetalRT] MetalFX denoising enables path-tracing guide output") {
-	float params[16] = {};
-	params[RSE::PT_PARAM_SAMPLE_COUNT] = 1.0f;
-	params[RSE::PT_PARAM_MAX_BOUNCES] = 1.0f;
-	params[RSE::PT_PARAM_DENOISER] = (float)RSE::PT_DENOISER_METALFX;
+	RendererEnvironmentStorage *environment_storage = RendererEnvironmentStorage::get_singleton();
+	REQUIRE(environment_storage != nullptr);
+	RID environment = environment_storage->environment_allocate();
+	environment_storage->environment_initialize(environment);
+	environment_storage->environment_set_pathtracing(environment, true, 0, 1, 1, RSE::PT_DENOISER_METALFX);
 
-	uint32_t flags = SceneShader::compute_rt_flags(params, false);
+	uint32_t flags = SceneShader::compute_rt_flags(environment, false);
 	CHECK((flags & SceneShader::RT_FLAG_DENOISER_GUIDES_ENABLED) != 0);
 	CHECK((SceneShader::sanitize_compute_rt_flags(flags) & SceneShader::RT_FLAG_DENOISER_GUIDES_ENABLED) != 0);
 
-	params[RSE::PT_PARAM_DENOISER] = (float)RSE::PT_DENOISER_NONE;
-	flags = SceneShader::compute_rt_flags(params, false);
+	environment_storage->environment_set_pathtracing(environment, true, 0, 1, 1, RSE::PT_DENOISER_NONE);
+	flags = SceneShader::compute_rt_flags(environment, false);
 	CHECK((flags & SceneShader::RT_FLAG_DENOISER_GUIDES_ENABLED) == 0);
+	environment_storage->environment_free(environment);
 }
 
 TEST_CASE("[MetalRT] SCENE_GEOMETRY preserves front-face winding across mirrored transforms") {

@@ -461,6 +461,7 @@ struct RTViewportState {
 
 	RID light_buffer;
 	RID params_buffer;
+	RID scene_uniform_set;
 
 	// Traversal aggregates for the instance table uploaded by the last
 	// finalize_buffers(). They select all-opaque or mixed native Metal lanes for
@@ -478,6 +479,7 @@ struct RTViewportState {
 
 class RenderRaytracing {
 	friend class RenderForwardClustered;
+	friend class RenderForwardClusteredPT;
 
 	RenderForwardClustered *owner = nullptr;
 	SceneShaderRaytracing *shader = nullptr;
@@ -635,6 +637,25 @@ public:
 
 	void copy_output_texture(const RenderDataRD *p_render_data);
 	void free_viewport_state(RenderSceneBuffersRD *p_render_buffers);
+
+	// Raytracing output textures (stored on the render buffers via named scopes).
+	void rt_ensure_textures(RenderSceneBuffersRD *p_render_buffers);
+	bool rt_has_texture(RenderSceneBuffersRD *p_render_buffers) const;
+	RID rt_get_texture(RenderSceneBuffersRD *p_render_buffers) const;
+	bool rt_has_depth_texture(RenderSceneBuffersRD *p_render_buffers) const;
+	RID rt_get_depth_texture(RenderSceneBuffersRD *p_render_buffers) const;
+
+	// DLSS Ray Reconstruction guide buffers (stored on the render buffers).
+	void dlss_rr_ensure_buffers(RenderSceneBuffersRD *p_render_buffers);
+	void dlss_rr_free_buffers(RenderSceneBuffersRD *p_render_buffers);
+	bool dlss_rr_has_buffers(RenderSceneBuffersRD *p_render_buffers) const;
+	RID dlss_rr_get_diffuse_albedo(RenderSceneBuffersRD *p_render_buffers) const;
+	RID dlss_rr_get_specular_albedo(RenderSceneBuffersRD *p_render_buffers) const;
+	RID dlss_rr_get_normal_roughness(RenderSceneBuffersRD *p_render_buffers) const;
+	RID dlss_rr_get_roughness(RenderSceneBuffersRD *p_render_buffers) const;
+	RID dlss_rr_get_specular_hit_dist(RenderSceneBuffersRD *p_render_buffers) const;
+	RID dlss_rr_get_denoise_strength(RenderSceneBuffersRD *p_render_buffers) const;
+	RID dlss_rr_get_transparency_overlay(RenderSceneBuffersRD *p_render_buffers) const;
 
 	void register_raytracing_buffer_dependencies(RD::RaytracingListID p_list);
 

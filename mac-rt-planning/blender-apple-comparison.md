@@ -23,7 +23,7 @@ remain declared-but-pending in the traversal registry.
   `compute_variant_cache` with bundle+task refcounts, so the ALL_OPAQUE
   rt_flags bundle reuses the base bundle's kernel instead of recompiling it.
   The HG0 bootstrap stays synchronous (`_build_compute_bundle` builds the
-  generic template pipeline only). `rendering/pathtracer/async_shader_compilation=false`
+  generic template pipeline only). `rendering/pathtracing/async_shader_compilation=false`
   preserves the fully synchronous single-frame behavior.
 - **P2 — implemented.** Full copy-and-compact lifecycle for immutable BLASes.
   Driver: `MDAccelerationStructure::encode_build` now writes the compacted

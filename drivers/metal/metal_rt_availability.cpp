@@ -104,7 +104,7 @@ String MetalRTGateResult::get_reason_codes() const {
 String MetalRTGateResult::get_description() const {
 	Vector<String> reasons;
 	if (blockers & METAL_RT_BLOCKER_PROJECT_DISABLED) {
-		reasons.push_back("the project setting rendering/pathtracer/metal_ray_query_backend is false");
+		reasons.push_back("the project setting rendering/pathtracing/metal_ray_query_backend is false");
 	}
 	if (blockers & METAL_RT_BLOCKER_FORCED_DISABLED) {
 		reasons.push_back("GODOT_MTL_DISABLE_RAYTRACING=1");

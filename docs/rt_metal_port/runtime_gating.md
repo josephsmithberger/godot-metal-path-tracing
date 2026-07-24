@@ -23,7 +23,7 @@ The gate requires all of the following:
 | Requirement | Engine check | Why it is required |
 |---|---|---|
 | Platform scope | macOS arm64 Metal driver | C1 shipping scope; other Apple platforms remain unvalidated |
-| Project opt-in | `rendering/pathtracer/metal_ray_query_backend` (default `true`) | Provides a restart-time escape hatch |
+| Project opt-in | `rendering/pathtracing/metal_ray_query_backend` (default `true`) | Provides a restart-time escape hatch |
 | No forced disable | `GODOT_MTL_DISABLE_RAYTRACING` is not `1` | Makes the fallback deterministic and automation-friendly |
 | Native RT | `supportsRaytracing` | Acceleration structures and compute intersector |
 | Function pointers | `supportsFunctionPointers` | Full mapped pipeline/function-table resource contract |

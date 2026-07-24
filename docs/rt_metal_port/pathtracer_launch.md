@@ -69,7 +69,7 @@ globally and no per-dispatch call is issued.
 
 C11 replaced the default-off debug exposure with the capability gate documented
 in [`runtime_gating.md`](runtime_gating.md).
-`rendering/pathtracer/metal_ray_query_backend` now defaults on, but the Metal
+`rendering/pathtracing/metal_ray_query_backend` now defaults on, but the Metal
 driver reports `SUPPORTS_RAY_QUERY` only when every compute-lane and bindless
 requirement is available. `SUPPORTS_RAYTRACING_PIPELINE` stays false. C13 gives
 `SceneShaderRaytracing` a separate compute bundle and enables the scene route

@@ -1190,6 +1190,14 @@ bool Viewport::_set_size(const Size2i &p_size, const int p_view_count, const Siz
 	Rect2i limit = get_visible_rect();
 	for (int i = 0; i < gui.sub_windows.size(); ++i) {
 		Window *sw = gui.sub_windows[i].window;
+#ifdef TOOLS_ENABLED
+		if (!is_part_of_edited_scene() && sw->is_part_of_edited_scene()) {
+			continue;
+		}
+#endif
+		if (!sw->is_clamped_to_embedder()) {
+			continue;
+		}
 		Rect2i rect = Rect2i(sw->position, sw->size);
 		Rect2i new_rect = sw->fit_rect_in_parent(rect, limit);
 		if (new_rect != rect) {
@@ -5388,9 +5396,9 @@ void Viewport::_bind_methods() {
 	ADD_GROUP("Scaling 3D", "");
 	{
 #if defined(MACOS_ENABLED) || defined(IOS_ENABLED)
-		const char *scaling_3d_hint = "Nearest (Fastest):6,Bilinear (Fastest):0,FSR 1.0 (Fast):1,FSR 2.2 (Slow):2,MetalFX (Spatial - Fast):3,MetalFX (Temporal - Slow):4";
+		const char *scaling_3d_hint = "Nearest (Fastest):5,Bilinear (Fastest):0,FSR 1.0 (Fast):1,FSR 2.2 (Slow):2,MetalFX (Spatial - Fast):3,MetalFX (Temporal - Slow):4";
 #else
-		const char *scaling_3d_hint = "Nearest (Fastest):6,Bilinear (Fastest):0,FSR 1.0 (Fast):1,FSR 2.2 (Slow):2,NVIDIA DLSS (Temporal):5";
+		const char *scaling_3d_hint = "Nearest (Fastest):5,Bilinear (Fastest):0,FSR 1.0 (Fast):1,FSR 2.2 (Slow):2,NVIDIA DLSS (Temporal):6";
 #endif
 		ADD_PROPERTY(PropertyInfo(Variant::INT, "scaling_3d_mode", PROPERTY_HINT_ENUM, scaling_3d_hint), "set_scaling_3d_mode", "get_scaling_3d_mode");
 	}
@@ -5457,8 +5465,8 @@ void Viewport::_bind_methods() {
 	BIND_ENUM_CONSTANT(SCALING_3D_MODE_FSR2);
 	BIND_ENUM_CONSTANT(SCALING_3D_MODE_METALFX_SPATIAL);
 	BIND_ENUM_CONSTANT(SCALING_3D_MODE_METALFX_TEMPORAL);
-	BIND_ENUM_CONSTANT(SCALING_3D_MODE_DLSS);
 	BIND_ENUM_CONSTANT(SCALING_3D_MODE_NEAREST);
+	BIND_ENUM_CONSTANT(SCALING_3D_MODE_DLSS);
 	BIND_ENUM_CONSTANT(SCALING_3D_MODE_MAX);
 
 	BIND_ENUM_CONSTANT(MSAA_DISABLED);

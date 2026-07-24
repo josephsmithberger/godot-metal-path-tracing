@@ -681,7 +681,6 @@ Vector<uint8_t> RenderingDeviceDriverMetal::texture_get_data(TextureID p_texture
 	image_data.resize(tight_mip_size);
 
 	uint32_t pixel_size = get_image_format_pixel_size(tex_format);
-	uint32_t pixel_rshift = get_compressed_image_format_pixel_rshift(tex_format);
 	uint32_t blockw = 0, blockh = 0;
 	get_compressed_image_format_block_dimensions(tex_format, blockw, blockh);
 
@@ -691,7 +690,7 @@ Vector<uint8_t> RenderingDeviceDriverMetal::texture_get_data(TextureID p_texture
 		uint32_t bw = STEPIFY(tex_w, blockw);
 		uint32_t bh = STEPIFY(tex_h, blockh);
 
-		uint32_t bytes_per_row = (bw * pixel_size) >> pixel_rshift;
+		uint32_t bytes_per_row = get_compressed_image_format_pixels_shifted(tex_format, bw * pixel_size);
 		uint32_t bytes_per_img = bytes_per_row * bh;
 		uint32_t mip_size = bytes_per_img * tex_d;
 
@@ -3342,8 +3341,8 @@ bool RenderingDeviceDriverMetal::_is_metal_rt_enabled() {
 
 	bool project_enabled = true;
 	ProjectSettings *project_settings = ProjectSettings::get_singleton();
-	if (project_settings != nullptr && project_settings->has_setting("rendering/pathtracer/metal_ray_query_backend")) {
-		project_enabled = GLOBAL_GET("rendering/pathtracer/metal_ray_query_backend");
+	if (project_settings != nullptr && project_settings->has_setting("rendering/pathtracing/metal_ray_query_backend")) {
+		project_enabled = GLOBAL_GET("rendering/pathtracing/metal_ray_query_backend");
 	}
 
 	const MetalFeatures &features = device_properties->features;

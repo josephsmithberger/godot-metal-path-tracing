@@ -1060,6 +1060,7 @@ public:
 	// Driver workarounds that require higher level code and cannot be solely implemented in RenderingDeviceDriver.
 	struct DriverWorkarounds {
 		bool avoid_compute_after_draw = false;
+		bool dont_print_on_render_pipeline_creation_failure = false;
 		bool disable_ubershaders = false;
 	};
 
@@ -1085,7 +1086,7 @@ protected:
 
 	static void get_compressed_image_format_block_dimensions(DataFormat p_format, uint32_t &r_w, uint32_t &r_h);
 	uint32_t get_compressed_image_format_block_byte_size(DataFormat p_format) const;
-	static uint32_t get_compressed_image_format_pixel_rshift(DataFormat p_format);
+	static uint32_t get_compressed_image_format_pixels_shifted(DataFormat p_format, uint32_t p_pixels);
 	static uint32_t get_image_format_required_size(DataFormat p_format, uint32_t p_width, uint32_t p_height, uint32_t p_depth, uint32_t p_mipmaps, uint32_t *r_blockw = nullptr, uint32_t *r_blockh = nullptr, uint32_t *r_depth = nullptr);
 	static uint32_t get_image_required_mipmaps(uint32_t p_width, uint32_t p_height, uint32_t p_depth);
 	static bool format_has_depth(DataFormat p_format);
@@ -1124,6 +1125,8 @@ public:
 		uint32_t binding = 0;
 		BitField<ShaderStage> stages = {};
 		uint32_t length = 0; // Size of arrays (in total elements), or ubos (in bytes * total elements). 0 if unbounded.
+		TextureType texture_type = TEXTURE_TYPE_MAX;
+		DataFormat texture_format = DATA_FORMAT_MAX;
 
 		bool operator!=(const ShaderUniform &p_other) const {
 			return binding != p_other.binding || type != p_other.type || writable != p_other.writable || unbounded != p_other.unbounded || stages != p_other.stages || length != p_other.length;
