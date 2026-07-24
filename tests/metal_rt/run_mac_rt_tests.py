@@ -32,6 +32,7 @@ VALID_STAGES = (
     "material-scene",
     "intersector-parity",
     "procedural-scene",
+    "raw-corruption",
     "fallback",
 )
 CAPS_PROBE_SOURCE = REPO_ROOT / "docs" / "rt_metal_port" / "capability_probe.mm"
@@ -47,6 +48,8 @@ MATERIAL_SCENE_VERIFY_SCRIPT = RUNTIME_GATE_PROJECT / "verify_material_scene.py"
 INTERSECTOR_PARITY_VERIFY_SCRIPT = RUNTIME_GATE_PROJECT / "verify_intersector_parity.py"
 PROCEDURAL_SCENE_FIXTURE = "res://fixtures/e3_procedural.tscn"
 PROCEDURAL_SCENE_VERIFY_SCRIPT = RUNTIME_GATE_PROJECT / "verify_procedural_scene.py"
+RAW_CORRUPTION_VERIFY_SCRIPT = RUNTIME_GATE_PROJECT / "verify_raw_corruption.py"
+BENCHMARK_PROJECT = REPO_ROOT / "benchmark"
 IMAGE_DIFF_SCRIPT = RUNTIME_GATE_PROJECT / "image_diff.py"
 IMAGE_DIFF_TEST_SCRIPT = RUNTIME_GATE_PROJECT / "test_image_diff.py"
 IMAGE_REFERENCE = RUNTIME_GATE_PROJECT / "references" / "pathtracer_launch_v1.png"
@@ -313,14 +316,14 @@ def make_commands(
                 [
                     sys.executable,
                     str(IMAGE_DIFF_SCRIPT),
-                    str(artifact_dir / "pathtracer_launch_gpu.png"),
+                    str(artifact_dir / "c10_pathtracer_launch_gpu.png"),
                     str(IMAGE_REFERENCE),
                     "--manifest",
                     str(IMAGE_REFERENCE_MANIFEST),
                     "--diff",
-                    str(artifact_dir / "pathtracer_launch_diff.png"),
+                    str(artifact_dir / "c10_pathtracer_launch_diff.png"),
                     "--metrics",
-                    str(artifact_dir / "pathtracer_launch_metrics.json"),
+                    str(artifact_dir / "c10_pathtracer_launch_metrics.json"),
                 ],
                 requires_passed=image_render_name,
                 preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
@@ -767,6 +770,25 @@ def make_commands(
                 ),
             ),
         ])
+
+    if "raw-corruption" in stages:
+        # Deliberately not wrapped in METAL_VALIDATION_ENVIRONMENT: shader
+        # validation perturbs register allocation enough to hide the Apple
+        # ray-query miscompile this stage exists to detect, which is why none of
+        # the validated stages above can serve as evidence against it.
+        commands.append(
+            command_record(
+                "raw-corruption",
+                [
+                    sys.executable,
+                    str(RAW_CORRUPTION_VERIFY_SCRIPT),
+                    str(binary),
+                    str(BENCHMARK_PROJECT),
+                ],
+                preset_skip_reason="unsupported_arch" if args.arch != "arm64" else None,
+                required_log_patterns=("METAL_RT_RAW_CORRUPTION=passed",),
+            )
+        )
 
     if "fallback" in stages:
         gate_command = [

@@ -274,6 +274,68 @@ spv::ExecutionModel map_stage(RDD::ShaderStage p_stage) {
 	return SHADER_STAGE_REMAP[p_stage];
 }
 
+// --- Apple Metal front-end ray-query miscompile workaround --------------------
+//
+// Apple's Metal compiler mis-codegens the path-tracing kernel when a second
+// intersection_query traversal is inlined into it: scattered output pixels come
+// back with exactly one color channel forced to 0.0 (finite, never NaN, and
+// masked entirely by MTL_SHADER_VALIDATION=1 -- the classic signature of a
+// register-allocation bug). Reported to Apple; unfixed as of Xcode 26.6.
+// Blender's Cycles Metal backend carries the same class of workaround
+// (kernel/integrator/mnee.h and kernel/util/image_3d.h both hard-code
+// __attribute__((noinline)) under __KERNEL_METAL__ for front-end codegen
+// bugs), so a narrow, documented inlining boundary is the accepted fix rather
+// than a stopgap.
+//
+// The boundary can only be expressed here, on the generated MSL. glslang
+// translates *every* rayQueryEXT variable to SPIRV StorageClass::Private
+// regardless of its GLSL scope (GlslangToSpv.cpp, TranslateStorageClass), and
+// SPIRV-Cross then hoists every Private ray query into the entry point and
+// threads it through the call graph as a `thread ...&` parameter
+// (spirv_msl.cpp, "Ray query accesses memory directly"). Declaring the query at
+// function scope in the GLSL produces byte-identical MSL, so the shader source
+// has no say in this and should stay written the natural way.
+
+// Rewrites `p_function`'s hoisted by-reference `p_query` parameter into a
+// function-local query, so the traversal state is register-allocated in the
+// callee instead of aliasing the entry point's frame. Returns true if applied.
+static bool _msl_localize_hoisted_query(std::string &r_source, const char *p_function, const char *p_query) {
+	size_t decl_pos = r_source.find(p_function);
+	if (decl_pos == std::string::npos) {
+		return false;
+	}
+	size_t body_pos = r_source.find(")\n{", decl_pos);
+	if (body_pos == std::string::npos) {
+		return false;
+	}
+	// The query may be the last parameter or an interior one; rename it wherever
+	// it sits in the list, then declare the local at the top of the body.
+	const std::string query_param = std::string("& ") + p_query;
+	size_t param_pos = r_source.find(query_param, decl_pos);
+	if (param_pos == std::string::npos || param_pos > body_pos) {
+		return false;
+	}
+	const std::string query_local = std::string("\n    raytracing::intersection_query<raytracing::instancing, raytracing::triangle_data> ") + p_query + ";";
+	r_source.insert(body_pos + 3, query_local);
+	r_source.insert(param_pos + query_param.size(), "_hoisted_unused");
+	return true;
+}
+
+// Replaces the SPIRV-Cross always_inline attribute on `p_function` with
+// noinline. `p_function` is matched as a prefix of the return type + name, so
+// the first definition whose name starts with it wins.
+static bool _msl_force_noinline(std::string &r_source, const char *p_function) {
+	static constexpr char always_inline_attr[] = "static inline __attribute__((always_inline))\n";
+	static constexpr char noinline_attr[] = "static __attribute__((noinline))\n";
+	const std::string inline_decl = std::string(always_inline_attr) + p_function;
+	size_t position = r_source.find(inline_decl);
+	if (position == std::string::npos) {
+		return false;
+	}
+	r_source.replace(position, inline_decl.size(), std::string(noinline_attr) + p_function);
+	return true;
+}
+
 MetalDeviceProfile::MinimumRequirements RenderingShaderContainerMetal::inspect_spirv(const ReflectShader &p_shader) {
 	// Scan SPIR-V for OpImageTexelPointer to detect image atomic usage and determine
 	// the minimum GPU family and MSL version required.
@@ -758,51 +820,50 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 			ERR_FAIL_V_MSG(false, "Failed to compile stage " + String(RDC::SHADER_STAGE_NAMES[stage]) + ": " + e.what());
 		}
 
-		// Apple's Metal compiler can corrupt radiance values when the shadow-ray
-		// intersection-query traversal is inlined into the path-tracing kernel.
-		// This occurs with either one shared intersection query or separate primary
-		// and shadow queries. Keep the shadow traversal behind a function boundary
-		// by default; shader validation masks the issue by changing register
-		// allocation. GODOT_MTL_RT_NOINLINE selects the boundary for controlled
-		// experiments: "shadow" (default) marks only trace_shadow_blocked noinline,
-		// "lights" restores the wider (slower) boundary around all direct lighting,
-		// "none" fully inlines (fastest, known to corrupt).
+		// Apply the ray-query miscompile boundary documented above.
+		//
+		// The default is "none" -- no boundary at all. The current generated
+		// kernel does not trigger the miscompile: measured on the same M5 /
+		// macOS 26.5.2 / Xcode 26.6 that produced the bug report, the raw
+		// single-zero-channel metric is 0 across 24 configurations (1/2/4 spp,
+		// 2/3 bounces, opaque and mixed-alpha, both traversal lanes), and a
+		// static-camera capture is pixel-identical with and without the
+		// boundary. The boundary is not free: it costs ~33% of the frame in
+		// mixed-alpha scenes (12.9 vs 19.3 fps on the benchmark orbit at
+		// 1080p/4spp/2bounce), because every shadow ray then pays a real call
+		// with SPIRV-Cross's full forwarded parameter list. All-opaque scenes on
+		// Apple9+ are unaffected either way; the query lane is dead-stripped
+		// there by the intersector specialization.
+		//
+		// The Apple bug is still unfixed, so this is a property of the current
+		// shader's register allocation rather than a resolution. The
+		// raw-corruption stage in tests/metal_rt/run_mac_rt_tests.py runs
+		// without shader validation specifically to catch a shader edit that
+		// re-triggers it; if it fires, GODOT_MTL_RT_NOINLINE=shadow restores the
+		// narrowest boundary that measured clean (the shadow traversal
+		// trace_shadow_blocked_query becomes a real call, matched by prefix, and
+		// its query becomes a local of the trace_shadow_blocked wrapper).
+		// "lights" is the wider, slower boundary around all of direct lighting.
+		// GODOT_MTL_RT_SHADOW_REF=1 keeps the shadow query hoisted by reference,
+		// and GODOT_MTL_RT_PRIMARY=local|noinline extends the same treatment to
+		// the primary traversal; both exist for A/B runs only.
 		if (source.find("raytracing::intersection_query") != std::string::npos) {
-			String noinline_mode = OS::get_singleton()->get_environment("GODOT_MTL_RT_NOINLINE");
-			if (noinline_mode.is_empty()) {
-				noinline_mode = "shadow";
-			}
-			static constexpr char always_inline_attr[] = "static inline __attribute__((always_inline))\n";
-			static constexpr char noinline_attr[] = "static __attribute__((noinline))\n";
-			const char *noinline_function = nullptr;
+			const String noinline_mode = OS::get_singleton()->get_environment("GODOT_MTL_RT_NOINLINE");
 			if (noinline_mode == "lights") {
-				noinline_function = "float3 lights_evaluate_direct_lighting";
+				_msl_force_noinline(source, "float3 lights_evaluate_direct_lighting");
 			} else if (noinline_mode == "shadow") {
-				noinline_function = "bool trace_shadow_blocked";
-			}
-			if (noinline_function != nullptr) {
-				std::string inline_decl = std::string(always_inline_attr) + noinline_function;
-				size_t position = source.find(inline_decl);
-				if (position != std::string::npos) {
-					source.replace(position, inline_decl.size(), std::string(noinline_attr) + noinline_function);
+				_msl_force_noinline(source, "bool trace_shadow_blocked");
+				if (OS::get_singleton()->get_environment("GODOT_MTL_RT_SHADOW_REF") != "1") {
+					_msl_localize_hoisted_query(source, "bool trace_shadow_blocked(", "shadow_query");
 				}
 			}
-			// In shadow mode, additionally turn the hoisted by-reference shadow
-			// query parameter into a function-local so the traversal state stays
-			// register-allocated inside the noinline callee instead of paying
-			// thread-memory traffic against main's frame.
-			if (noinline_mode == "shadow" && OS::get_singleton()->get_environment("GODOT_MTL_RT_SHADOW_REF") != "1") {
-				static constexpr char query_param[] = "& shadow_query)\n{";
-				static constexpr char query_local[] =
-						"& shadow_query_hoisted_unused)\n{\n"
-						"    raytracing::intersection_query<raytracing::instancing, raytracing::triangle_data> shadow_query;";
-				size_t decl_pos = source.find("bool trace_shadow_blocked(");
-				if (decl_pos != std::string::npos) {
-					size_t param_pos = source.find(query_param, decl_pos);
-					if (param_pos != std::string::npos) {
-						source.replace(param_pos, sizeof(query_param) - 1, query_local);
-					}
-				}
+
+			const String primary_mode = OS::get_singleton()->get_environment("GODOT_MTL_RT_PRIMARY");
+			if (primary_mode == "noinline") {
+				_msl_force_noinline(source, "bool trace_material_query");
+			}
+			if (primary_mode == "local" || primary_mode == "noinline") {
+				_msl_localize_hoisted_query(source, "bool trace_material_query(", "rt_query");
 			}
 
 			// Native-intersector lane, driven by the traversal-class registry in
