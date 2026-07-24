@@ -1020,6 +1020,9 @@ public:
 		LIMIT_METALFX_TEMPORAL_SCALER_MIN_SCALE = 46,
 		LIMIT_METALFX_TEMPORAL_SCALER_MAX_SCALE,
 		LIMIT_MAX_SHADER_VARYINGS,
+		// Maximum TLAS instance count that does not require an extended-limit
+		// build/traversal mode. Used to cap speculative renderer growth.
+		LIMIT_MAX_ACCELERATION_STRUCTURE_INSTANCES,
 	};
 
 	enum Features {
@@ -1038,6 +1041,9 @@ public:
 		SUPPORTS_RAY_QUERY,
 		SUPPORTS_RAYTRACING_PIPELINE,
 		SUPPORTS_HDR_OUTPUT,
+		SUPPORTS_METALFX_DENOISED,
+		// Driver implements the BLAS compacted-size query and copy-and-compact.
+		SUPPORTS_BLAS_COMPACTION,
 	};
 
 	enum SubgroupOperations {

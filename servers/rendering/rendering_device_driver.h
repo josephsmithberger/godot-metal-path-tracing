@@ -802,9 +802,27 @@ public:
 	};
 
 	virtual AccelerationStructureID tlas_create(uint32_t p_max_instance_count, BitField<AccelerationStructureFlagBits> p_flags) = 0;
+	/// Validates a TLAS build before RenderingDevice mutates dependencies or
+	/// enqueues graph work. Optional backend safety/coherence gates belong here.
+	virtual bool tlas_build_is_valid(AccelerationStructureID p_tlas, VectorView<AccelerationStructureInstance> p_instances) const { return true; }
 	virtual void acceleration_structure_instance_write(uint8_t *r_driver_instance, const AccelerationStructureInstance &p_instance) = 0;
 	virtual void acceleration_structure_free(AccelerationStructureID p_acceleration_structure) = 0;
 	virtual uint32_t acceleration_structure_get_scratch_size_bytes(AccelerationStructureID p_acceleration_structure) = 0;
+
+	// BLAS compaction (optional). Drivers without support keep the defaults; a
+	// zero compacted size disables compaction upstream.
+	/// Returns the compacted size recorded by a completed build of a BLAS
+	/// created with ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT, or 0 while the
+	/// build has not finished on the GPU (or the driver has no support).
+	virtual uint64_t acceleration_structure_get_compacted_size(AccelerationStructureID p_acceleration_structure) { return 0; }
+	/// Returns the bytes currently allocated for the native structure.
+	virtual uint64_t acceleration_structure_get_allocated_size(AccelerationStructureID p_acceleration_structure) { return 0; }
+	/// Returns true only after a queued compact copy has completed successfully.
+	virtual bool acceleration_structure_is_compaction_complete(AccelerationStructureID p_acceleration_structure) { return false; }
+	/// Creates an empty BLAS allocation of exactly `p_size` bytes to serve as a
+	/// compacted-copy destination. It has no geometry and is only valid after
+	/// command_compact_blas() writes into it.
+	virtual AccelerationStructureID blas_create_compacted_target(AccelerationStructureID p_source, uint64_t p_size) { return AccelerationStructureID(); }
 
 	// ----- PIPELINE -----
 
@@ -832,6 +850,9 @@ public:
 	// Geometry topology / counts must be unchanged; only vertex positions may differ.
 	virtual void command_update_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer) = 0;
 	virtual void command_build_tlas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, BufferID p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count) = 0;
+	// Copies a fully built BLAS into a compacted-target BLAS created by
+	// blas_create_compacted_target(). Optional; see the compaction queries.
+	virtual void command_compact_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_source, AccelerationStructureID p_destination) {}
 	virtual void command_bind_raytracing_pipeline(CommandBufferID p_cmd_buffer, RaytracingPipelineID p_pipeline) = 0;
 	virtual void command_bind_raytracing_uniform_set(CommandBufferID p_cmd_buffer, UniformSetID p_uniform_set, ShaderID p_shader, uint32_t p_set_index) = 0;
 

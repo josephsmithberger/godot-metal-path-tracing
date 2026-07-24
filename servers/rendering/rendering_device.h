@@ -1404,6 +1404,16 @@ public:
 
 	RID blas_create(Span<AccelerationStructureGeometry> p_geometries, BitField<AccelerationStructureFlagBits> p_flags);
 	RID tlas_create(uint32_t p_max_instance_count, BitField<AccelerationStructureFlagBits> p_flags);
+	bool acceleration_structure_is_valid(RID p_acceleration_structure) const;
+
+	// BLAS compaction. A BLAS created with ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT
+	// reports a nonzero compacted size once its build has completed on the GPU;
+	// drivers without compaction support always report zero.
+	uint64_t blas_get_compacted_size(RID p_blas);
+	uint64_t blas_get_allocated_size(RID p_blas);
+	bool blas_is_compaction_complete(RID p_blas);
+	RID blas_create_compacted_target(RID p_source, uint64_t p_size);
+	Error blas_compact(RID p_source, RID p_destination);
 
 	typedef int64_t HitShaderBindingTableRange;
 
