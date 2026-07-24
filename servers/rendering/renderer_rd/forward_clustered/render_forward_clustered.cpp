@@ -30,7 +30,9 @@
 
 #include "render_forward_clustered.h"
 
+#include "core/config/engine.h"
 #include "core/config/project_settings.h"
+#include "core/os/os.h"
 #include "servers/rendering/renderer_rd/environment/fog.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h"
 #include "servers/rendering/renderer_rd/framebuffer_cache_rd.h"
@@ -48,6 +50,35 @@ using namespace RendererSceneRenderImplementation;
 #define PRELOAD_PIPELINES_ON_SURFACE_CACHE_CONSTRUCTION 1
 
 #define FADE_ALPHA_PASS_THRESHOLD 0.999
+
+static void _print_pathtracing_presentation_history_reset(uint32_t p_reasons) {
+	if (p_reasons == PT_PRESENTATION_HISTORY_RESET_NONE) {
+		return;
+	}
+	String reasons;
+	auto append_reason = [&reasons](const char *p_reason) {
+		if (!reasons.is_empty()) {
+			reasons += ",";
+		}
+		reasons += p_reason;
+	};
+	if (p_reasons & PT_PRESENTATION_HISTORY_RESET_CONTEXT) {
+		append_reason("context");
+	}
+	if (p_reasons & PT_PRESENTATION_HISTORY_RESET_FRAME_GAP) {
+		append_reason("frame_gap");
+	}
+	if (p_reasons & PT_PRESENTATION_HISTORY_RESET_CAMERA_CUT) {
+		append_reason("camera_cut");
+	}
+	if (p_reasons & PT_PRESENTATION_HISTORY_RESET_PROJECTION_CUT) {
+		append_reason("projection_cut");
+	}
+	if (p_reasons & PT_PRESENTATION_HISTORY_RESET_LONG_FRAME) {
+		append_reason("long_frame");
+	}
+	print_verbose("MetalRT PRESENTATION temporal presentation history reset: " + reasons);
+}
 
 void RenderForwardClustered::RenderBufferDataForwardClustered::ensure_specular() {
 	ERR_FAIL_NULL(render_buffers);
@@ -91,15 +122,6 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::rt_ensure_texture
 	uint32_t usage_bits = RD::TEXTURE_USAGE_STORAGE_BIT |
 			RD::TEXTURE_USAGE_SAMPLING_BIT |
 			RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
-
-	if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING)) {
-		render_buffers->create_texture(
-				RB_SCOPE_FORWARD_CLUSTERED,
-				RB_TEX_RAYTRACING,
-				RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
-				usage_bits,
-				RD::TEXTURE_SAMPLES_1);
-	}
 
 	if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_DEPTH)) {
 		render_buffers->create_texture(
@@ -146,12 +168,37 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::dlss_rr_ensure_bu
 			usage_bits,
 			RD::TEXTURE_SAMPLES_1);
 
+	// Roughness: MetalFX consumes roughness separately from the signed world-space normal texture.
+	render_buffers->create_texture(
+			RB_SCOPE_DLSS_RR,
+			RB_TEX_DLSS_RR_ROUGHNESS,
+			RD::DATA_FORMAT_R16_SFLOAT,
+			usage_bits,
+			RD::TEXTURE_SAMPLES_1);
+
 	// Specular Hit Distance: Single channel distance (R16F is sufficient)
 	render_buffers->create_texture(
 			RB_SCOPE_DLSS_RR,
 			RB_TEX_DLSS_RR_SPECULAR_HIT_DIST,
 			RD::DATA_FORMAT_R16_SFLOAT,
 			usage_bits,
+			RD::TEXTURE_SAMPLES_1);
+
+	// A value of 1 tells MetalFX to leave that pixel out of denoising.
+	render_buffers->create_texture(
+			RB_SCOPE_DLSS_RR,
+			RB_TEX_DLSS_RR_DENOISE_STRENGTH,
+			RD::DATA_FORMAT_R8_UNORM,
+			usage_bits,
+			RD::TEXTURE_SAMPLES_1);
+
+	// Blended raster materials are kept separate from the noisy path-traced
+	// color and supplied through MetalFX's dedicated transparency input.
+	render_buffers->create_texture(
+			RB_SCOPE_DLSS_RR,
+			RB_TEX_DLSS_RR_TRANSPARENCY_OVERLAY,
+			render_buffers->get_base_data_format(),
+			RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT,
 			RD::TEXTURE_SAMPLES_1);
 }
 
@@ -191,6 +238,36 @@ bool RenderForwardClustered::RenderBufferDataForwardClustered::ensure_mfx_tempor
 }
 #endif
 
+#ifdef METAL_MFXDENOISED_ENABLED
+bool RenderForwardClustered::RenderBufferDataForwardClustered::ensure_mfx_denoised(RendererRD::MFXDenoisedEffect *p_effect) {
+	if (mfx_denoised_context) {
+		return true;
+	}
+	if (mfx_denoised_failed) {
+		return false;
+	}
+
+	RendererRD::MFXDenoisedEffect::CreateParams params;
+	params.input_size = render_buffers->get_internal_size();
+	params.output_size = render_buffers->get_target_size();
+	params.input_format = render_buffers->get_base_data_format();
+	params.depth_format = render_buffers->get_depth_format(false, false, render_buffers->get_can_be_storage());
+	params.motion_format = render_buffers->get_velocity_format();
+	params.diffuse_albedo_format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
+	params.specular_albedo_format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
+	params.normal_format = RD::DATA_FORMAT_R8G8B8A8_SNORM;
+	params.roughness_format = RD::DATA_FORMAT_R16_SFLOAT;
+	params.specular_hit_distance_format = RD::DATA_FORMAT_R16_SFLOAT;
+	params.denoise_strength_format = RD::DATA_FORMAT_R8_UNORM;
+	params.transparency_overlay_format = render_buffers->get_base_data_format();
+	params.output_format = render_buffers->get_base_data_format();
+	params.motion_vector_scale = render_buffers->get_internal_size();
+	mfx_denoised_context = p_effect->create_context(params);
+	mfx_denoised_failed = mfx_denoised_context == nullptr;
+	return mfx_denoised_context != nullptr;
+}
+#endif
+
 void RenderForwardClustered::RenderBufferDataForwardClustered::free_data() {
 	// JIC, should already have been cleared
 	if (render_buffers) {
@@ -224,6 +301,15 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::free_data() {
 	}
 #endif
 
+#ifdef METAL_MFXDENOISED_ENABLED
+	if (mfx_denoised_context) {
+		memdelete(mfx_denoised_context);
+		mfx_denoised_context = nullptr;
+	}
+	// A reconfigure changes size/format, so a previous failure no longer applies.
+	mfx_denoised_failed = false;
+#endif
+
 	if (dlss_context) {
 		memdelete(dlss_context);
 		dlss_context = nullptr;
@@ -232,6 +318,15 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::free_data() {
 	if (!render_sdfgi_uniform_set.is_null() && RD::get_singleton()->uniform_set_is_valid(render_sdfgi_uniform_set)) {
 		RD::get_singleton()->free_rid(render_sdfgi_uniform_set);
 	}
+
+	fsr2_presentation_history = {};
+	dlss_presentation_history = {};
+#ifdef METAL_MFXTEMPORAL_ENABLED
+	mfx_presentation_history = {};
+#endif
+#ifdef METAL_MFXDENOISED_ENABLED
+	mfx_denoised_presentation_history = {};
+#endif
 }
 
 void RenderForwardClustered::RenderBufferDataForwardClustered::configure(RenderSceneBuffersRD *p_render_buffers) {
@@ -1960,6 +2055,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		SCALE_NONE,
 		SCALE_FSR2,
 		SCALE_MFX,
+		SCALE_MFX_DENOISED,
 		SCALE_DLSS,
 	} scale_type = SCALE_NONE;
 
@@ -1980,6 +2076,25 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		default:
 			break;
 	}
+
+	rb->set_temporal_upscaler_override(false);
+	rb->set_upscaler_ready(false);
+#ifdef METAL_MFXDENOISED_ENABLED
+	if (scene_features.rt && p_render_data->environment.is_valid() && RD::get_singleton()->has_feature(RD::SUPPORTS_METALFX_DENOISED)) {
+		const float *environment_params = RendererEnvironmentStorage::get_singleton()->environment_get_pathtracing_params_ptr(p_render_data->environment);
+		if (environment_params && (uint32_t)environment_params[RSE::PT_PARAM_DENOISER] == RSE::PT_DENOISER_METALFX) {
+#ifdef METAL_MFXTEMPORAL_ENABLED
+			const bool use_interactive_temporal = _editor_interactive_rt_active(p_render_data, rb_data.ptr()) &&
+					_editor_interactive_use_temporal_upscaler(p_render_data);
+			scale_type = use_interactive_temporal ? SCALE_MFX : SCALE_MFX_DENOISED;
+#else
+			scale_type = SCALE_MFX_DENOISED;
+#endif
+			using_taa = false;
+			rb->set_temporal_upscaler_override(true);
+		}
+	}
+#endif
 
 	bool using_upscaling = scale_type != SCALE_NONE;
 
@@ -2149,6 +2264,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	// Captured from build_tlas/update_uniform_set so the trace-dispatch block
 	// below can bind without RenderRaytracing keeping hidden "current" state.
 	RID rt_uniform_set;
+	RID rt_guide_uniform_set;
 
 	// Create TLAS for raytracing if enabled
 	if (scene_features.rt && rb_data.is_valid() && raytracing && raytracing->get_shader()) {
@@ -2158,9 +2274,11 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				: nullptr;
 		const bool fog_enabled = p_render_data && p_render_data->environment.is_valid() && environment_get_fog_enabled(p_render_data->environment);
 		rt_flags = SceneShaderRaytracing::compute_rt_flags(env_params, fog_enabled);
+		rt_flags = raytracing->get_shader()->sanitize_rt_flags(rt_flags);
+		rt_flags = _apply_editor_interactive_rt_quality(rt_flags, p_render_data, rb_data.ptr());
 
-		const bool dlss_rr_enabled = (rt_flags & SceneShaderRaytracing::RT_FLAG_DLSS_RR_ENABLED) != 0;
-		if (dlss_rr_enabled) {
+		const bool denoiser_guides_enabled = (rt_flags & SceneShaderRaytracing::RT_FLAG_DENOISER_GUIDES_ENABLED) != 0;
+		if (denoiser_guides_enabled) {
 			rb_data->dlss_rr_ensure_buffers();
 			scene_features.set(SCENE_FEATURE_DEPTH_RECONSTRUCT);
 		} else if (rb_data->dlss_rr_has_buffers()) {
@@ -2169,7 +2287,23 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 		RTViewportState *rt_state = raytracing->build_tlas(p_render_data, rt_flags);
 		if (rt_state) {
+			// Traversal aggregates come from the viewport instance table build_tlas
+			// just refreshed, so the pipeline always matches the TLAS this frame.
+			// GODOT_MTL_RT_NO_ALL_OPAQUE=1 disables the specialization for A/B runs.
+			static const bool all_opaque_disabled = OS::get_singleton()->get_environment("GODOT_MTL_RT_NO_ALL_OPAQUE") == "1";
+			// Procedural AABBs remain on the unified query path: native and query
+			// traversal can choose different winners at exact triangle/AABB ties.
+			if (!all_opaque_disabled && !rt_state->traversal_has_procedural_instances &&
+					rt_state->traversal_has_opaque_triangles &&
+					raytracing->get_shader()->uses_compute_scene_lane()) {
+				if (rt_state->traversal_has_query_instances) {
+					rt_flags |= SceneShaderRaytracing::RT_FLAG_MIXED_ALPHA;
+				} else {
+					rt_flags |= SceneShaderRaytracing::RT_FLAG_ALL_OPAQUE;
+				}
+			}
 			rt_uniform_set = raytracing->update_uniform_set(rt_state, p_render_data, rt_flags);
+			rt_guide_uniform_set = rt_state->guide_uniform_set;
 		}
 	} else if (rb_data.is_valid() && rb_data->dlss_rr_has_buffers()) {
 		// RT disabled: free DLSS RR buffers so DLSS falls back to SR.
@@ -2561,12 +2695,35 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		// Make sure BDA referenced buffers are registered as dependencies, otherwise GPU hangs may occur, or render graph will not be able to order the dependencies correctly.
 		raytracing->register_raytracing_buffer_dependencies(raytracing_list);
 
-		// Raytracing dispatches at internal (pre-upscale) size because the RT
-		// output texture is allocated at that resolution; FSR/upscaler runs
-		// afterward as a separate compute pass.
+		// Raytracing writes the main internal (pre-upscale) color texture;
+		// FSR/upscaler runs afterward as a separate compute pass.
 		Size2i rt_size = rb->get_internal_size();
 		RD::get_singleton()->raytracing_list_trace_rays(raytracing_list, 0, raytracing->get_shader()->get_hit_sbt(rt_flags), rt_size.width, rt_size.height, 1);
 		RD::get_singleton()->raytracing_list_end();
+
+		// Compute-lane denoiser guide pass: a standalone kernel re-traces the
+		// coherent primary ray and writes the guide surfaces. Keeping this out
+		// of the path-trace kernel avoids the guide code's occupancy tax on
+		// every bounce (see GUIDE_PASS_MODE in scene_raytracing_compute.glsl).
+		if (rt_guide_uniform_set.is_valid() && raytracing->get_shader()->uses_compute_scene_lane()) {
+			const uint32_t guide_flags = rt_flags | SceneShaderRaytracing::RT_FLAG_GUIDE_PASS;
+			RID guide_pipeline = raytracing->get_shader()->get_raytracing_pipeline(guide_flags);
+			if (guide_pipeline.is_valid()) {
+				RENDER_TIMESTAMP("Denoiser Guides");
+				RD::RaytracingListID guide_list = RD::get_singleton()->raytracing_list_begin();
+				RD::get_singleton()->raytracing_list_bind_raytracing_pipeline(guide_list, guide_pipeline);
+				RD::get_singleton()->raytracing_list_bind_uniform_set(guide_list, rt_guide_uniform_set, 0);
+				if (bindless_set.is_valid()) {
+					RD::get_singleton()->raytracing_list_bind_uniform_set(guide_list, bindless_set, 1);
+				}
+				raytracing->register_raytracing_buffer_dependencies(guide_list);
+				RD::get_singleton()->raytracing_list_trace_rays(guide_list, 0, raytracing->get_shader()->get_hit_sbt(guide_flags), rt_size.width, rt_size.height, 1);
+				RD::get_singleton()->raytracing_list_end();
+			}
+		}
+		if (raytracing->get_shader()->uses_compute_scene_lane()) {
+			WARN_PRINT_ONCE("Metal path tracing supports triangle and procedural AABB geometry with opaque, alpha-scissored, double-sided, textured, and generated/inlined custom material/intersection bodies. Transparent blending, stage-global custom helpers, and SER remain disabled.");
+		}
 
 		RD::get_singleton()->draw_command_end_label();
 
@@ -2742,7 +2899,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_TRANSPARENT, p_render_data);
 	}
 
-	// Skip transparent pass when raytracing handles color.
+	// Ray tracing handles opaque color; blended materials still use this raster pass.
 	if (true) {
 		RENDER_TIMESTAMP("Render 3D Transparent Pass");
 
@@ -2757,9 +2914,20 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			// Motion vectors should not be overwritten by transparent objects.
 			transparent_color_pass_flags &= ~uint32_t(COLOR_PASS_FLAG_MOTION_VECTORS);
 
-			RID alpha_framebuffer = rb_data.is_valid() ? rb_data->get_color_pass_fb(transparent_color_pass_flags) : color_only_framebuffer;
+			const bool use_metalfx_transparency_overlay = scene_features.rt && scale_type == SCALE_MFX_DENOISED && rb_data.is_valid() && rb_data->dlss_rr_has_buffers();
+			RID alpha_framebuffer;
+			BitField<RD::DrawFlags> alpha_draw_flags = RD::DRAW_DEFAULT_ALL;
+			Vector<Color> alpha_clear_colors;
+			if (use_metalfx_transparency_overlay) {
+				alpha_framebuffer = FramebufferCacheRD::get_singleton()->get_cache_multiview(
+						rb->get_view_count(), rb_data->dlss_rr_get_transparency_overlay(), rb->get_depth_texture());
+				alpha_draw_flags = RD::DRAW_CLEAR_COLOR_ALL;
+				alpha_clear_colors.push_back(Color(0.0, 0.0, 0.0, 0.0));
+			} else {
+				alpha_framebuffer = rb_data.is_valid() ? rb_data->get_color_pass_fb(transparent_color_pass_flags) : color_only_framebuffer;
+			}
 			RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, PASS_MODE_COLOR, transparent_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
-			_render_list_with_draw_list(&render_list_params, alpha_framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 0.0f, 0u, p_render_data->render_region);
+			_render_list_with_draw_list(&render_list_params, alpha_framebuffer, alpha_draw_flags, alpha_clear_colors, 0.0f, 0u, p_render_data->render_region);
 		}
 
 		RD::get_singleton()->draw_command_end_label();
@@ -2806,6 +2974,13 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	if (rb_data.is_valid() && (using_upscaling || using_taa)) {
 		if (scale_type == SCALE_FSR2) {
 			rb_data->ensure_fsr2(fsr2_effect);
+			const uint32_t history_reset_reasons = rb_data->fsr2_presentation_history.begin_frame(
+					RSG::rasterizer->get_frame_number(), time_step,
+					p_render_data->scene_data->cam_transform, p_render_data->scene_data->prev_cam_transform,
+					p_render_data->scene_data->cam_projection, p_render_data->scene_data->prev_cam_projection);
+			if (scene_features.rt) {
+				_print_pathtracing_presentation_history_reset(history_reset_reasons);
+			}
 
 			RID exposure;
 			if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
@@ -2835,7 +3010,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				params.fovy = fovy;
 				params.jitter = jitter;
 				params.delta_time = float(time_step);
-				params.reset_accumulation = false; // FIXME: The engine does not provide a way to reset the accumulation.
+				params.reset_accumulation = history_reset_reasons != PT_PRESENTATION_HISTORY_RESET_NONE;
 
 				Projection correction;
 				correction.set_depth_correction(true, true, false);
@@ -2854,6 +3029,13 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		} else if (scale_type == SCALE_DLSS) {
 			RENDER_TIMESTAMP("DLSS");
 			rb_data->ensure_dlss(dlss_effect);
+			const uint32_t history_reset_reasons = rb_data->dlss_presentation_history.begin_frame(
+					RSG::rasterizer->get_frame_number(), time_step,
+					p_render_data->scene_data->cam_transform, p_render_data->scene_data->prev_cam_transform,
+					p_render_data->scene_data->cam_projection, p_render_data->scene_data->prev_cam_projection);
+			if (scene_features.rt) {
+				_print_pathtracing_presentation_history_reset(history_reset_reasons);
+			}
 
 			RID exposure;
 			if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
@@ -2882,7 +3064,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				params.fovy = fovy;
 				params.jitter = jitter;
 				params.delta_time = float(time_step);
-				params.reset_accumulation = false; // FIXME: The engine does not provide a way to reset the accumulation.
+				params.reset_accumulation = history_reset_reasons != PT_PRESENTATION_HISTORY_RESET_NONE;
 
 				// Enable DLSS Ray Reconstruction if raytracing buffers are available
 				if (rb_data->dlss_rr_has_buffers()) {
@@ -2908,19 +3090,107 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				rb->set_upscaler_ready(dlss_effect->is_ready(rb_data->get_dlss_context()));
 				dlss_effect->upscale(params);
 			}
+		} else if (scale_type == SCALE_MFX_DENOISED) {
+#ifdef METAL_MFXDENOISED_ENABLED
+			if (!rb_data->dlss_rr_has_buffers() || !rb_data->ensure_mfx_denoised(mfx_denoised_effect)) {
+				ERR_PRINT_ONCE("MetalFX denoised upscaling could not create a compatible context. Presenting this frame without native denoising.");
+				rb->set_temporal_upscaler_override(false);
+			} else {
+				const uint32_t history_reset_reasons = rb_data->mfx_denoised_presentation_history.begin_frame(
+						RSG::rasterizer->get_frame_number(), time_step,
+						p_render_data->scene_data->cam_transform, p_render_data->scene_data->prev_cam_transform,
+						p_render_data->scene_data->cam_projection, p_render_data->scene_data->prev_cam_projection);
+				_print_pathtracing_presentation_history_reset(history_reset_reasons);
+
+				RD::get_singleton()->draw_command_begin_label("MetalFX Denoised Upscaling");
+				RENDER_TIMESTAMP("MetalFX Denoised Upscaling");
+				// MetalFX expects the subpixel jitter in input pixels (-0.5..0.5),
+				// pointing the way the content was displaced. taa_jitter is an NDC
+				// offset applied in y-down clip space and texture space is also
+				// y-down, so scale by half the internal size without flipping.
+				Vector2 jitter = p_render_data->scene_data->taa_jitter * Vector2(rb->get_internal_size()) * 0.5f;
+
+				// viewToClip must match the transform that produced the depth
+				// texture: reversed-Z remapped to [0,1]. Metal clip space is y-up,
+				// so skip the Vulkan y-flip.
+				Projection depth_correction;
+				depth_correction.set_depth_correction(false, true, true);
+				Projection metalfx_projection = depth_correction * p_render_data->scene_data->cam_projection;
+
+				// MetalFX needs the actual multiplier that will be applied during
+				// tonemapping, not Godot's adapted-luminance denominator. Generate
+				// the required 1x1 R16F texture on the GPU to avoid both an inverted
+				// exposure signal and a CPU readback.
+				RID adapted_luminance = RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
+				float exposure_numerator = rb->get_luminance_multiplier();
+				if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
+					RID current_luminance = luminance->get_current_luminance_buffer(rb);
+					if (current_luminance.is_valid()) {
+						adapted_luminance = current_luminance;
+						exposure_numerator = RSG::camera_attributes->camera_attributes_get_auto_exposure_scale(p_render_data->camera_attributes);
+					}
+				}
+				if (p_render_data->environment.is_valid()) {
+					exposure_numerator *= environment_get_exposure(p_render_data->environment);
+				}
+				RID metalfx_exposure = mfx_temporal_effect->prepare_exposure(rb, adapted_luminance, exposure_numerator);
+
+				for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+					RendererRD::MFXDenoisedEffect::Params params;
+					params.src = rb->get_internal_texture(v);
+					params.depth = rb->get_depth_texture(v);
+					params.motion = rb->get_velocity_buffer(false, v);
+					params.exposure = metalfx_exposure;
+					params.diffuse_albedo = rb_data->dlss_rr_get_diffuse_albedo(v);
+					params.specular_albedo = rb_data->dlss_rr_get_specular_albedo(v);
+					params.normal = rb_data->dlss_rr_get_normal_roughness(v);
+					params.roughness = rb_data->dlss_rr_get_roughness(v);
+					params.specular_hit_distance = rb_data->dlss_rr_get_specular_hit_dist(v);
+					params.denoise_strength = rb_data->dlss_rr_get_denoise_strength(v);
+					params.transparency_overlay = rb_data->dlss_rr_get_transparency_overlay(v);
+					params.dst = rb->get_upscaled_texture(v);
+					params.jitter_offset = jitter;
+					params.camera_projection = metalfx_projection;
+					params.camera_transform = p_render_data->scene_data->cam_transform;
+					params.reset = history_reset_reasons != PT_PRESENTATION_HISTORY_RESET_NONE;
+					mfx_denoised_effect->process(rb_data->get_mfx_denoised_context(), params);
+				}
+
+				rb->set_upscaler_ready(true);
+				RD::get_singleton()->draw_command_end_label();
+			}
+#endif
 		} else if (scale_type == SCALE_MFX) {
 #ifdef METAL_MFXTEMPORAL_ENABLED
-			bool reset = rb_data->ensure_mfx_temporal(mfx_temporal_effect);
-
-			RID exposure;
-			if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
-				exposure = luminance->get_current_luminance_buffer(rb);
+			rb_data->ensure_mfx_temporal(mfx_temporal_effect);
+			const uint32_t history_reset_reasons = rb_data->mfx_presentation_history.begin_frame(
+					RSG::rasterizer->get_frame_number(), time_step,
+					p_render_data->scene_data->cam_transform, p_render_data->scene_data->prev_cam_transform,
+					p_render_data->scene_data->cam_projection, p_render_data->scene_data->prev_cam_projection);
+			if (scene_features.rt) {
+				_print_pathtracing_presentation_history_reset(history_reset_reasons);
 			}
 
+			RID adapted_luminance = RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
+			float exposure_numerator = rb->get_luminance_multiplier();
+			if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
+				RID current_luminance = luminance->get_current_luminance_buffer(rb);
+				if (current_luminance.is_valid()) {
+					adapted_luminance = current_luminance;
+					exposure_numerator = RSG::camera_attributes->camera_attributes_get_auto_exposure_scale(p_render_data->camera_attributes);
+				}
+			}
+			if (p_render_data->environment.is_valid()) {
+				exposure_numerator *= environment_get_exposure(p_render_data->environment);
+			}
+			RID exposure = mfx_temporal_effect->prepare_exposure(rb, adapted_luminance, exposure_numerator);
+
 			RD::get_singleton()->draw_command_begin_label("MetalFX Temporal");
-			// Scale to ±0.5.
-			Vector2 jitter = p_render_data->scene_data->taa_jitter * 0.5f;
-			jitter *= Vector2(1.0, -1.0); // Flip y-axis as bottom left is origin.
+			// MetalFX expects the subpixel jitter in input pixels (-0.5..0.5),
+			// pointing the way the content was displaced. taa_jitter is an NDC
+			// offset applied in y-down clip space and texture space is also
+			// y-down, so scale by half the internal size without flipping.
+			Vector2 jitter = p_render_data->scene_data->taa_jitter * Vector2(rb->get_internal_size()) * 0.5f;
 
 			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 				RendererRD::MFXTemporalEffect::Params params;
@@ -2930,7 +3200,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				params.exposure = exposure;
 				params.dst = rb->get_upscaled_texture(v);
 				params.jitter_offset = jitter;
-				params.reset = reset;
+				params.reset = history_reset_reasons != PT_PRESENTATION_HISTORY_RESET_NONE;
 
 				rb->set_upscaler_ready(true);
 				mfx_temporal_effect->process(rb_data->get_mfx_temporal_context(), params);
@@ -5608,8 +5878,80 @@ void RenderForwardClustered::_update_shader_quality_settings() {
 
 // Raytracing methods
 
+bool RenderForwardClustered::_editor_interactive_rt_active(const RenderDataRD *p_render_data, RenderBufferDataForwardClustered *p_rb_data) {
+#ifdef TOOLS_ENABLED
+	// A running game is a separate process, so this only ever affects viewports
+	// rendered inside the editor.
+	if (!Engine::get_singleton()->is_editor_hint() || p_rb_data == nullptr || p_render_data == nullptr || p_render_data->scene_data == nullptr) {
+		return false;
+	}
+
+	const int interactive_samples = GLOBAL_GET_CACHED(int, "rendering/pathtracer/editor_interactive_samples");
+	if (interactive_samples <= 0) {
+		return false;
+	}
+
+	const uint64_t settle_msec = uint64_t(MAX(0, GLOBAL_GET_CACHED(int, "rendering/pathtracer/editor_interactive_settle_msec")));
+	const uint64_t now_msec = OS::get_singleton()->get_ticks_msec();
+
+	// The camera is the only thing checked here: a moving camera invalidates the
+	// accumulated path tracer history anyway, so those samples are discarded.
+	const bool camera_moved =
+			!p_render_data->scene_data->cam_transform.is_equal_approx(p_render_data->scene_data->prev_cam_transform) ||
+			p_render_data->scene_data->cam_projection != p_render_data->scene_data->prev_cam_projection;
+	if (camera_moved) {
+		p_rb_data->pt_last_camera_motion_msec = now_msec;
+	}
+
+	return p_rb_data->pt_last_camera_motion_msec != 0 &&
+			now_msec - p_rb_data->pt_last_camera_motion_msec <= settle_msec;
+#else
+	return false;
+#endif
+}
+
+bool RenderForwardClustered::_editor_interactive_use_temporal_upscaler(const RenderDataRD *p_render_data) const {
+#if defined(TOOLS_ENABLED) && defined(METAL_MFXTEMPORAL_ENABLED) && defined(METAL_MFXDENOISED_ENABLED)
+	if (!GLOBAL_GET_CACHED(bool, "rendering/pathtracer/editor_interactive_use_temporal_upscaler") ||
+			p_render_data == nullptr || !p_render_data->environment.is_valid()) {
+		return false;
+	}
+	const float *params = RendererEnvironmentStorage::get_singleton()->environment_get_pathtracing_params_ptr(p_render_data->environment);
+	return params != nullptr && (uint32_t)params[RSE::PT_PARAM_DENOISER] == RSE::PT_DENOISER_METALFX &&
+			RD::get_singleton()->has_feature(RD::SUPPORTS_METALFX_DENOISED);
+#else
+	return false;
+#endif
+}
+
+uint32_t RenderForwardClustered::_apply_editor_interactive_rt_quality(uint32_t p_rt_flags, const RenderDataRD *p_render_data, RenderBufferDataForwardClustered *p_rb_data) {
+#ifdef TOOLS_ENABLED
+	if (!_editor_interactive_rt_active(p_render_data, p_rb_data)) {
+		return p_rt_flags;
+	}
+
+	const int interactive_bounces = GLOBAL_GET_CACHED(int, "rendering/pathtracer/editor_interactive_max_bounces");
+	const int interactive_samples = GLOBAL_GET_CACHED(int, "rendering/pathtracer/editor_interactive_samples");
+	// Only ever reduce; a scene authored below the interactive budget keeps its
+	// own values rather than being scaled up while navigating.
+	const uint32_t samples = MIN((uint32_t)interactive_samples, SceneShaderRaytracing::rt_flags_get_sample_count(p_rt_flags));
+	const uint32_t bounces = MIN((uint32_t)interactive_bounces, SceneShaderRaytracing::rt_flags_get_max_bounces(p_rt_flags));
+	uint32_t flags = SceneShaderRaytracing::rt_flags_with_quality(p_rt_flags, samples, bounces);
+	if (_editor_interactive_use_temporal_upscaler(p_render_data)) {
+		// Ordinary MetalFX Temporal does not consume ray-reconstruction guides.
+		// Avoid generating them while navigation invalidates denoiser history.
+		flags &= ~SceneShaderRaytracing::RT_FLAG_DENOISER_GUIDES_ENABLED;
+	}
+	return flags;
+#else
+	return p_rt_flags;
+#endif
+}
+
 bool RenderForwardClustered::_setup_rt() {
-	if (!RD::get_singleton()->has_feature(RD::SUPPORTS_RAYTRACING_PIPELINE)) {
+	const bool supports_pipeline = RD::get_singleton()->has_feature(RD::SUPPORTS_RAYTRACING_PIPELINE);
+	const bool supports_query = RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY);
+	if (!supports_pipeline && !supports_query) {
 		WARN_PRINT_ONCE("Raytracing not supported on this device.");
 		return false;
 	}
@@ -5622,6 +5964,12 @@ bool RenderForwardClustered::_setup_rt() {
 		rt_defines += "\n#define RT 1\n";
 		rt_defines += "\n#define MAX_ROUGHNESS_LOD " + itos(get_roughness_layers() - 1) + ".0\n";
 		raytracing->shader->init(rt_defines);
+	}
+	SceneShaderRaytracing::SceneRoute route = SceneShaderRaytracing::select_scene_route(
+			supports_pipeline, supports_query, raytracing->shader->is_scene_shader_ready());
+	if (route == SceneShaderRaytracing::SceneRoute::UNAVAILABLE) {
+		WARN_PRINT_ONCE("Raytracing scene shader is not ready; keeping the Forward+ raster route.");
+		return false;
 	}
 
 	return true;
@@ -5771,6 +6119,9 @@ RenderForwardClustered::RenderForwardClustered() {
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	mfx_temporal_effect = memnew(RendererRD::MFXTemporalEffect);
 #endif
+#ifdef METAL_MFXDENOISED_ENABLED
+	mfx_denoised_effect = memnew(RendererRD::MFXDenoisedEffect);
+#endif
 
 	// Raytracing will be initialized lazily when rt_set_enabled(true) is called
 }
@@ -5802,6 +6153,13 @@ RenderForwardClustered::~RenderForwardClustered() {
 		mfx_temporal_effect = nullptr;
 	}
 
+#endif
+
+#ifdef METAL_MFXDENOISED_ENABLED
+	if (mfx_denoised_effect) {
+		memdelete(mfx_denoised_effect);
+		mfx_denoised_effect = nullptr;
+	}
 #endif
 
 	if (dlss_effect) {

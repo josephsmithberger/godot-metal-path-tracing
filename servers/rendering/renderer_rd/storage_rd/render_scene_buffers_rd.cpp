@@ -167,6 +167,8 @@ void RenderSceneBuffersRD::configure(const RenderSceneBuffersConfiguration *p_co
 	screen_space_aa = p_config->get_screen_space_aa();
 
 	frame_generation = p_config->get_use_frame_generation();
+	temporal_upscaler_override = false;
+	upscaler_ready = false;
 	fsr_sharpness = p_config->get_fsr_sharpness();
 	texture_mipmap_bias = p_config->get_texture_mipmap_bias();
 	anisotropic_filtering_level = p_config->get_anisotropic_filtering_level();
@@ -217,6 +219,8 @@ void RenderSceneBuffersRD::configure_for_reflections(const Size2i p_reflection_s
 	// For now our render buffers for reflections are only used for effects/environment (Sky/Fog/Etc)
 	// Possibly at some point move our entire reflection atlas buffer management into this class
 
+	temporal_upscaler_override = false;
+	upscaler_ready = false;
 	target_size = p_reflection_size;
 	internal_size = p_reflection_size;
 	render_target = RID();
@@ -519,7 +523,7 @@ void RenderSceneBuffersRD::allocate_blur_textures() {
 	}
 
 	Size2i blur_size = internal_size;
-	if (RSE::scaling_3d_mode_type(scaling_3d_mode) == RSE::VIEWPORT_SCALING_3D_TYPE_TEMPORAL) {
+	if (temporal_upscaler_override || RSE::scaling_3d_mode_type(scaling_3d_mode) == RSE::VIEWPORT_SCALING_3D_TYPE_TEMPORAL) {
 		// The blur texture should be as big as the target size when using an upscaler.
 		blur_size = target_size;
 	}

@@ -69,6 +69,7 @@ class RenderSceneBuffersRD : public RenderSceneBuffers {
 
 private:
 	bool upscaler_ready = false;
+	bool temporal_upscaler_override = false;
 	bool depth_reconstruct_requested = false;
 	bool can_be_storage = true;
 	bool force_hdr = false;
@@ -313,6 +314,8 @@ public:
 
 	_FORCE_INLINE_ bool get_upscaler_ready() const { return upscaler_ready; }
 	_FORCE_INLINE_ void set_upscaler_ready(bool ready) { upscaler_ready = ready; }
+	_FORCE_INLINE_ bool get_temporal_upscaler_override() const { return temporal_upscaler_override; }
+	_FORCE_INLINE_ void set_temporal_upscaler_override(bool p_enabled) { temporal_upscaler_override = p_enabled; }
 
 	_FORCE_INLINE_ bool get_depth_reconstruct_requested() const { return depth_reconstruct_requested; }
 	_FORCE_INLINE_ void set_depth_reconstruct_requested(bool p_requested) { depth_reconstruct_requested = p_requested; }

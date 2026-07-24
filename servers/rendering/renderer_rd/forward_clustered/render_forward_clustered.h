@@ -38,6 +38,7 @@
 #include "servers/rendering/renderer_rd/effects/motion_vectors_store.h"
 #include "servers/rendering/renderer_rd/effects/ss_effects.h"
 #include "servers/rendering/renderer_rd/effects/taa.h"
+#include "servers/rendering/renderer_rd/forward_clustered/pathtracing_presentation.h"
 #include "servers/rendering/renderer_rd/forward_clustered/render_raytracing.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_forward_clustered.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
@@ -99,16 +100,32 @@ public:
 
 	class RenderBufferDataForwardClustered : public RenderBufferCustomDataRD {
 		GDCLASS(RenderBufferDataForwardClustered, RenderBufferCustomDataRD)
+		friend class RenderForwardClustered;
 
 	private:
 		RenderSceneBuffersRD *render_buffers = nullptr;
 		RendererRD::FSR2Context *fsr2_context = nullptr;
 		RendererRD::DLSSContext *dlss_context = nullptr;
+		PathtracingPresentationHistory fsr2_presentation_history;
+		PathtracingPresentationHistory dlss_presentation_history;
 #ifdef METAL_MFXTEMPORAL_ENABLED
 		RendererRD::MFXTemporalContext *mfx_temporal_context = nullptr;
+		PathtracingPresentationHistory mfx_presentation_history;
+#endif
+#ifdef METAL_MFXDENOISED_ENABLED
+		RendererRD::MFXDenoisedContext *mfx_denoised_context = nullptr;
+		// Constructing a MetalFX denoised scaler costs ~0.9s of main-thread time
+		// (MPSGraph specialization). Creation is not retried for a configuration
+		// that already failed, otherwise every frame pays that cost again.
+		bool mfx_denoised_failed = false;
+		PathtracingPresentationHistory mfx_denoised_presentation_history;
 #endif
 
 	public:
+		// Wall-clock time the editor viewport camera last moved, used to restore
+		// full path tracer quality once navigation settles. Zero means "never".
+		uint64_t pt_last_camera_motion_msec = 0;
+
 		ClusterBuilderRD *cluster_builder = nullptr;
 
 		struct SSEffectsData {
@@ -160,11 +177,18 @@ public:
 		bool ensure_mfx_temporal(RendererRD::MFXTemporalEffect *p_effect);
 		RendererRD::MFXTemporalContext *get_mfx_temporal_context() const { return mfx_temporal_context; }
 #endif
+#ifdef METAL_MFXDENOISED_ENABLED
+		bool ensure_mfx_denoised(RendererRD::MFXDenoisedEffect *p_effect);
+		RendererRD::MFXDenoisedContext *get_mfx_denoised_context() const { return mfx_denoised_context; }
+#endif
 
 		// Raytracing support
 		void rt_ensure_textures();
-		bool rt_has_texture() const { return render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING); }
-		RID rt_get_texture() const { return render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING); }
+		// The path tracer writes the storage-capable main color texture directly;
+		// keeping a second full-resolution color image only to copy it here cost
+		// bandwidth and delayed every downstream editor effect.
+		bool rt_has_texture() const { return render_buffers->has_internal_texture(); }
+		RID rt_get_texture() const { return render_buffers->get_internal_texture(); }
 		bool rt_has_depth_texture() const { return render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_DEPTH); }
 		RID rt_get_depth_texture() const { return render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_DEPTH); }
 
@@ -175,7 +199,17 @@ public:
 		RID dlss_rr_get_diffuse_albedo() const { return render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_DIFFUSE_ALBEDO); }
 		RID dlss_rr_get_specular_albedo() const { return render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_SPECULAR_ALBEDO); }
 		RID dlss_rr_get_normal_roughness() const { return render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_NORMAL_ROUGHNESS); }
+		RID dlss_rr_get_roughness() const { return render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_ROUGHNESS); }
 		RID dlss_rr_get_specular_hit_dist() const { return render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_SPECULAR_HIT_DIST); }
+		RID dlss_rr_get_denoise_strength() const { return render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_DENOISE_STRENGTH); }
+		RID dlss_rr_get_transparency_overlay() const { return render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_TRANSPARENCY_OVERLAY); }
+		RID dlss_rr_get_diffuse_albedo(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_DIFFUSE_ALBEDO, p_layer, 0); }
+		RID dlss_rr_get_specular_albedo(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_SPECULAR_ALBEDO, p_layer, 0); }
+		RID dlss_rr_get_normal_roughness(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_NORMAL_ROUGHNESS, p_layer, 0); }
+		RID dlss_rr_get_roughness(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_ROUGHNESS, p_layer, 0); }
+		RID dlss_rr_get_specular_hit_dist(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_SPECULAR_HIT_DIST, p_layer, 0); }
+		RID dlss_rr_get_denoise_strength(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_DENOISE_STRENGTH, p_layer, 0); }
+		RID dlss_rr_get_transparency_overlay(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_TRANSPARENCY_OVERLAY, p_layer, 0); }
 
 		RID get_color_only_fb();
 		RID get_color_pass_fb(uint32_t p_color_pass_flags);
@@ -822,6 +856,9 @@ private:
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	RendererRD::MFXTemporalEffect *mfx_temporal_effect = nullptr;
 #endif
+#ifdef METAL_MFXDENOISED_ENABLED
+	RendererRD::MFXDenoisedEffect *mfx_denoised_effect = nullptr;
+#endif
 	RendererRD::MotionVectorsStore *motion_vectors_store = nullptr;
 
 	/* Cluster builder */
@@ -856,6 +893,9 @@ private:
 
 	/* Raytracing */
 	bool _setup_rt();
+	uint32_t _apply_editor_interactive_rt_quality(uint32_t p_rt_flags, const RenderDataRD *p_render_data, RenderBufferDataForwardClustered *p_rb_data);
+	bool _editor_interactive_rt_active(const RenderDataRD *p_render_data, RenderBufferDataForwardClustered *p_rb_data);
+	bool _editor_interactive_use_temporal_upscaler(const RenderDataRD *p_render_data) const;
 
 	/* Debug */
 	void _debug_draw_cluster(Ref<RenderSceneBuffersRD> p_render_buffers);

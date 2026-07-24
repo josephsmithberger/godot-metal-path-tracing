@@ -30,24 +30,28 @@
 
 #pragma once
 
+#include "core/math/math_funcs.h"
 #include "core/math/transform_3d.h"
 #include "core/string/string_name.h"
 #include "core/templates/hash_map.h"
 #include "core/templates/local_vector.h"
 #include "core/templates/rid_owner.h"
+#include "core/templates/span.h"
 #include "core/templates/vector.h"
 #include "servers/rendering/renderer_rd/bindless_block.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/multimesh_merge.glsl.gen.h"
 #include "servers/rendering/rendering_device.h"
 
-#define RB_TEX_RAYTRACING SNAME("raytracing")
 #define RB_TEX_RT_DEPTH SNAME("rt_depth")
 
 #define RB_SCOPE_DLSS_RR SNAME("dlss_rr")
 #define RB_TEX_DLSS_RR_DIFFUSE_ALBEDO SNAME("diffuse_albedo")
 #define RB_TEX_DLSS_RR_SPECULAR_ALBEDO SNAME("specular_albedo")
 #define RB_TEX_DLSS_RR_NORMAL_ROUGHNESS SNAME("normal_roughness")
+#define RB_TEX_DLSS_RR_ROUGHNESS SNAME("roughness")
 #define RB_TEX_DLSS_RR_SPECULAR_HIT_DIST SNAME("specular_hit_dist")
+#define RB_TEX_DLSS_RR_DENOISE_STRENGTH SNAME("denoise_strength")
+#define RB_TEX_DLSS_RR_TRANSPARENCY_OVERLAY SNAME("transparency_overlay")
 
 class RenderDataRD;
 class RenderSceneBuffersRD;
@@ -56,6 +60,13 @@ namespace RendererSceneRenderImplementation {
 
 class RenderForwardClustered;
 class SceneShaderRaytracing;
+
+inline uint32_t rt_tlas_growth_capacity(uint32_t p_needed, uint64_t p_standard_limit) {
+	if (p_needed > p_standard_limit) {
+		return p_needed;
+	}
+	return (uint32_t)MIN(uint64_t(p_needed) * 2, MIN(p_standard_limit, uint64_t(UINT32_MAX)));
+}
 
 // Must match GLSL GeometryData (std430, 128 bytes).
 struct alignas(16) RT_GeometryData {
@@ -94,7 +105,18 @@ struct RT_InstanceMotionData {
 };
 static_assert(sizeof(RT_InstanceMotionData) == 48, "RT_InstanceMotionData must be 48 bytes");
 
-// Must match GLSL MaterialData (std430, 96 bytes).
+/// Per-instance current transforms for the compute lane (matches GLSL
+/// InstanceCurrentXform, 96 bytes), indexed by the TLAS instance custom index
+/// like geometries[]/materials[]. Both directions are stored so the shader
+/// never inverts a matrix, and so committed-hit transforms never have to be
+/// read back from a ray query after traversal.
+struct RT_InstanceCurrentXform {
+	float object_to_world[12]; // Current object-to-world (mat3x4, transposed 3x4).
+	float world_to_object[12]; // Current world-to-object (mat3x4, transposed 3x4).
+};
+static_assert(sizeof(RT_InstanceCurrentXform) == 96, "RT_InstanceCurrentXform must be 96 bytes");
+
+// Must match GLSL MaterialData (std430, 112 bytes).
 struct alignas(16) RT_MaterialData {
 	uint32_t albedo_texture_idx;
 	uint32_t normal_texture_idx;
@@ -112,8 +134,12 @@ struct alignas(16) RT_MaterialData {
 	float normal_map_depth; // Strength [0..N], default 1.0 (not Z-depth).
 	float specular; // Dielectric specular [0..1], default 0.5 -> F0 = 0.04.
 	uint64_t uniform_address; // BDA for custom shader uniform buffer (0 = none).
+	float alpha_scissor_threshold;
+	uint32_t dispatch_index; // Generated/inlined material function; 0 is HG0.
+	uint32_t material_id; // Stable RID identity for debug capture within a run.
+	uint32_t _material_pad;
 };
-static_assert(sizeof(RT_MaterialData) == 96, "RT_MaterialData must be 96 bytes for std430");
+static_assert(sizeof(RT_MaterialData) == 112, "RT_MaterialData must be 112 bytes for std430");
 
 // Light types for raytracing (matches GLSL RT_LIGHT_TYPE_* defines).
 enum RTLightType : uint32_t {
@@ -159,7 +185,19 @@ enum {
 	RT_MAT_FLAG_HAS_NORMAL_MAP = 1u,
 	RT_MAT_FLAG_HAS_EMISSION_TEX = 2u,
 	RT_MAT_FLAG_POINT_FILTER = 4u,
+	RT_MAT_FLAG_ALPHA_SCISSOR = 8u,
+	RT_MAT_FLAG_CUSTOM_SHADER = 16u,
+	RT_MAT_FLAG_HAS_ALBEDO_TEX = 32u,
+	RT_MAT_FLAG_HAS_ORM_TEX = 64u,
 };
+
+_FORCE_INLINE_ bool rt_material_cache_needs_refresh(bool p_has_data, uint32_t p_cached_rid_version, uint16_t p_cached_counter, uint32_t p_rid_version, uint16_t p_counter) {
+	return !p_has_data || p_cached_rid_version != p_rid_version || p_cached_counter != p_counter;
+}
+
+_FORCE_INLINE_ bool rt_material_buffer_write_fits(uint32_t p_offset, uint32_t p_size, uint32_t p_total_size) {
+	return p_offset <= p_total_size && p_size <= p_total_size - p_offset;
+}
 
 // Index format for RT geometry (matches GLSL fetch_indices).
 enum {
@@ -168,12 +206,94 @@ enum {
 	RT_INDEX_FORMAT_NONE = 2,
 };
 
+/// Applies the winding reversal caused by a mirrored instance transform to
+/// the API-neutral acceleration-structure flags. Godot meshes use clockwise
+/// front faces, while the existing material cull mapping stores the Metal /
+/// Vulkan counter-clockwise override in the FLIP bit.
+_FORCE_INLINE_ uint32_t rt_instance_flags_apply_transform_winding(uint32_t p_flags, const Transform3D &p_transform) {
+	if (p_transform.basis.determinant() < 0.0) {
+		p_flags ^= RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT;
+	}
+	return p_flags;
+}
+
 enum {
 	RT_GEOM_FLAG_COMPRESSED = 1u,
 	RT_GEOM_FLAG_PROCEDURAL = 2u,
 	// Set when the BLAS uses a per-frame-deformed vertex buffer.
 	RT_GEOM_FLAG_DEFORMED = 4u,
 };
+
+// Partition the compute ray-query TLAS into geometry that Metal can traverse
+// with its native opaque intersector and geometry that still needs candidate
+// evaluation. The regular Vulkan RT-pipeline lane keeps using visibility mask
+// 0xFF, which includes both partitions.
+enum : uint8_t {
+	RT_INSTANCE_MASK_OPAQUE_TRIANGLE = 1u << 0,
+	RT_INSTANCE_MASK_QUERY = 1u << 1,
+	RT_INSTANCE_MASK_ALL = RT_INSTANCE_MASK_OPAQUE_TRIANGLE | RT_INSTANCE_MASK_QUERY,
+};
+
+_FORCE_INLINE_ uint8_t rt_instance_traversal_mask(uint32_t p_instance_flags, uint32_t p_geometry_flags) {
+	const bool opaque_triangle = (p_geometry_flags & RT_GEOM_FLAG_PROCEDURAL) == 0 &&
+			(p_instance_flags & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT) != 0;
+	return opaque_triangle ? RT_INSTANCE_MASK_OPAQUE_TRIANGLE : RT_INSTANCE_MASK_QUERY;
+}
+
+enum class RTProceduralBoundsSource : uint8_t {
+	EXPLICIT,
+	FALLBACK,
+};
+
+struct RTProceduralBoundsValidation {
+	RTProceduralBoundsSource source = RTProceduralBoundsSource::FALLBACK;
+	uint32_t count = 0;
+};
+
+/// Validates the exact min/max float3 records consumed by Vulkan and Metal.
+/// An empty record span intentionally selects the instance's single fallback
+/// AABB; malformed, non-finite, flat, or inverted records reject only that
+/// procedural instance before any backend descriptor is created.
+_FORCE_INLINE_ bool rt_procedural_bounds_validate(Span<const float> p_bounds, const AABB &p_fallback, RTProceduralBoundsValidation &r_validation, String &r_error) {
+	r_validation = RTProceduralBoundsValidation();
+	r_error = String();
+
+	if (p_bounds.is_empty()) {
+		if (!p_fallback.is_finite()) {
+			r_error = "the fallback AABB contains a non-finite value";
+			return false;
+		}
+		if (p_fallback.size.x <= 0.0 || p_fallback.size.y <= 0.0 || p_fallback.size.z <= 0.0) {
+			r_error = "the fallback AABB must have positive volume";
+			return false;
+		}
+		r_validation.source = RTProceduralBoundsSource::FALLBACK;
+		r_validation.count = 1;
+		return true;
+	}
+
+	if ((p_bounds.size() % 6) != 0) {
+		r_error = "the explicit bounds array must contain complete float3 min/max pairs";
+		return false;
+	}
+
+	for (uint32_t i = 0; i < p_bounds.size(); i += 6) {
+		for (uint32_t component = 0; component < 6; component++) {
+			if (!Math::is_finite(p_bounds[i + component])) {
+				r_error = vformat("AABB %d contains a non-finite value", i / 6);
+				return false;
+			}
+		}
+		if (p_bounds[i + 0] >= p_bounds[i + 3] || p_bounds[i + 1] >= p_bounds[i + 4] || p_bounds[i + 2] >= p_bounds[i + 5]) {
+			r_error = vformat("AABB %d must have a strictly greater max than min on every axis", i / 6);
+			return false;
+		}
+	}
+
+	r_validation.source = RTProceduralBoundsSource::EXPLICIT;
+	r_validation.count = p_bounds.size() / 6;
+	return true;
+}
 
 /// Per-instance state for procedural RT geometry. Heap-allocated, only exists for procedural instances.
 struct RTProceduralState {
@@ -186,14 +306,31 @@ struct RTProceduralState {
 	uint32_t gpu_buffer_capacity = 0; // Bytes, grow-only.
 	uint64_t gpu_buffer_address = 0; // BDA (0 = not exposed).
 	uint32_t aabb_count = 0;
+	bool blas_built_once = false;
+	bool blas_allow_update = false; // Upgraded on the first mutation after a static build.
+	uint32_t build_count = 0;
+	uint32_t refit_count = 0;
 };
 
 struct RTSurfaceData {
+	/// Static-BLAS compaction lifecycle (BLAS_COMPACTION). Compaction is asynchronous: the
+	/// build records a compacted size, a later frame copies into a right-sized
+	/// allocation, swaps the RID, and defers the source free.
+	enum class BlasCompaction : uint8_t {
+		INELIGIBLE, // Updatable/fast-build BLAS, or the driver has no support.
+		PENDING, // Built with ALLOW_COMPACTION; waiting on the recorded size.
+		COPYING, // copyAndCompact is queued; source remains live until completion.
+		DONE, // Compacted, or measured not worth the copy.
+	};
+
 	RID blas;
+	RID compacted_blas;
 	RT_GeometryData geometry = {};
 	Transform3D aabb_transform;
 	bool is_compressed = false;
 	uint64_t blas_size = 0;
+	uint64_t source_blas_size = 0;
+	BlasCompaction compaction = BlasCompaction::INELIGIBLE;
 };
 
 /// Inputs for a surface backed by a per-frame-deformed vertex buffer.
@@ -280,6 +417,7 @@ struct RTMergedMMEntry {
 	uint32_t last_used_frame = 0;
 	uint64_t cached_mm_last_change = 0;
 	bool blas_built_once = false;
+	bool blas_allow_update = false; // Upgraded on the first mutation after a static build.
 	bool indexed = false; // selects MODE_INDEXED vs MODE_NON_INDEXED variant
 };
 
@@ -305,6 +443,11 @@ struct RTViewportState {
 	RID tlas;
 	uint32_t tlas_max_instances = 0;
 
+	// Instance array of the last committed tlas_build. A camera-only change
+	// leaves this identical, which lets the rebuild be skipped entirely.
+	LocalVector<RD::AccelerationStructureInstance> tlas_built_instances;
+	bool tlas_built = false;
+
 	RID geometry_buffer;
 	uint32_t geometry_buffer_capacity = 0;
 	RID material_buffer;
@@ -313,9 +456,22 @@ struct RTViewportState {
 	uint32_t motion_index_buffer_capacity = 0;
 	RID motion_transform_buffer;
 	uint32_t motion_transform_buffer_capacity = 0;
+	RID current_xform_buffer;
+	uint32_t current_xform_buffer_capacity = 0;
 
 	RID light_buffer;
 	RID params_buffer;
+
+	// Traversal aggregates for the instance table uploaded by the last
+	// finalize_buffers(). They select all-opaque or mixed native Metal lanes for
+	// this viewport without making assumptions about a particular scene.
+	bool traversal_has_opaque_triangles = false;
+	bool traversal_has_query_instances = false;
+	bool traversal_has_procedural_instances = false;
+
+	// Transient (linear-pool) uniform set for the compute-lane denoiser guide
+	// pass; rebuilt by update_uniform_set whenever guides are enabled.
+	RID guide_uniform_set;
 
 	uint32_t frame_counter = 0;
 };
@@ -382,9 +538,25 @@ class RenderRaytracing {
 	LocalVector<RT_InstanceMotionData> motion_transforms; ///< Compact: only moving instances.
 	LocalVector<RID> blass;
 	LocalVector<Transform3D> blas_transforms;
+	LocalVector<RT_InstanceCurrentXform> current_xform_data; ///< Packed from blas_transforms at upload.
 	LocalVector<uint32_t> instance_flags;
 	LocalVector<uint8_t> instance_masks; // Per-instance ray mask (0x00 = invisible to rays, 0xFF = normal)
 	LocalVector<uint32_t> sbt_offsets; // 0 = default material hit group
+
+	// BLAS_COMPACTION: static-BLAS compaction. Candidates are collected during the surface
+	// walk (pointers stay valid until build_acceleration_structures later the
+	// same frame) and processed there under a per-frame budget so concurrent
+	// old + new + copy allocations stay bounded.
+	static constexpr uint32_t MAX_BLAS_COMPACTIONS_PER_FRAME = 8;
+	LocalVector<RTSurfaceData *> compaction_candidates;
+	bool blas_compaction_supported = false;
+	bool blas_compaction_support_checked = false;
+	uint32_t compacted_blas_count = 0;
+	uint64_t compacted_blas_bytes_saved = 0;
+
+	bool _blas_compaction_enabled();
+	void _collect_compaction_candidate(RTSurfaceData *p_surf_data);
+	void _process_blas_compactions();
 
 	HashMap<RenderSceneBuffersRD *, RTViewportState *> viewport_states;
 
@@ -447,7 +619,7 @@ class RenderRaytracing {
 			LocalVector<RID> &r_dirty_blas_list,
 			LocalVector<RID> &r_dirty_blas_update_list,
 			RTSurfaceData *r_surf_data);
-	void update_procedural_blas(RTProceduralState *p_state, LocalVector<RID> &r_dirty_blas_list);
+	bool update_procedural_blas(RTProceduralState *p_state, LocalVector<RID> &r_dirty_blas_list, LocalVector<RID> &r_dirty_blas_update_list);
 	void build_acceleration_structures(RTViewportState *p_state, const LocalVector<RID> &p_dirty_blas_list, const LocalVector<RID> &p_dirty_blas_update_list);
 	void finalize_buffers(RTViewportState *p_state);
 	void prepare_frame();

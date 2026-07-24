@@ -30,6 +30,7 @@
 
 #include "core/config/project_settings.h"
 #include "core/math/math_funcs.h"
+#include "core/os/os.h"
 #include "servers/rendering/renderer_rd/environment/sky.h"
 #include "servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h"
@@ -132,6 +133,9 @@ void RenderRaytracing::_free_viewport_state_internal(RTViewportState *p_state) {
 	}
 	if (p_state->motion_transform_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->motion_transform_buffer);
+	}
+	if (p_state->current_xform_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(p_state->current_xform_buffer);
 	}
 	if (p_state->light_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->light_buffer);
@@ -236,13 +240,24 @@ uint64_t RenderRaytracing::mat_ubo_pool_get_address(uint32_t p_slot) const {
 // ---------------------------------------------------------------------------
 
 void RenderRaytracing::cleanup_caches() {
-	// Static-surface BLASes are NOT freed here: they were created with the default
-	// lifetime and will be cascade-freed by RD when their source vertex buffer is freed.
+	RD *rd = RD::get_singleton();
+
+	// Static BLASes are owned by this cache. A source mesh deletion may have
+	// already cascade-freed one through RenderingDevice dependencies, hence the
+	// explicit validity check before renderer restart / shutdown cleanup.
 	for (uint32_t i = 0; i < surface_chunks.size(); i++) {
 		if (surface_chunks[i]) {
 			for (uint32_t j = 0; j < RT_CACHE_CHUNK_SIZE; j++) {
 				RTCacheEntry *entry = &surface_chunks[i][j];
 				if (entry->ptr) {
+					if (entry->ptr->compacted_blas.is_valid() && rd->acceleration_structure_is_valid(entry->ptr->compacted_blas)) {
+						rd->free_rid(entry->ptr->compacted_blas);
+						entry->ptr->compacted_blas = RID();
+					}
+					if (entry->ptr->blas.is_valid() && rd->acceleration_structure_is_valid(entry->ptr->blas)) {
+						rd->free_rid(entry->ptr->blas);
+						entry->ptr->blas = RID();
+					}
 					memdelete(entry->ptr);
 					entry->ptr = nullptr;
 				}
@@ -251,8 +266,6 @@ void RenderRaytracing::cleanup_caches() {
 		}
 	}
 	surface_chunks.clear();
-
-	RD *rd = RD::get_singleton();
 
 	// Free all cached deformed surface data.
 	{
@@ -442,6 +455,9 @@ void RenderRaytracing::prepare_frame() {
 	material_data.clear();
 	motion_indices.clear();
 	motion_transforms.clear();
+	// Compaction candidates never survive a frame; surface eviction below could
+	// otherwise leave dangling pointers in the list.
+	compaction_candidates.clear();
 
 	// Per-frame "touched this frame" lists are cleared here and refilled by
 	// `_access_*_slot` during the build phase. Saves a hashmap walk in
@@ -579,12 +595,20 @@ RTSurfaceData *RenderRaytracing::process_surface(
 	// Allocate or reuse entry
 	if (!entry->ptr) {
 		entry->ptr = memnew(RTSurfaceData);
-	} else if (entry->ptr->blas.is_valid()) {
-		if (entry->cached_rid_version == mesh_version) {
-			// Same mesh, surface data changed: BLAS is still live, free explicitly.
+	} else {
+		if (entry->ptr->compacted_blas.is_valid() && RD::get_singleton()->acceleration_structure_is_valid(entry->ptr->compacted_blas)) {
+			RD::get_singleton()->free_rid(entry->ptr->compacted_blas);
+			entry->ptr->compacted_blas = RID();
+		}
+		if (entry->ptr->blas.is_valid() && RD::get_singleton()->acceleration_structure_is_valid(entry->ptr->blas)) {
+			// A surface edit may replace its vertex or index buffer. RenderingDevice
+			// cascade-frees dependent BLAS RIDs when that happens, even though the
+			// mesh RID may stay unchanged. Only free the cached BLAS if it survived
+			// that dependency cleanup.
 			RD::get_singleton()->free_rid(entry->ptr->blas);
 		}
-		// Version mismatch: old mesh was deleted, BLAS already cascade-freed by RD.
+		// Whether freed above or by the dependency cascade, discard the handle
+		// before populating the replacement BLAS.
 		entry->ptr->blas = RID();
 	}
 
@@ -978,11 +1002,20 @@ void RenderRaytracing::_populate_surface_blas(
 		if (p_allow_update) {
 			as_flags.set_flag(RD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT);
 		}
+		// BLAS_COMPACTION: immutable BLASes record their compacted size at build so a later
+		// frame can copy-and-compact them (drivers without support ignore this).
+		const bool compaction_eligible = !p_allow_update && !p_prefer_fast_build && _blas_compaction_enabled();
+		if (compaction_eligible) {
+			as_flags.set_flag(RD::ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT);
+		}
 
 		r_surf_data->blas = RD::get_singleton()->blas_create({ &as_geom, 1 }, as_flags);
 		if (!r_surf_data->blas.is_valid()) {
 			return;
 		}
+		r_surf_data->compaction = compaction_eligible
+				? RTSurfaceData::BlasCompaction::PENDING
+				: RTSurfaceData::BlasCompaction::INELIGIBLE;
 		RD::get_singleton()->set_resource_name(r_surf_data->blas,
 				String(p_vertex_buffer_override.is_valid() ? "RT BLAS deformed [" : "RT BLAS [") + itos(p_cache_key) + "]");
 		r_dirty_blas_list.push_back(r_surf_data->blas);
@@ -1251,13 +1284,35 @@ static void pack_uniform(const ShaderLanguage::ShaderNode::Uniform &u, const Var
 // Procedural geometry processing
 // ---------------------------------------------------------------------------
 
-void RenderRaytracing::update_procedural_blas(RTProceduralState *p_state, LocalVector<RID> &r_dirty_blas_list) {
-	// Pack AABB data into a byte buffer.
-	Vector<uint8_t> aabb_bytes;
-	uint32_t aabb_count = 1;
+bool RenderRaytracing::update_procedural_blas(RTProceduralState *p_state, LocalVector<RID> &r_dirty_blas_list, LocalVector<RID> &r_dirty_blas_update_list) {
+	ERR_FAIL_NULL_V(p_state, false);
 
-	if (p_state->aabb_data.size() >= 6 && (p_state->aabb_data.size() % 6) == 0) {
-		aabb_count = p_state->aabb_data.size() / 6;
+	RTProceduralBoundsValidation validation;
+	String validation_error;
+	Span<const float> explicit_bounds(p_state->aabb_data.ptr(), p_state->aabb_data.size());
+	if (!rt_procedural_bounds_validate(explicit_bounds, p_state->culling_aabb, validation, validation_error)) {
+		// Never leave the last valid BLAS visible after an invalid live edit.
+		if (p_state->blas.is_valid()) {
+			RD::get_singleton()->free_rid(p_state->blas);
+			p_state->blas = RID();
+		}
+		if (p_state->gpu_buffer.is_valid()) {
+			RD::get_singleton()->free_rid(p_state->gpu_buffer);
+			p_state->gpu_buffer = RID();
+		}
+		p_state->gpu_buffer_capacity = 0;
+		p_state->gpu_buffer_address = 0;
+		p_state->aabb_count = 0;
+		p_state->blas_built_once = false;
+		WARN_PRINT_ONCE(vformat("Path tracing omitted invalid procedural AABB geometry: %s. Valid triangle and procedural instances remain enabled.", validation_error));
+		return false;
+	}
+
+	// Pack the validated AABB data into the backend's shared min/max layout.
+	Vector<uint8_t> aabb_bytes;
+	const uint32_t aabb_count = validation.count;
+
+	if (validation.source == RTProceduralBoundsSource::EXPLICIT) {
 		aabb_bytes.resize(p_state->aabb_data.size() * sizeof(float));
 		memcpy(aabb_bytes.ptrw(), p_state->aabb_data.ptr(), aabb_bytes.size());
 	} else {
@@ -1278,6 +1333,7 @@ void RenderRaytracing::update_procedural_blas(RTProceduralState *p_state, LocalV
 		if (p_state->blas.is_valid()) {
 			RD::get_singleton()->free_rid(p_state->blas);
 			p_state->blas = RID();
+			p_state->blas_built_once = false;
 		}
 		if (p_state->gpu_buffer.is_valid()) {
 			RD::get_singleton()->free_rid(p_state->gpu_buffer);
@@ -1293,15 +1349,32 @@ void RenderRaytracing::update_procedural_blas(RTProceduralState *p_state, LocalV
 		needs_new_blas = !p_state->blas.is_valid();
 	}
 
+	// Refit-capable acceleration structures trade traversal quality for update
+	// speed, so a BLAS is first built without ALLOW_UPDATE. The first in-place
+	// mutation rebuilds it refit-capable; later mutations then refit as before.
+	// Static procedural geometry keeps the faster non-refittable BVH forever.
+	if (!needs_new_blas && p_state->blas.is_valid() && p_state->blas_built_once && !p_state->blas_allow_update) {
+		RD::get_singleton()->free_rid(p_state->blas);
+		p_state->blas = RID();
+		p_state->blas_built_once = false;
+		p_state->blas_allow_update = true;
+		needs_new_blas = true;
+	}
+
 	if (needs_new_blas) {
-		ERR_FAIL_COND(!p_state->gpu_buffer.is_valid());
+		ERR_FAIL_COND_V(!p_state->gpu_buffer.is_valid(), false);
 
 		RD::AccelerationStructureGeometry geom;
 		geom.type = RD::AccelerationStructureGeometry::TYPE_AABBS;
 		geom.geometry.aabbs.buffer = p_state->gpu_buffer;
 		geom.geometry.aabbs.count = aabb_count;
 		geom.geometry.aabbs.stride = 24; // VkAabbPositionsKHR: two float3 (min, max).
-		p_state->blas = RD::get_singleton()->blas_create({ &geom, 1 }, RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
+		BitField<RD::AccelerationStructureFlagBits> as_flags = RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT;
+		if (p_state->blas_allow_update) {
+			as_flags.set_flag(RD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT);
+		}
+		p_state->blas = RD::get_singleton()->blas_create({ &geom, 1 }, as_flags);
+		p_state->blas_built_once = false;
 	}
 
 	// BDA for shader access.
@@ -1312,8 +1385,16 @@ void RenderRaytracing::update_procedural_blas(RTProceduralState *p_state, LocalV
 	}
 
 	if (p_state->blas.is_valid()) {
-		r_dirty_blas_list.push_back(p_state->blas);
+		if (p_state->blas_built_once) {
+			r_dirty_blas_update_list.push_back(p_state->blas);
+			p_state->refit_count++;
+		} else {
+			r_dirty_blas_list.push_back(p_state->blas);
+			p_state->blas_built_once = true;
+			p_state->build_count++;
+		}
 	}
+	return p_state->blas.is_valid();
 }
 
 // ---------------------------------------------------------------------------
@@ -1340,6 +1421,9 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		s_default_mat.data.uv1_scale[1] = 1.0f;
 		s_default_mat.data.uv1_offset[0] = 0.0f;
 		s_default_mat.data.uv1_offset[1] = 0.0f;
+		s_default_mat.data.alpha_scissor_threshold = 0.0f;
+		s_default_mat.data.dispatch_index = 0;
+		s_default_mat.data.material_id = 0;
 		s_default_mat_initialized = true;
 	}
 
@@ -1353,9 +1437,8 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	RTMaterialCacheEntry *entry = get_material_cache_entry(mat_idx);
 
 	uint32_t current_frame = RSG::rasterizer->get_frame_number();
-	bool needs_refresh = !entry->ptr ||
-			entry->cached_rid_version != mat_version ||
-			entry->cached_counter != p_material_invalidation_counter;
+	bool needs_refresh = rt_material_cache_needs_refresh(entry->ptr != nullptr,
+			entry->cached_rid_version, entry->cached_counter, mat_version, p_material_invalidation_counter);
 
 	if (!needs_refresh) {
 		entry->last_used_frame = current_frame;
@@ -1406,6 +1489,10 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	mat.uv1_offset[1] = 0.0f;
 	mat.normal_map_depth = 1.0f;
 	mat.uniform_address = 0;
+	mat.alpha_scissor_threshold = 0.0f;
+	mat.dispatch_index = 0;
+	mat.material_id = mat_idx;
+	mat._material_pad = 0;
 
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
@@ -1428,6 +1515,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	RID albedo_rd = get_material_texture("texture_albedo", true);
 	if (albedo_rd.is_valid()) {
 		mat.albedo_texture_idx = bindless_block->add_texture(albedo_rd);
+		mat.flags |= RT_MAT_FLAG_HAS_ALBEDO_TEX;
 	}
 
 	RID normal_rd = get_material_texture("texture_normal");
@@ -1444,10 +1532,12 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	RID orm_rd = get_material_texture("texture_orm");
 	if (orm_rd.is_valid()) {
 		mat.orm_texture_idx = bindless_block->add_texture(orm_rd);
+		mat.flags |= RT_MAT_FLAG_HAS_ORM_TEX;
 	} else {
 		RID roughness_rd = get_material_texture("texture_roughness");
 		if (roughness_rd.is_valid()) {
 			mat.orm_texture_idx = bindless_block->add_texture(roughness_rd);
+			mat.flags |= RT_MAT_FLAG_HAS_ORM_TEX;
 		}
 	}
 
@@ -1479,6 +1569,8 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		mat_data->is_custom_shader = true;
 		uint32_t shader_id = material_storage->material_get_shader_id(p_material_rid);
 		mat_data->rt_sbt_offset = SceneShaderRaytracing::get_singleton()->register_custom_shader(shader_id, p_material_rid);
+		mat.dispatch_index = mat_data->rt_sbt_offset;
+		mat.flags |= RT_MAT_FLAG_CUSTOM_SHADER;
 
 		const SceneShaderRaytracing::CustomShaderEntry *cse =
 				SceneShaderRaytracing::get_singleton()->get_custom_shader_entry(mat_data->rt_sbt_offset);
@@ -1498,7 +1590,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 
 				uint32_t offset = cse->uniform_offsets[u.order];
 				uint32_t size = ShaderLanguage::get_datatype_size(u.type);
-				if (offset + size > cse->uniform_total_size) {
+				if (!rt_material_buffer_write_fits(offset, size, cse->uniform_total_size)) {
 					continue;
 				}
 
@@ -1565,16 +1657,19 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 					}
 				}
 
-				if (tui.buffer_offset + 4 <= cse->uniform_total_size) {
+				if (rt_material_buffer_write_fits(tui.buffer_offset, 4, cse->uniform_total_size)) {
 					memcpy(ubo_data.ptrw() + tui.buffer_offset, &bindless_idx, 4);
 				}
 			}
 
 			// Try the suballoc pool first. Common materials (UBO <= slot size)
 			// just buffer_update an existing slot - O(1), no driver allocation,
-			// no per-frame storage_buffer_create cost.
+			// no per-frame storage_buffer_create cost. Metal's compute lane uses
+			// initialized dedicated buffers because address-only reads are not
+			// visible to its pooled buffer-update hazard tracking.
 			bool used_pool = false;
-			if (cse->uniform_total_size <= MAT_UBO_POOL_SLOT_SIZE) {
+			bool metal_compute_record = SceneShaderRaytracing::get_singleton()->uses_compute_scene_lane();
+			if (!metal_compute_record && cse->uniform_total_size <= MAT_UBO_POOL_SLOT_SIZE) {
 				if (mat_data->uniform_pool_slot == UINT32_MAX) {
 					mat_data->uniform_pool_slot = mat_ubo_pool_allocate();
 				}
@@ -1596,14 +1691,16 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 				// every rebuild. Warn once so it's visible in the log; the fix is
 				// either to shrink the material's uniform footprint below
 				// MAT_UBO_POOL_SLOT_SIZE or to grow the pool slot/capacity.
-				const char *reason = (cse->uniform_total_size > MAT_UBO_POOL_SLOT_SIZE)
-						? "uniform size exceeds slot"
-						: "pool exhausted";
-				WARN_PRINT_ONCE(vformat(
-						"RT Material UBO falling back to dedicated buffer (%s): "
-						"sbt_offset=%u, uniform_total_size=%u, slot_size=%u.",
-						String(reason), mat_data->rt_sbt_offset,
-						cse->uniform_total_size, MAT_UBO_POOL_SLOT_SIZE));
+				if (!metal_compute_record) {
+					const char *reason = (cse->uniform_total_size > MAT_UBO_POOL_SLOT_SIZE)
+							? "uniform size exceeds slot"
+							: "pool exhausted";
+					WARN_PRINT_ONCE(vformat(
+							"RT Material UBO falling back to dedicated buffer (%s): "
+							"sbt_offset=%d, uniform_total_size=%d, slot_size=%d.",
+							String(reason), mat_data->rt_sbt_offset,
+							cse->uniform_total_size, MAT_UBO_POOL_SLOT_SIZE));
+				}
 
 				if (mat_data->uniform_pool_slot != UINT32_MAX) {
 					mat_ubo_pool_release(mat_data->uniform_pool_slot);
@@ -1674,6 +1771,28 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		}
 	}
 
+	// StandardMaterial3D cutouts use the same alpha-scissor parameter that its
+	// generated spatial shader writes. Custom shaders provide their threshold
+	// from the generated material evaluator instead.
+	// BaseMaterial3D stores the alpha_scissor_threshold param on every
+	// material (its constructor sets 0.5 unconditionally), but the generated
+	// shader only declares the uniform when the scissor transparency mode is
+	// active. Honor the param only when the shader declares it; otherwise
+	// every standard material would carry a spurious 0.5 threshold and the
+	// candidate alpha test would run on fully opaque scenes.
+	if (!mat_data->is_custom_shader) {
+		RendererRD::MaterialStorage::ShaderData *shader_data = material_storage->material_get_shader_data(p_material_rid);
+		if (shader_data != nullptr && shader_data->uniforms.has("alpha_scissor_threshold")) {
+			Variant alpha_scissor_var = material_storage->material_get_param(p_material_rid, "alpha_scissor_threshold");
+			if (alpha_scissor_var.get_type() == Variant::FLOAT) {
+				mat.alpha_scissor_threshold = CLAMP((float)alpha_scissor_var, 0.0f, 1.0f);
+				if (mat.alpha_scissor_threshold > 0.0f) {
+					mat.flags |= RT_MAT_FLAG_ALPHA_SCISSOR;
+				}
+			}
+		}
+	}
+
 	// Update cache entry
 	entry->cached_counter = p_material_invalidation_counter;
 	entry->cached_rid_version = mat_version;
@@ -1686,7 +1805,127 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 // Acceleration structure building
 // ---------------------------------------------------------------------------
 
+// Field-wise compare; the struct has padding, so memcmp would be unreliable.
+static bool _rt_instance_equal(const RD::AccelerationStructureInstance &p_a, const RD::AccelerationStructureInstance &p_b) {
+	return p_a.blas == p_b.blas &&
+			p_a.id == p_b.id &&
+			p_a.mask == p_b.mask &&
+			p_a.hit_sbt_range == p_b.hit_sbt_range &&
+			p_a.flags == p_b.flags &&
+			p_a.transform == p_b.transform;
+}
+
+bool RenderRaytracing::_blas_compaction_enabled() {
+	if (!blas_compaction_support_checked) {
+		blas_compaction_support_checked = true;
+		// GODOT_RT_BLAS_COMPACTION=0 disables the lane for A/B runs and for
+		// pixel-exact capture comparisons: a compacted BVH can legitimately
+		// resolve exact-tie hits differently at shared edges.
+		blas_compaction_supported = OS::get_singleton()->get_environment("GODOT_RT_BLAS_COMPACTION") != "0" &&
+				RD::get_singleton()->has_feature(RD::SUPPORTS_BLAS_COMPACTION);
+	}
+	return blas_compaction_supported;
+}
+
+void RenderRaytracing::_collect_compaction_candidate(RTSurfaceData *p_surf_data) {
+	// The list is small; multiple instances share one RTSurfaceData per frame.
+	if (compaction_candidates.size() >= MAX_BLAS_COMPACTIONS_PER_FRAME * 4 ||
+			compaction_candidates.has(p_surf_data)) {
+		return;
+	}
+	compaction_candidates.push_back(p_surf_data);
+}
+
+void RenderRaytracing::_process_blas_compactions() {
+	if (compaction_candidates.is_empty()) {
+		return;
+	}
+
+	RD *rd = RD::get_singleton();
+	HashMap<RID, RID> remap; // Old BLAS -> compacted BLAS for this frame's TLAS list.
+	uint32_t budget = MAX_BLAS_COMPACTIONS_PER_FRAME;
+
+	for (RTSurfaceData *surf : compaction_candidates) {
+		if (!surf->blas.is_valid()) {
+			continue;
+		}
+		if (surf->compaction == RTSurfaceData::BlasCompaction::COPYING) {
+			if (!surf->compacted_blas.is_valid() || !rd->acceleration_structure_is_valid(surf->compacted_blas)) {
+				surf->compacted_blas = RID();
+				surf->compaction = RTSurfaceData::BlasCompaction::INELIGIBLE;
+				continue;
+			}
+			if (!rd->blas_is_compaction_complete(surf->compacted_blas)) {
+				continue;
+			}
+			remap.insert(surf->blas, surf->compacted_blas);
+			rd->free_rid(surf->blas);
+			surf->blas = surf->compacted_blas;
+			surf->compacted_blas = RID();
+			surf->blas_size = rd->blas_get_allocated_size(surf->blas);
+			surf->compaction = RTSurfaceData::BlasCompaction::DONE;
+			compacted_blas_count++;
+			if (surf->source_blas_size > surf->blas_size) {
+				compacted_blas_bytes_saved += surf->source_blas_size - surf->blas_size;
+			}
+			continue;
+		}
+		if (surf->compaction != RTSurfaceData::BlasCompaction::PENDING) {
+			continue;
+		}
+		if (budget == 0) {
+			continue;
+		}
+		const uint64_t compacted_size = rd->blas_get_compacted_size(surf->blas);
+		if (compacted_size == 0) {
+			continue; // The size-recording build has not completed yet; retry later.
+		}
+		const uint64_t allocated_size = rd->blas_get_allocated_size(surf->blas);
+		if (allocated_size != 0 && compacted_size >= allocated_size) {
+			surf->compaction = RTSurfaceData::BlasCompaction::DONE;
+			continue;
+		}
+		RID target = rd->blas_create_compacted_target(surf->blas, compacted_size);
+		if (!target.is_valid()) {
+			surf->compaction = RTSurfaceData::BlasCompaction::INELIGIBLE;
+			continue;
+		}
+		if (rd->blas_compact(surf->blas, target) != OK) {
+			rd->free_rid(target);
+			surf->compaction = RTSurfaceData::BlasCompaction::DONE;
+			continue;
+		}
+		rd->set_resource_name(target, "RT BLAS compacted");
+
+		// Keep the source in every TLAS until the compact command's completion
+		// callback makes the destination safe to publish on a later frame.
+		surf->compacted_blas = target;
+		surf->source_blas_size = allocated_size;
+		surf->compaction = RTSurfaceData::BlasCompaction::COPYING;
+		budget--;
+	}
+	compaction_candidates.clear();
+
+	if (!remap.is_empty()) {
+		// This frame's instance list was collected before the swap.
+		for (uint32_t i = 0; i < blass.size(); i++) {
+			const RID *swapped = remap.getptr(blass[i]);
+			if (swapped != nullptr) {
+				blass[i] = *swapped;
+			}
+		}
+		if (OS::get_singleton()->get_environment("GODOT_RT_DUMP_COMPACTION") == "1") {
+			print_line(vformat("RT_BLAS_COMPACTION swapped=%d total=%d saved_bytes=%d",
+					(int)remap.size(), compacted_blas_count, (int64_t)compacted_blas_bytes_saved));
+		}
+	}
+}
+
 void RenderRaytracing::build_acceleration_structures(RTViewportState *p_state, const LocalVector<RID> &p_dirty_blas_list, const LocalVector<RID> &p_dirty_blas_update_list) {
+	RENDER_TIMESTAMP("BLAS Compaction");
+
+	_process_blas_compactions();
+
 	RENDER_TIMESTAMP("BLAS Build");
 
 	for (const RID &blas_rid : p_dirty_blas_list) {
@@ -1704,13 +1943,22 @@ void RenderRaytracing::build_acceleration_structures(RTViewportState *p_state, c
 	RENDER_TIMESTAMP("TLAS Build");
 
 	uint32_t needed = MAX(blass.size(), (uint32_t)1);
+	bool tlas_recreated = false;
 	if (!p_state->tlas.is_valid() || needed > p_state->tlas_max_instances) {
 		if (p_state->tlas.is_valid()) {
 			RD::get_singleton()->free_rid(p_state->tlas);
 		}
-		p_state->tlas_max_instances = needed * 2;
+		const uint64_t standard_limit = RD::get_singleton()->limit_get(RD::LIMIT_MAX_ACCELERATION_STRUCTURE_INSTANCES);
+		// Do not let speculative doubling select an extended-limit TLAS for an
+		// actual instance count that still fits the standard traversal mode.
+		p_state->tlas_max_instances = rt_tlas_growth_capacity(needed, standard_limit);
 		p_state->tlas = RD::get_singleton()->tlas_create(p_state->tlas_max_instances, RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
+		if (!p_state->tlas.is_valid()) {
+			p_state->tlas_built = false;
+			return;
+		}
 		RD::get_singleton()->set_resource_name(p_state->tlas, "RT TLAS");
+		tlas_recreated = true;
 	}
 
 	LocalVector<RD::AccelerationStructureInstance> instances;
@@ -1726,7 +1974,33 @@ void RenderRaytracing::build_acceleration_structures(RTViewportState *p_state, c
 		inst.hit_sbt_range = RD::HitShaderBindingTableRange((1ULL << 32) | uint64_t(sbt_off));
 	}
 
-	RD::get_singleton()->tlas_build(p_state->tlas, instances);
+	// A rebuilt or refit BLAS can change the geometry bounds the TLAS was built
+	// against, so the TLAS is only reusable when no BLAS changed either.
+	bool reusable = p_state->tlas_built &&
+			!tlas_recreated &&
+			p_dirty_blas_list.is_empty() &&
+			p_dirty_blas_update_list.is_empty() &&
+			p_state->tlas_built_instances.size() == instances.size();
+	if (reusable) {
+		for (uint32_t i = 0; i < instances.size(); i++) {
+			if (!_rt_instance_equal(p_state->tlas_built_instances[i], instances[i])) {
+				reusable = false;
+				break;
+			}
+		}
+	}
+
+	if (reusable) {
+		return;
+	}
+
+	if (RD::get_singleton()->tlas_build(p_state->tlas, instances) != OK) {
+		p_state->tlas_built = false;
+		p_state->tlas_built_instances.clear();
+		return;
+	}
+	p_state->tlas_built_instances = instances;
+	p_state->tlas_built = true;
 }
 
 void RenderRaytracing::finalize_buffers(RTViewportState *p_state) {
@@ -1753,10 +2027,36 @@ void RenderRaytracing::finalize_buffers(RTViewportState *p_state) {
 			geometry_data.ptr(), geometry_data.size() * sizeof(RT_GeometryData));
 	update_or_grow(p_state->material_buffer, p_state->material_buffer_capacity,
 			material_data.ptr(), material_data.size() * sizeof(RT_MaterialData));
+
+	p_state->traversal_has_opaque_triangles = false;
+	p_state->traversal_has_query_instances = false;
+	p_state->traversal_has_procedural_instances = false;
+	for (uint32_t i = 0; i < instance_masks.size(); i++) {
+		const uint8_t mask = instance_masks[i];
+		p_state->traversal_has_opaque_triangles |= (mask & RT_INSTANCE_MASK_OPAQUE_TRIANGLE) != 0;
+		p_state->traversal_has_query_instances |= (mask & RT_INSTANCE_MASK_QUERY) != 0;
+		p_state->traversal_has_procedural_instances |= i < geometry_data.size() &&
+				(geometry_data[i].flags & RT_GEOM_FLAG_PROCEDURAL) != 0;
+	}
+
 	update_or_grow(p_state->motion_index_buffer, p_state->motion_index_buffer_capacity,
 			motion_indices.ptr(), motion_indices.size() * sizeof(int32_t));
 	update_or_grow(p_state->motion_transform_buffer, p_state->motion_transform_buffer_capacity,
 			motion_transforms.ptr(), motion_transforms.size() * sizeof(RT_InstanceMotionData));
+
+	// Current per-instance transforms for the compute lane, indexed by the
+	// TLAS instance custom index (inst.id = i, so blas_transforms order is the
+	// custom-index order shared with geometries[]/materials[]). Reading them
+	// from a table instead of the committed ray query keeps shading
+	// independent of query state, which the native-intersector fast path in
+	// the Metal driver relies on.
+	current_xform_data.resize(blas_transforms.size());
+	for (uint32_t i = 0; i < blas_transforms.size(); i++) {
+		RendererRD::MaterialStorage::store_transform_transposed_3x4(blas_transforms[i], current_xform_data[i].object_to_world);
+		RendererRD::MaterialStorage::store_transform_transposed_3x4(blas_transforms[i].affine_inverse(), current_xform_data[i].world_to_object);
+	}
+	update_or_grow(p_state->current_xform_buffer, p_state->current_xform_buffer_capacity,
+			current_xform_data.ptr(), current_xform_data.size() * sizeof(RT_InstanceCurrentXform));
 }
 
 // ---------------------------------------------------------------------------
@@ -1790,6 +2090,26 @@ bool RenderRaytracing::_build_merged_mm_blas(
 
 	if (prim_count == 0 || vertex_count == 0) {
 		return false;
+	}
+
+	// A merged BLAS has one TLAS winding flag for every baked instance. Mixed
+	// mirrored/non-mirrored transforms cannot be represented by that flag, so
+	// use the expanded TLAS path where each repeated instance gets its own flag.
+	const float *mm_local_data = mesh_storage->multimesh_get_local_data_ptr(p_mm_rid);
+	const uint32_t mm_stride = mesh_storage->multimesh_get_stride(p_mm_rid);
+	const uint32_t mm_offset = mesh_storage->multimesh_get_current_instance_offset(p_mm_rid);
+	if (!mm_local_data || mm_stride < 12) {
+		return false;
+	}
+	for (uint32_t i = 0; i < p_mm_count; i++) {
+		const float *d = mm_local_data + (mm_offset + i) * mm_stride;
+		const float determinant =
+				d[0] * (d[5] * d[10] - d[6] * d[9]) -
+				d[1] * (d[4] * d[10] - d[6] * d[8]) +
+				d[2] * (d[4] * d[9] - d[5] * d[8]);
+		if (determinant < 0.0f) {
+			return false;
+		}
 	}
 	static const uint32_t MM_MERGED_BLAS_MAX_TRIANGLES = (uint32_t)GLOBAL_GET("rendering/pathtracer/multimesh_merged_blas_max_triangles");
 	if ((uint64_t)p_mm_count * prim_count > MM_MERGED_BLAS_MAX_TRIANGLES) {
@@ -1992,7 +2312,6 @@ bool RenderRaytracing::_build_merged_mm_blas(
 		}
 		RID merge_uniform_set = rd->uniform_set_create(uniforms, mm_merge_shader.version_shader[merge_mode], 0, /*p_linear_pool=*/true);
 		ERR_FAIL_COND_V(!merge_uniform_set.is_valid(), false);
-		uint32_t mm_stride = mesh_storage->multimesh_get_stride(p_mm_rid);
 		uint32_t mm_cur_offset = mesh_storage->multimesh_get_current_instance_offset(p_mm_rid);
 		uint32_t tbn_stride_words = tbn_stride / 4;
 		// In the merged vertex buffer the TBN block starts after all N*V float3 positions.
@@ -2085,6 +2404,17 @@ bool RenderRaytracing::_build_merged_mm_blas(
 	}
 
 	// --- Build or refit the merged BLAS (uses merged_vtx_buffer for positions) ---
+	// Refit-capable acceleration structures trade traversal quality for update
+	// speed, so the merged BLAS is first built without ALLOW_UPDATE. The first
+	// mutation after that rebuilds it refit-capable; later mutations then refit.
+	// Static multimeshes keep the faster non-refittable BVH forever.
+	if (needs_rebake && entry.blas.is_valid() && entry.blas_built_once && !entry.blas_allow_update) {
+		rd->free_rid(entry.blas);
+		entry.blas = RID();
+		entry.blas_built_once = false;
+		entry.blas_allow_update = true;
+	}
+
 	if (!entry.blas.is_valid()) {
 		RD::AccelerationStructureGeometry as_geom;
 		as_geom.type = RD::AccelerationStructureGeometry::TYPE_TRIANGLES;
@@ -2098,9 +2428,10 @@ bool RenderRaytracing::_build_merged_mm_blas(
 			as_geom.geometry.triangles.index_count = p_mm_count * index_count;
 		}
 
-		BitField<RD::AccelerationStructureFlagBits> as_flags =
-				RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT |
-				RD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT;
+		BitField<RD::AccelerationStructureFlagBits> as_flags = RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT;
+		if (entry.blas_allow_update) {
+			as_flags.set_flag(RD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT);
+		}
 		entry.blas = rd->blas_create({ &as_geom, 1 }, as_flags);
 		ERR_FAIL_COND_V(!entry.blas.is_valid(), false);
 		rd->set_resource_name(entry.blas, "RT MM merged BLAS [" + itos(cache_key) + "]");
@@ -2174,6 +2505,14 @@ _FORCE_INLINE_ static uint32_t _rt_indices_to_primitives(RSE::PrimitiveType p_pr
 	static const uint32_t divisor[RSE::PRIMITIVE_MAX] = { 1, 2, 1, 3, 1 };
 	static const uint32_t subtractor[RSE::PRIMITIVE_MAX] = { 0, 0, 1, 0, 2 };
 	return (p_indices - subtractor[p_primitive]) / divisor[p_primitive];
+}
+
+static bool _rt_triangle_geometry_supported(RSE::PrimitiveType p_primitive) {
+	if (p_primitive == RSE::PRIMITIVE_TRIANGLES) {
+		return true;
+	}
+	WARN_PRINT_ONCE("Path tracing supports triangle-list mesh surfaces only. Convert point, line, or strip surfaces to PRIMITIVE_TRIANGLES; the unsupported surface was omitted from the TLAS.");
+	return false;
 }
 
 RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data, uint32_t p_rt_flags) {
@@ -2267,12 +2606,14 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			if (ps->dirty) {
 #ifdef TOOLS_ENABLED
 				uint32_t pre_proc_build_size = dirty_blas_list.size();
+				uint32_t pre_proc_refit_size = dirty_blas_update_list.size();
 #endif
-				update_procedural_blas(ps, dirty_blas_list);
+				update_procedural_blas(ps, dirty_blas_list, dirty_blas_update_list);
 				ps->dirty = false;
 #ifdef TOOLS_ENABLED
 				if (collect_render_info) {
 					rt_blas_builds += dirty_blas_list.size() - pre_proc_build_size;
+					rt_blas_refits += dirty_blas_update_list.size() - pre_proc_refit_size;
 				}
 #endif
 			}
@@ -2308,7 +2649,14 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				uint32_t inst_flags = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT |
 						RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 				instance_flags.push_back(inst_flags);
-				instance_masks.push_back(0xFF);
+				instance_masks.push_back(RT_INSTANCE_MASK_QUERY);
+
+#ifdef TOOLS_ENABLED
+				if (collect_render_info) {
+					tlas_instance_count++;
+					tlas_primitive_count += ps->aabb_count;
+				}
+#endif
 			}
 			continue;
 		}
@@ -2340,7 +2688,10 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					mm_surf = mm_surf->next;
 					continue;
 				}
-
+				if (!_rt_triangle_geometry_supported(mm_surf->primitive)) {
+					mm_surf = mm_surf->next;
+					continue;
+				}
 				void *mesh_surface = mm_surf->surface;
 				uint32_t surface_counter = mesh_storage->mesh_surface_get_rt_invalidation_counter(mesh_surface);
 
@@ -2359,7 +2710,6 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 				uint16_t material_counter = material_storage->material_get_rt_invalidation_counter(material_rid);
 				RTMaterialData *mat_data = process_material(material_rid, material_counter);
-
 				if (mat_data->rt_sbt_offset > 0 &&
 						!rt_shader_singleton->is_hg_ready_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
 					mm_surf = mm_surf->next;
@@ -2426,10 +2776,13 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				surf = surf->next;
 				continue;
 			}
+			if (!_rt_triangle_geometry_supported(surf->primitive)) {
+				surf = surf->next;
+				continue;
+			}
 
 			void *mesh_surface = surf->surface;
 			uint32_t surface_counter = mesh_storage->mesh_surface_get_rt_invalidation_counter(mesh_surface);
-
 #ifdef TOOLS_ENABLED
 			uint32_t pre_build_size = dirty_blas_list.size();
 			uint32_t pre_refit_size = dirty_blas_update_list.size();
@@ -2460,6 +2813,13 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				continue;
 			}
 
+			// BLAS_COMPACTION: revisit static BLASes until their recorded compacted size is
+			// consumed in build_acceleration_structures() this frame.
+			if (surf_data->compaction == RTSurfaceData::BlasCompaction::PENDING ||
+					surf_data->compaction == RTSurfaceData::BlasCompaction::COPYING) {
+				_collect_compaction_candidate(surf_data);
+			}
+
 			// Resolve material before TLAS so we can skip surfaces whose HG is not live yet (override > surface > mesh).
 			RID material_rid;
 			if (surf->owner->data->material_override.is_valid()) {
@@ -2476,7 +2836,6 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 			uint16_t material_counter = material_storage->material_get_rt_invalidation_counter(material_rid);
 			RTMaterialData *mat_data = process_material(material_rid, material_counter);
-
 			if (mat_data->rt_sbt_offset > 0 &&
 					!rt_shader_singleton->is_hg_ready_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
 				surf = surf->next;
@@ -2564,8 +2923,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 				}
 			}
+			inst_flags = rt_instance_flags_apply_transform_winding(inst_flags, final_transform);
 			instance_flags.push_back(inst_flags);
-			instance_masks.push_back(0xFF);
+			instance_masks.push_back(rt_instance_traversal_mask(inst_flags, surf_data->geometry.flags));
 
 			surf = surf->next;
 		}
@@ -2594,8 +2954,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			sbt_offsets.push_back(pending.mat_data->rt_sbt_offset);
 			material_data.push_back(pending.mat_data->data);
 			motion_indices.push_back(-1);
-			instance_flags.push_back(pending.inst_flags);
-			instance_masks.push_back(0xFF);
+			const uint32_t inst_flags = rt_instance_flags_apply_transform_winding(pending.inst_flags, pending.instance_transform);
+			instance_flags.push_back(inst_flags);
+			instance_masks.push_back(rt_instance_traversal_mask(inst_flags, merged_sd.geometry.flags));
 #ifdef TOOLS_ENABLED
 			if (collect_render_info) {
 				tlas_instance_count++;
@@ -2666,8 +3027,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					motion_indices.push_back(-1);
 				}
 
-				instance_flags.push_back(pending.inst_flags);
-				instance_masks.push_back(0xFF);
+				const uint32_t inst_flags = rt_instance_flags_apply_transform_winding(pending.inst_flags, final_transform);
+				instance_flags.push_back(inst_flags);
+				instance_masks.push_back(rt_instance_traversal_mask(inst_flags, surf_data->geometry.flags));
 			}
 
 #ifdef TOOLS_ENABLED
@@ -2989,6 +3351,21 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		uniforms.push_back(u);
 	}
 
+	// Binding 33: per-instance current transforms. Only the compute lane
+	// declares this binding; uniform_set_create ignores entries the raygen
+	// lane shaders do not use.
+	{
+		RD::Uniform u;
+		u.binding = 33;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		if (p_state->current_xform_buffer.is_valid()) {
+			u.append_id(p_state->current_xform_buffer);
+		} else {
+			u.append_id(RendererRD::MeshStorage::get_singleton()->get_default_rd_storage_buffer());
+		}
+		uniforms.push_back(u);
+	}
+
 	// Binding 5: Material buffer.
 	{
 		RD::Uniform u;
@@ -3020,7 +3397,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 
 		// rt_params layout (see RaytracingParamIndex enum):
 		// [0] = VIS_MODE, [1] = SAMPLE_COUNT, [2] = MAX_BOUNCES,
-		// [3] = DLSS_RR_ENABLED, [14] = LIGHT_COUNT, [15] = FRAME_INDEX
+		// [3] = DENOISER, [14] = LIGHT_COUNT, [15] = FRAME_INDEX
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FRAME_INDEX] = float(p_state->frame_counter++);
 
 		// Unjittered VP for motion vectors (matches raster convention).
@@ -3101,7 +3478,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		uniforms.push_back(u);
 	}
 
-	// Bindings 9-12: DLSS Ray Reconstruction output buffers (only in DLSS RR shader variant).
+	// Bindings 9-12, 29, and 30: path-tracing denoiser guide buffers.
 	bool dlss_rr_enabled = rb_data->dlss_rr_has_buffers();
 	if (dlss_rr_enabled) {
 		// Binding 9: DLSS RR Diffuse Albedo
@@ -3137,6 +3514,24 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			u.binding = 12;
 			u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
 			u.append_id(rb_data->dlss_rr_get_specular_hit_dist());
+			uniforms.push_back(u);
+		}
+
+		// Binding 29: Roughness (MetalFX consumes it separately from normals).
+		{
+			RD::Uniform u;
+			u.binding = 29;
+			u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
+			u.append_id(rb_data->dlss_rr_get_roughness());
+			uniforms.push_back(u);
+		}
+
+		// Binding 30: MetalFX denoise strength mask (1 excludes a pixel).
+		{
+			RD::Uniform u;
+			u.binding = 30;
+			u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
+			u.append_id(rb_data->dlss_rr_get_denoise_strength());
 			uniforms.push_back(u);
 		}
 	}
@@ -3209,6 +3604,23 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		}
 	}
 
+	// The compute-lane guide pass runs as its own kernel with the guide image
+	// bindings the path-trace variant no longer declares, so it needs a set
+	// created against its own shader layout. The uniforms list is a superset of
+	// both layouts; uniform_set_create drops entries a shader does not declare.
+	p_state->guide_uniform_set = RID();
+	if (shader && shader->uses_compute_scene_lane() && dlss_rr_enabled &&
+			(p_rt_flags & SceneShaderRaytracing::RT_FLAG_DENOISER_GUIDES_ENABLED) != 0) {
+		RID guide_shader_rd = shader->get_pipeline_shader_rd(p_rt_flags | SceneShaderRaytracing::RT_FLAG_GUIDE_PASS);
+		if (guide_shader_rd.is_valid()) {
+			p_state->guide_uniform_set = RD::get_singleton()->uniform_set_create(
+					uniforms,
+					guide_shader_rd,
+					RenderForwardClustered::SCENE_UNIFORM_SET,
+					/*p_linear_pool=*/true);
+		}
+	}
+
 	return result;
 }
 
@@ -3276,10 +3688,37 @@ void RenderRaytracing::copy_output_texture(const RenderDataRD *p_render_data) {
 		return;
 	}
 
-	// Copy raytracing output to main color buffer
-	for (uint32_t v = 0; v < rb->get_view_count(); v++) {
-		RID src = rb_data->rt_get_texture();
-		RID dst = rb->get_internal_texture(v);
-		owner->copy_effects->copy_to_rect(src, dst, Rect2i(0, 0, rb->get_internal_size().x, rb->get_internal_size().y), false, false, false, false, false, true);
+	// Debug: read the raw RGBA16F path-tracer output back and count pixels with
+	// an exact-zero color channel (the sparse-speckle compiler-corruption
+	// signature). Enabled with GODOT_DBG_DUMP_RT=1; reads back every 30 frames
+	// which forces a GPU sync, so debug only.
+	static const bool dump_rt = OS::get_singleton()->get_environment("GODOT_DBG_DUMP_RT") == "1";
+	if (dump_rt) {
+		static uint64_t rt_dump_frame = 0;
+		rt_dump_frame++;
+		if (rt_dump_frame % 10 == 0) {
+			Vector<uint8_t> data = RD::get_singleton()->texture_get_data(rb_data->rt_get_texture(), 0);
+			Size2i size = rb->get_internal_size();
+			const uint16_t *px = (const uint16_t *)data.ptr();
+			uint64_t total = (uint64_t)size.x * size.y;
+			uint64_t zero_channel = 0;
+			uint64_t nonfinite = 0;
+			if (data.size() >= (int64_t)(total * 8)) {
+				for (uint64_t p = 0; p < total; p++) {
+					float r = Math::half_to_float(px[p * 4 + 0]);
+					float g = Math::half_to_float(px[p * 4 + 1]);
+					float b = Math::half_to_float(px[p * 4 + 2]);
+					if (!Math::is_finite(r) || !Math::is_finite(g) || !Math::is_finite(b)) {
+						nonfinite++;
+					}
+					bool any_zero = (r == 0.0f) || (g == 0.0f) || (b == 0.0f);
+					bool all_zero = (r == 0.0f) && (g == 0.0f) && (b == 0.0f);
+					if (any_zero && !all_zero) {
+						zero_channel++;
+					}
+				}
+			}
+			print_line(vformat("RT_RAW_DUMP frame=%d zero_channel=%d nonfinite=%d total=%d", rt_dump_frame, zero_channel, nonfinite, total));
+		}
 	}
 }
