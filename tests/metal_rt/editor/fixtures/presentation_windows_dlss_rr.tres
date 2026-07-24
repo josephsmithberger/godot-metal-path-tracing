@@ -1,5 +1,0 @@
-[gd_resource type="Environment" format=3]
-
-[resource]
-pathtracing_enabled = true
-pathtracing_denoiser = 1

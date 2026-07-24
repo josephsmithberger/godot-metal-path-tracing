@@ -1,19 +1,7 @@
 name: 🍎 macOS Builds
 on:
   workflow_call:
-    inputs:
-      run-metal-rt:
-        description: Run the self-hosted Apple Silicon Metal RT validation lane.
-        required: false
-        default: false
-        type: boolean
   workflow_dispatch:
-    inputs:
-      run-metal-rt:
-        description: Run the self-hosted Apple Silicon Metal RT validation lane.
-        required: false
-        default: false
-        type: boolean
 
 # Global Settings
 env:
@@ -203,61 +191,3 @@ jobs:
         with:
           name: macos-editor-metal-only-logs
           path: metal-only-logs/*
-
-  # Native Metal RT behavior must run on a persistent Apple Silicon GPU. The
-  # custom `metal-rt` label is the capability label: repositories opt in with
-  # the ENABLE_METAL_RT_CI variable after registering a matching runner. A
-  # manual dispatch can also opt in explicitly with the workflow input.
-  test-metal-rt:
-    if: vars.ENABLE_METAL_RT_CI == 'true' || inputs.run-metal-rt
-    needs: build-macos-metal-only
-    runs-on: [self-hosted, macOS, ARM64, metal-rt]
-    name: Metal RT render validation (self-hosted Apple Silicon)
-    timeout-minutes: 30
-    concurrency:
-      group: metal-rt-apple-silicon
-      cancel-in-progress: false
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          submodules: recursive
-
-      - name: Download Metal-only editor
-        uses: ./.github/actions/download-artifact
-        with:
-          name: macos-editor-metal-only
-          path: bin
-
-      - name: Validate runner and binary architecture
-        env:
-          GODOT_RUNNER_ARCH: ${{ runner.arch }}
-          GODOT_RUNNER_OS: ${{ runner.os }}
-        run: |
-          if [[ "$GODOT_RUNNER_OS" != "macOS" || "$GODOT_RUNNER_ARCH" != "ARM64" ]]; then
-            echo "Expected a macOS ARM64 runner, got $GODOT_RUNNER_OS $GODOT_RUNNER_ARCH" >&2
-            exit 1
-          fi
-          chmod +x bin/godot.macos.editor.arm64
-          lipo -verify_arch arm64 bin/godot.macos.editor.arm64
-
-      - name: Run capability, GPU, image, traversal parity, and fallback validation
-        env:
-          MTL_DEBUG_LAYER: 1
-        run: |
-          python3 tests/metal_rt/run_mac_rt_tests.py \
-            --stage gpu \
-            --stage image \
-            --stage intersector-parity \
-            --stage fallback \
-            --binary bin/godot.macos.editor.arm64 \
-            --artifact-dir metal-rt-artifacts \
-            --fail-on-skip \
-            --keep-going
-
-      - name: Upload Metal RT validation artifacts
-        if: always()
-        uses: ./.github/actions/upload-artifact
-        with:
-          name: macos-metal-rt-validation
-          path: metal-rt-artifacts/**

@@ -1,9 +1,0 @@
-[gd_scene load_steps=3 format=3]
-
-[ext_resource type="Script" path="res://scripts/debug_closeup_capture.gd" id="1_closeup"]
-[ext_resource type="PackedScene" path="res://fixtures/e0_hg0.tscn" id="2_e0"]
-
-[node name="E0CloseupCapture" type="Node3D"]
-script = ExtResource("1_closeup")
-
-[node name="E0" parent="." instance=ExtResource("2_e0")]

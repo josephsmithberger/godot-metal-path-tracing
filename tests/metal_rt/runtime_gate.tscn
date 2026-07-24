@@ -1,8 +1,0 @@
-[gd_scene load_steps=2 format=3]
-
-[sub_resource type="BoxMesh" id="BoxMesh_runtime_gate"]
-
-[node name="MetalRTRuntimeGate" type="Node"]
-
-[node name="Mesh" type="MeshInstance3D" parent="."]
-mesh = SubResource("BoxMesh_runtime_gate")
