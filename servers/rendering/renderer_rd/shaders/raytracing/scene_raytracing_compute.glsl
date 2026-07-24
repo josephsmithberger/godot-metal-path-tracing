@@ -230,6 +230,29 @@ vec4 sample_material_texture(uint texture_index, vec2 uv, uint material_flags) {
 	return sample_bindless_texture(texture_index, uv);
 }
 
+// Any-hit only needs opacity for the built-in material. Avoid constructing a
+// full hit frame (positions, TBN, vertex color) and sampling normal/ORM/
+// emission textures for every non-opaque candidate in mixed-alpha scenes.
+bool evaluate_hg0_alpha_candidate(ComputeHit hit, MaterialData material) {
+	float alpha = material.albedo_color.a;
+	if ((material.flags & RT_MAT_FLAG_HAS_ALBEDO_TEX) != 0u) {
+		vec2 uv;
+		if (hit.procedural) {
+			uv = hit.procedural_uv;
+		} else {
+			GeometryData geometry = geometries[hit.geometry_idx];
+			uint i0, i1, i2;
+			get_triangle_indices_ex(geometry, hit.primitive_idx, i0, i1, i2);
+			vec3 bary = vec3(1.0 - hit.barycentrics.x - hit.barycentrics.y,
+					hit.barycentrics.x, hit.barycentrics.y);
+			uv = fetch_uv(geometry, i0, i1, i2, bary);
+		}
+		uv = uv * material.uv1_scale + material.uv1_offset;
+		alpha *= sample_material_texture(material.albedo_texture_idx, uv, material.flags).a;
+	}
+	return !(material.alpha_scissor_threshold > 0.0 && alpha < material.alpha_scissor_threshold);
+}
+
 MaterialResult evaluate_hg0(ComputeHitData hit) {
 	MaterialData material = materials[hit.geometry_idx];
 	vec2 uv = hit.uv * material.uv1_scale + material.uv1_offset;
@@ -304,6 +327,12 @@ bool ray_query_candidate_accepts(rayQueryEXT query, vec3 origin, vec3 direction)
 	}
 	if (!needs_alpha_test) {
 		return true;
+	}
+	// Built-in materials resolve opacity from albedo alone; only generated
+	// custom shaders need the full material evaluation, because their opacity
+	// can depend on arbitrary material code.
+	if ((candidate_material.flags & RT_MAT_FLAG_CUSTOM_SHADER) == 0u || candidate_material.dispatch_index == 0u) {
+		return evaluate_hg0_alpha_candidate(candidate, candidate_material);
 	}
 	mat4 candidate_object_to_world = current_object_to_world(candidate.geometry_idx);
 	mat4 candidate_world_to_object = current_world_to_object(candidate.geometry_idx);
