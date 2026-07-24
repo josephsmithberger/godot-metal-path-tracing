@@ -50,8 +50,13 @@ void main() {
 
 	const uint max_bounces = RT_GET_MAX_BOUNCES();
 
-	// TODO: when we have a spp > 0 the first raycast is always identical,
-	// we should move it out of the loop
+	// NOTE: the primary ray carries no per-sample jitter, so with spp > 1 the
+	// first raycast is identical for every sample. Hoisting it was measured on
+	// the compute lane (Apple M5) and rejected: the cached primary hit state
+	// living across the sample loop costs more in register/scratch pressure
+	// than the redundant traversals cost to re-run. If revisited here, the SER
+	// route (trace the hitObjectEXT once, hitObjectExecuteShaderEXT per
+	// sample) is the only shape that avoids re-tracing.
 
 	[[dont_unroll]] for (uint sample_idx = 0u; sample_idx < samples_per_pixel; sample_idx++) {
 		PathState ps;
@@ -193,15 +198,17 @@ void main() {
 		sky_color = mix(sky_color, fog_color, scene_data_block.data.fog_sky_affect);
 	}
 
-#ifdef DLSS_RR_ENABLED
+#ifdef DENOISER_GUIDES_ENABLED
 	{
 		uint total_bounces = get_total_bounces(ps.packed_bounces_flags);
 		if (total_bounces == 0u && is_sample_zero(ps.packed_bounces_flags)) {
 			ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
-			imageStore(dlss_rr_diffuse_albedo, pixel, vec4(sky_color, 1.0));
-			imageStore(dlss_rr_specular_albedo, pixel, vec4(0.0));
-			imageStore(dlss_rr_normal_roughness, pixel, vec4(-gl_WorldRayDirectionEXT, 0.0));
-			imageStore(dlss_rr_specular_hit_dist, pixel, vec4(-1.0));
+			imageStore(denoiser_diffuse_albedo, pixel, vec4(sky_color, 1.0));
+			imageStore(denoiser_specular_albedo, pixel, vec4(0.0));
+			imageStore(denoiser_normal_roughness, pixel, vec4(-gl_WorldRayDirectionEXT, 0.0));
+			imageStore(denoiser_roughness, pixel, vec4(0.0));
+			imageStore(denoiser_specular_hit_dist, pixel, vec4(-1.0));
+			imageStore(denoiser_strength, pixel, vec4(1.0));
 		}
 	}
 #endif
@@ -324,6 +331,7 @@ void main() {
 	MaterialResult m;
 	m.albedo = albedo;
 	m.alpha = alpha;
+	m.alpha_scissor_threshold = alpha_scissor_threshold;
 	m.roughness = roughness;
 	m.metalness = metallic;
 	m.specular = specular;
@@ -360,7 +368,7 @@ void main() {
 	// Normal mapping.
 	vec3 tangent_space_normal = vec3(0.0, 0.0, 1.0);
 	vec3 final_normal = h.geometry_normal;
-	if ((mat.flags & 1u) != 0u) {
+	if ((mat.flags & RT_MAT_FLAG_HAS_NORMAL_MAP) != 0u) {
 		vec3 normal_sample = sample_bindless_texture(mat.normal_texture_idx, uv).rgb;
 		tangent_space_normal.xy = normal_sample.xy * 2.0 - 1.0;
 		tangent_space_normal.z = sqrt(max(0.0, 1.0 - dot(tangent_space_normal.xy, tangent_space_normal.xy)));
@@ -368,14 +376,16 @@ void main() {
 	}
 
 	// Texture sampling.
-	vec4 albedo_tex = sample_material_texture(mat.albedo_texture_idx, uv, mat.flags);
+	vec4 albedo_tex = (mat.flags & RT_MAT_FLAG_HAS_ALBEDO_TEX) != 0u ?
+			sample_material_texture(mat.albedo_texture_idx, uv, mat.flags) : vec4(1.0);
 	vec3 albedo = albedo_tex.rgb * mat.albedo_color.rgb;
-	vec3 orm = sample_material_texture(mat.orm_texture_idx, uv, mat.flags).rgb;
+	vec3 orm = (mat.flags & RT_MAT_FLAG_HAS_ORM_TEX) != 0u ?
+			sample_material_texture(mat.orm_texture_idx, uv, mat.flags).rgb : vec3(1.0);
 	float roughness = saturate(orm.g * mat.roughness);
 	float metalness = saturate(orm.b * mat.metallic);
 
 	vec3 emissive = vec3(0.0);
-	if ((mat.flags & 2u) != 0u) {
+	if ((mat.flags & RT_MAT_FLAG_HAS_EMISSION_TEX) != 0u) {
 		emissive = sample_material_texture(mat.emission_texture_idx, uv, mat.flags).rgb * mat.emission_color * mat.emission_strength;
 		emissive *= scene_data_block.data.emissive_exposure_normalization;
 	}
@@ -384,6 +394,7 @@ void main() {
 	MaterialResult m;
 	m.albedo = albedo;
 	m.alpha = albedo_tex.a * mat.albedo_color.a;
+	m.alpha_scissor_threshold = mat.alpha_scissor_threshold;
 	m.roughness = roughness;
 	m.metalness = metalness;
 	m.specular = mat.specular;
@@ -505,11 +516,12 @@ void main() {
 	}
 #else
 	// HG0: Standard material alpha test.
-	vec2 uv = fetch_uv(geom, i0, i1, i2, bary);
 	MaterialData mat = materials[geometry_idx];
-	uv = uv * mat.uv1_scale + mat.uv1_offset;
-	float alpha = texture(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv).a;
-	alpha *= mat.albedo_color.a;
+	float alpha = mat.albedo_color.a;
+	if ((mat.flags & RT_MAT_FLAG_HAS_ALBEDO_TEX) != 0u) {
+		vec2 uv = fetch_uv(geom, i0, i1, i2, bary) * mat.uv1_scale + mat.uv1_offset;
+		alpha *= texture(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv).a;
+	}
 
 	if (alpha < 0.5) {
 		ignoreIntersectionEXT;

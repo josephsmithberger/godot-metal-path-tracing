@@ -7,7 +7,7 @@
 // Required bindings (before this file):
 //   tlas, payload, scene_data_block, geometries[], motion_indices[], materials[], motion_transforms[], bindless_textures[],
 //   SAMPLER_* (12 material samplers), rt_params, rt_depth_image,
-//   DLSS-RR images (ifdef DLSS_RR_ENABLED)
+//   denoiser guide images (ifdef DENOISER_GUIDES_ENABLED)
 
 // ============================================================================
 // HIT DATA
@@ -93,9 +93,9 @@ vec4 sample_bindless_texture_point(uint tex_idx, vec2 uv) {
 	return texture(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_NEAREST_REPEAT), uv);
 }
 
-/// Sample with the appropriate filter based on material flags (bit 2 = point filtering).
+/// Sample with the appropriate filter based on material flags.
 vec4 sample_material_texture(uint tex_idx, vec2 uv, uint mat_flags) {
-	if ((mat_flags & 4u) != 0u) {
+	if ((mat_flags & RT_MAT_FLAG_POINT_FILTER) != 0u) {
 		return sample_bindless_texture_point(tex_idx, uv);
 	}
 	return sample_bindless_texture(tex_idx, uv);
@@ -426,6 +426,18 @@ void debug_visualize(
 		} else {
 			ps.radiance = vec3(1.0, 0.0, 0.0);
 		}
+	} else if (vis_mode == 23) {
+		uint encoded_id = pcg_hash(gl_InstanceCustomIndexEXT + 1u);
+		ps.radiance = vec3(0.2) + vec3(
+				float(encoded_id & 0xFFu),
+				float((encoded_id >> 8u) & 0xFFu),
+				float((encoded_id >> 16u) & 0xFFu)) * (0.8 / 255.0);
+	} else if (vis_mode == 24) {
+		uint encoded_id = pcg_hash(gl_PrimitiveID + 1u);
+		ps.radiance = vec3(0.2) + vec3(
+				float(encoded_id & 0xFFu),
+				float((encoded_id >> 8u) & 0xFFu),
+				float((encoded_id >> 16u) & 0xFFu)) * (0.8 / 255.0);
 	}
 
 	ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
@@ -478,19 +490,21 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	vec3 diffuseReflectance = baseColorToDiffuseReflectance(brdf_mat.baseColor, brdf_mat.metalness);
 
 	// =================================================================
-	// DLSS Ray Reconstruction output (primary ray, sample 0 only)
+	// Denoiser guide output (primary ray, sample 0 only)
 	// =================================================================
-#ifdef DLSS_RR_ENABLED
+#ifdef DENOISER_GUIDES_ENABLED
 	if (total_bounces == 0u && is_sample_zero(ps.packed_bounces_flags)) {
 		ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
 
 		vec3 diffuse_albedo = DLSSRR_computeDiffuseAlbedo(m.albedo, m.metalness);
-		imageStore(dlss_rr_diffuse_albedo, pixel, vec4(diffuse_albedo, 1.0));
+		imageStore(denoiser_diffuse_albedo, pixel, vec4(diffuse_albedo, 1.0));
 
 		vec3 specular_albedo = DLSSRR_computeSpecularAlbedo(m.albedo, m.metalness, brdf_mat.dielectricF0, m.roughness, NdotV);
-		imageStore(dlss_rr_specular_albedo, pixel, vec4(clamp(specular_albedo, vec3(0.0), vec3(1.0)), 1.0)); // match UNORM8 like before - fixes some issues with garbling..
+		imageStore(denoiser_specular_albedo, pixel, vec4(clamp(specular_albedo, vec3(0.0), vec3(1.0)), 1.0));
 
-		imageStore(dlss_rr_normal_roughness, pixel, vec4(N, m.roughness));
+		imageStore(denoiser_normal_roughness, pixel, vec4(N, m.roughness));
+		imageStore(denoiser_roughness, pixel, vec4(m.roughness));
+		imageStore(denoiser_strength, pixel, vec4(0.0));
 
 		// Specular hit distance via inline ray query (only for smooth surfaces).
 		float spec_hit_dist = -1.0;
@@ -515,7 +529,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 				spec_hit_dist = rayQueryGetIntersectionTEXT(spec_rq, true);
 			}
 		}
-		imageStore(dlss_rr_specular_hit_dist, pixel, vec4(spec_hit_dist));
+		imageStore(denoiser_specular_hit_dist, pixel, vec4(spec_hit_dist));
 	}
 #endif
 
@@ -526,7 +540,20 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 
 	uint rt_light_count = uint(get_rt_param(RT_PARAM_LIGHT_COUNT));
 	if (rt_light_count > 0u) {
-		vec3 hit_pos_offset = offset_ray_origin(h.hit_pos, h.geometry_normal);
+		vec3 shadow_pos = h.hit_pos;
+#ifdef RT_HIT_ATTRIBS_DECLARED
+		{
+			GeometryData shadow_geom = geometries[h.geometry_idx];
+			if ((shadow_geom.flags & FLAG_PROCEDURAL) == 0u) {
+				uint s0, s1, s2;
+				get_triangle_indices(shadow_geom, s0, s1, s2);
+				vec3 shadow_bary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
+				shadow_pos = shadow_terminator_hit_pos(shadow_geom, s0, s1, s2, shadow_bary,
+						h.hit_pos, h.geometry_normal, mat4(gl_ObjectToWorldEXT));
+			}
+		}
+#endif
+		vec3 hit_pos_offset = offset_ray_origin(shadow_pos, h.geometry_normal);
 		bool is_indirect = (diffuse_bounces > 0u);
 		vec3 direct_light = lights_evaluate_direct_lighting(
 				hit_pos_offset, N, V, brdf_mat, ps.rng_state, is_indirect, rt_light_count);

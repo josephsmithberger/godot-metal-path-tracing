@@ -1,12 +1,29 @@
 // Shared defines and common bindings for all RT shader stages.
 // Include AFTER raytracing_inc.glsl and scene_data_inc.glsl.
-// The includer must set exactly one of RT_STAGE_{RAYGEN,MISS,CLOSEST_HIT,ANY_HIT,INTERSECTION}.
+// The includer must set exactly one of
+// RT_STAGE_{RAYGEN,MISS,CLOSEST_HIT,ANY_HIT,INTERSECTION,COMPUTE}.
 
 // Specialization constant (bits 0-20: flags, 21-28: samples, 29-31: bounces).
 layout(constant_id = 0) const uint RT_FLAGS = 0u;
 
-#define RT_FLAG_DLSS_RR_ENABLED (1u << 1)
+#define RT_FLAG_DENOISER_GUIDES_ENABLED (1u << 1)
 #define RT_FLAG_FOG_ENABLED (1u << 2)
+// Every visible TLAS instance is an opaque triangle. Folds at pipeline
+// compile time.
+#define RT_FLAG_ALL_OPAQUE (1u << 4)
+#define RT_FLAG_MIXED_ALPHA (1u << 5)
+// Compute-lane pipeline selector: this rt_flags value belongs to the denoiser
+// guide pass, not the path-trace kernel (see GUIDE_PASS_MODE).
+#define RT_FLAG_GUIDE_PASS (1u << 6)
+// Shadow rays treat alpha-tested geometry as opaque (skip the query partition).
+#define RT_FLAG_OPAQUE_SHADOWS (1u << 7)
+
+// Matches RT_INSTANCE_MASK_* in render_raytracing.h. Opaque triangles can be
+// traversed by Metal's native intersector; alpha and procedural geometry stay
+// on the exact candidate-evaluation query lane.
+#define RT_INSTANCE_MASK_OPAQUE_TRIANGLE (1u << 0)
+#define RT_INSTANCE_MASK_QUERY (1u << 1)
+#define RT_INSTANCE_MASK_ALL (RT_INSTANCE_MASK_OPAQUE_TRIANGLE | RT_INSTANCE_MASK_QUERY)
 
 #define RT_SAMPLE_COUNT_SHIFT 21u
 #define RT_SAMPLE_COUNT_MASK 0xFFu
@@ -30,7 +47,7 @@ layout(set = 0, binding = 14, std430) readonly buffer GlobalShaderUniformData {
 }
 global_shader_uniforms;
 
-#ifndef RT_STAGE_ANY_HIT
+#if !defined(RT_STAGE_ANY_HIT) && !defined(RT_STAGE_INTERSECTION)
 
 layout(set = 0, binding = 6, std140) uniform RaytracingParams {
 	vec4 rt_params[4];
@@ -48,11 +65,13 @@ vec2 project_uv(vec3 world_pos, mat4 vp) {
 	return clip.xy / clip.w * 0.5 + 0.5;
 }
 
-#ifdef DLSS_RR_ENABLED
-layout(set = 0, binding = 9, rgba16f) uniform image2D dlss_rr_diffuse_albedo;
-layout(set = 0, binding = 10, rgba16f) uniform image2D dlss_rr_specular_albedo;
-layout(set = 0, binding = 11, rgba16f) uniform image2D dlss_rr_normal_roughness;
-layout(set = 0, binding = 12, r16f) uniform image2D dlss_rr_specular_hit_dist;
+#ifdef DENOISER_GUIDES_ENABLED
+layout(set = 0, binding = 9, rgba8) uniform image2D denoiser_diffuse_albedo;
+layout(set = 0, binding = 10, rgba16f) uniform image2D denoiser_specular_albedo;
+layout(set = 0, binding = 11, rgba8_snorm) uniform image2D denoiser_normal_roughness;
+layout(set = 0, binding = 12, r16f) uniform image2D denoiser_specular_hit_dist;
+layout(set = 0, binding = 29, r16f) uniform image2D denoiser_roughness;
+layout(set = 0, binding = 30, r8) uniform image2D denoiser_strength;
 #endif
 
 // Binding 14 is reserved for GlobalShaderUniformData (declared above).
@@ -61,7 +80,7 @@ layout(set = 0, binding = 12, r16f) uniform image2D dlss_rr_specular_hit_dist;
 layout(set = 0, binding = 28, rg16f) uniform image2D rt_velocity_image;
 layout(set = 0, binding = 15, r32f) uniform image2D rt_depth_image;
 
-#endif // !RT_STAGE_ANY_HIT
+#endif // !RT_STAGE_ANY_HIT && !RT_STAGE_INTERSECTION
 
 // Shared hitAttributeEXT layout for all hit-group stages.
 // Vulkan requires every shader in a hit group to agree on this layout.

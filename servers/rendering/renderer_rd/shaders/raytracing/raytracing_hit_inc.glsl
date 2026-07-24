@@ -61,9 +61,11 @@ void get_triangle_indices_ex(in GeometryData geom, uint primitive_id, out uint i
 }
 
 /// Convenience wrapper using gl_PrimitiveID (hit shaders only).
+#ifndef RT_COMPUTE_LANE
 void get_triangle_indices(in GeometryData geom, out uint i0, out uint i1, out uint i2) {
 	get_triangle_indices_ex(geom, gl_PrimitiveID, i0, i1, i2);
 }
+#endif
 
 // ============================================================================
 // UV FETCHING
@@ -223,6 +225,77 @@ TBNResult fetch_tbn(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary) 
 	result.bitangent_sign = sign(bary.x * t0.bitangent_sign + bary.y * t1.bitangent_sign + bary.z * t2.bitangent_sign);
 
 	return result;
+}
+
+// ============================================================================
+// SHADOW TERMINATOR SMOOTHING
+// ============================================================================
+
+/// Object-space vertex position. For compressed meshes this is the BLAS's
+/// AABB-normalized space; the TLAS instance transform folds in the AABB
+/// xform, so object_to_world maps these coordinates to world directly.
+vec3 fetch_object_position(in GeometryData geom, uint idx) {
+	if ((geom.flags & FLAG_COMPRESSED) != 0u) {
+		Uint32Buffer vb = Uint32Buffer(geom.vertex_address);
+		uint w0 = vb.v[idx * 2u];
+		uint w1 = vb.v[idx * 2u + 1u];
+		return vec3(float(w0 & 0xFFFFu), float(w0 >> 16), float(w1 & 0xFFFFu)) / 65535.0;
+	}
+	FloatBuffer vb = FloatBuffer(geom.vertex_address);
+	uint stride_floats = geom.position_stride >> 2;
+	return vec3(vb.v[idx * stride_floats + 0u],
+			vb.v[idx * stride_floats + 1u],
+			vb.v[idx * stride_floats + 2u]);
+}
+
+/// Shadow-ray origin lifted onto the smooth surface implied by the vertex
+/// normals (Hanika, "Hacking the Shadow Terminator", Ray Tracing Gems II).
+/// Coarse meshes otherwise self-shadow whole facets near the terminator:
+/// the interpolated normal reports the facet as lit while the shadow ray,
+/// starting on the flat facet, dips through the neighboring geometry.
+/// `oriented_normal` is the world-space interpolated normal, already flipped
+/// toward the incoming ray; back-face hits and concave regions keep the true
+/// hit position. Returns a world-space position.
+vec3 shadow_terminator_hit_pos(in GeometryData geom, uint i0, uint i1, uint i2,
+		vec3 bary, vec3 world_hit_pos, vec3 oriented_normal, mat4 object_to_world) {
+	bool compressed = (geom.flags & FLAG_COMPRESSED) != 0u;
+	if (geom.vertex_address == 0ul || geom.normal_byte_offset == OFFSET_NONE ||
+			(!compressed && geom.position_stride < 12u)) {
+		return world_hit_pos; // No smooth normals (or 2D mesh): nothing to correct.
+	}
+
+	vec3 p0 = (object_to_world * vec4(fetch_object_position(geom, i0), 1.0)).xyz;
+	vec3 p1 = (object_to_world * vec4(fetch_object_position(geom, i1), 1.0)).xyz;
+	vec3 p2 = (object_to_world * vec4(fetch_object_position(geom, i2), 1.0)).xyz;
+
+	vec3 n0, n1, n2;
+	if (compressed) {
+		n0 = fetch_tbn_compressed_vertex(geom, i0).normal;
+		n1 = fetch_tbn_compressed_vertex(geom, i1).normal;
+		n2 = fetch_tbn_compressed_vertex(geom, i2).normal;
+	} else {
+		n0 = fetch_tbn_uncompressed_vertex(geom, i0).normal;
+		n1 = fetch_tbn_uncompressed_vertex(geom, i1).normal;
+		n2 = fetch_tbn_uncompressed_vertex(geom, i2).normal;
+	}
+	mat3 model_rotation = mat3(object_to_world);
+	mat3 normal_matrix = mat3(
+			normalize(model_rotation[0]),
+			normalize(model_rotation[1]),
+			normalize(model_rotation[2]));
+	n0 = normalize(normal_matrix * n0);
+	n1 = normalize(normal_matrix * n1);
+	n2 = normalize(normal_matrix * n2);
+
+	// Interpolate the hit point's projection onto each vertex tangent plane.
+	vec3 offset = bary.x * (n0 * dot(p0 - world_hit_pos, n0)) +
+			bary.y * (n1 * dot(p1 - world_hit_pos, n1)) +
+			bary.z * (n2 * dot(p2 - world_hit_pos, n2));
+
+	// Only lift the origin toward the ray-facing outside of the surface.
+	vec3 face_normal = cross(p1 - p0, p2 - p0);
+	face_normal = dot(face_normal, oriented_normal) < 0.0 ? -face_normal : face_normal;
+	return dot(offset, face_normal) > 0.0 ? world_hit_pos + offset : world_hit_pos;
 }
 
 // ============================================================================

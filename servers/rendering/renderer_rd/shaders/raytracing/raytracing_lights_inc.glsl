@@ -166,17 +166,16 @@ float lights_get_specular_multiplier(float specular_amount, float roughness) {
 /// Inline alpha test for ray query candidates. Returns true if the hit is opaque (alpha >= 0.5).
 /// Mirrors the any-hit shader logic for use with inline ray queries.
 bool ray_query_alpha_test(uint geometry_idx, uint primitive_id, vec2 candidate_bary) {
-	vec3 bary = vec3(1.0 - candidate_bary.x - candidate_bary.y, candidate_bary.x, candidate_bary.y);
-
-	GeometryData geom = geometries[geometry_idx];
-	uint i0, i1, i2;
-	get_triangle_indices_ex(geom, primitive_id, i0, i1, i2);
-	vec2 uv = fetch_uv(geom, i0, i1, i2, bary);
-
 	MaterialData mat = materials[geometry_idx];
-	uv = uv * mat.uv1_scale + mat.uv1_offset;
-	float alpha = texture(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv).a;
-	alpha *= mat.albedo_color.a;
+	float alpha = mat.albedo_color.a;
+	if ((mat.flags & RT_MAT_FLAG_HAS_ALBEDO_TEX) != 0u) {
+		vec3 bary = vec3(1.0 - candidate_bary.x - candidate_bary.y, candidate_bary.x, candidate_bary.y);
+		GeometryData geom = geometries[geometry_idx];
+		uint i0, i1, i2;
+		get_triangle_indices_ex(geom, primitive_id, i0, i1, i2);
+		vec2 uv = fetch_uv(geom, i0, i1, i2, bary) * mat.uv1_scale + mat.uv1_offset;
+		alpha *= texture(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv).a;
+	}
 
 	return alpha >= 0.5;
 }
@@ -189,7 +188,9 @@ bool ray_query_alpha_test(uint geometry_idx, uint primitive_id, vec2 candidate_b
 /// Uses SkipClosestHitShader so only any_hit (alpha test) and miss are invoked.
 /// TerminateOnFirstHit causes early exit on first confirmed opaque hit.
 bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout uint rng_state) {
-#ifdef USE_SER
+#ifdef RT_COMPUTE_LANE
+	return !trace_shadow_blocked(origin, direction, max_dist - 0.001);
+#elif defined(USE_SER)
 	hitObjectEXT hitObject;
 	hitObjectTraceRayEXT(hitObject, tlas,
 			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
@@ -311,6 +312,13 @@ vec3 lights_evaluate_direct_lighting(
 			float perp_sq = dot(perp, perp);
 			float dt = sqrt(max(0.0, light.radius * light.radius - perp_sq));
 			shadow_dist = max(0.0, t_center - dt);
+		}
+
+		// Backfacing early-out before paying the shadow ray: the BRDF below
+		// returns zero whenever NdotL <= 0 (Lbackfacing), so this only skips
+		// work that cannot contribute. The directional path already does this.
+		if (dot(N, L) <= 0.0) {
+			return vec3(0.0);
 		}
 
 		// Spot cone early-out.
