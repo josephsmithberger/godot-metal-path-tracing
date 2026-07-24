@@ -33,6 +33,7 @@
 #include "core/templates/local_vector.h"
 #include "servers/rendering/renderer_rd/pipeline_hash_map_rd.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h" // IWYU pragma: keep
+#include "servers/rendering/renderer_rd/shaders/raytracing/scene_raytracing_compute.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/scene_raytracing_raygen.glsl.gen.h"
 
 namespace RendererSceneRenderImplementation {
@@ -43,6 +44,64 @@ private:
 	static Mutex singleton_mutex;
 
 public:
+	enum class SceneRoute : uint8_t {
+		UNAVAILABLE,
+		RAYTRACING_PIPELINE,
+		COMPUTE_RAY_QUERY,
+	};
+
+	static SceneRoute select_scene_route(bool p_supports_raytracing_pipeline, bool p_supports_ray_query, bool p_compute_scene_shader_ready) {
+		if (p_supports_raytracing_pipeline) {
+			return SceneRoute::RAYTRACING_PIPELINE;
+		}
+		if (p_supports_ray_query && p_compute_scene_shader_ready) {
+			return SceneRoute::COMPUTE_RAY_QUERY;
+		}
+		return SceneRoute::UNAVAILABLE;
+	}
+	static uint32_t sanitize_compute_rt_flags(uint32_t p_rt_flags) {
+		return p_rt_flags & ~(RT_FLAG_DEBUG_VIS_ENABLED | RT_FLAG_SER_ENABLED | RT_FLAG_FOG_ENABLED);
+	}
+	struct ComputeMaterialVariantKey {
+		uint32_t rt_flags = 0;
+		uint32_t material_generation = 0;
+
+		bool operator==(const ComputeMaterialVariantKey &p_other) const {
+			return rt_flags == p_other.rt_flags && material_generation == p_other.material_generation;
+		}
+	};
+	static ComputeMaterialVariantKey make_compute_material_variant_key(uint32_t p_rt_flags, uint32_t p_material_generation) {
+		return { sanitize_compute_rt_flags(p_rt_flags), p_material_generation };
+	}
+
+	struct ComputeCompileDebounce {
+		uint32_t observed_generation = 0;
+		uint32_t settled_generation = 0;
+		bool armed = false;
+
+		bool is_ready(uint32_t p_generation) {
+			if (p_generation == settled_generation) {
+				return true;
+			}
+			if (!armed || observed_generation != p_generation) {
+				observed_generation = p_generation;
+				armed = true;
+				return false;
+			}
+			settled_generation = p_generation;
+			armed = false;
+			return true;
+		}
+	};
+	template <typename TValue>
+	static bool compute_cache_insert_if_absent(HashMap<uint64_t, TValue> &r_cache, uint64_t p_key, const TValue &p_value) {
+		if (r_cache.has(p_key)) {
+			return false;
+		}
+		r_cache.insert(p_key, p_value);
+		return true;
+	}
+
 	enum ShaderGroup {
 		SHADER_GROUP_BASE, // Always compiled at the beginning.
 		SHADER_GROUP_ADVANCED,
@@ -75,9 +134,26 @@ public:
 	enum RaytracingFlags {
 		RT_FLAG_NONE = 0,
 		RT_FLAG_DEBUG_VIS_ENABLED = (1 << 0),
-		RT_FLAG_DLSS_RR_ENABLED = (1 << 1),
+		RT_FLAG_DENOISER_GUIDES_ENABLED = (1 << 1),
 		RT_FLAG_FOG_ENABLED = (1 << 2),
 		RT_FLAG_SER_ENABLED = (1 << 3),
+		// Every visible TLAS instance is an opaque triangle; the compute lane
+		// compiles out candidate evaluation and uses native opaque traversal.
+		RT_FLAG_ALL_OPAQUE = (1 << 4),
+		// The TLAS contains both native-opaque triangles and alpha/procedural
+		// query instances. Metal traces the opaque partition with its native
+		// intersector, queries only the second partition, and selects the nearest.
+		RT_FLAG_MIXED_ALPHA = (1 << 5),
+		// Compute-lane internal bit: selects the denoiser guide-pass kernel
+		// instead of the path-trace kernel. Never produced by compute_rt_flags;
+		// the renderer ORs it in when requesting the guide pipeline so guide
+		// generation stays out of the path-trace mega-kernel's register budget.
+		RT_FLAG_GUIDE_PASS = (1 << 6),
+		// Shadow rays skip the alpha-tested query partition and treat every
+		// instance as opaque. Alpha foliage then casts solid-silhouette shadows,
+		// trading shadow fidelity for the cost of the divergent per-candidate
+		// alpha traversal on every NEE shadow ray. Opt-in scalability knob.
+		RT_FLAG_OPAQUE_SHADOWS = (1 << 7),
 	};
 
 	constexpr static uint32_t RT_SAMPLE_COUNT_SHIFT = 21;
@@ -105,6 +181,20 @@ public:
 		// Max bounces is offset by 1 (0=1 bounce, 7=8 bounces)
 		result |= (MAX(1u, MIN(8u, p_max_bounces)) - 1u) << RT_MAX_BOUNCES_SHIFT;
 		return result;
+	}
+
+	static inline uint32_t rt_flags_get_sample_count(uint32_t p_rt_flags) {
+		return (p_rt_flags >> RT_SAMPLE_COUNT_SHIFT) & RT_SAMPLE_COUNT_MASK;
+	}
+
+	static inline uint32_t rt_flags_get_max_bounces(uint32_t p_rt_flags) {
+		return ((p_rt_flags >> RT_MAX_BOUNCES_SHIFT) & RT_MAX_BOUNCES_MASK) + 1u;
+	}
+
+	// Replaces the packed quality fields, leaving every other flag bit intact.
+	static inline uint32_t rt_flags_with_quality(uint32_t p_rt_flags, uint32_t p_sample_count, uint32_t p_max_bounces) {
+		uint32_t flags = p_rt_flags & ~((RT_SAMPLE_COUNT_MASK << RT_SAMPLE_COUNT_SHIFT) | (RT_MAX_BOUNCES_MASK << RT_MAX_BOUNCES_SHIFT));
+		return rt_flags_pack(flags, p_sample_count, p_max_bounces);
 	}
 
 	// Build the full packed rt_flags from pathtracing environment params.
@@ -338,6 +428,7 @@ public:
 	}
 
 	SceneRaytracingRaygenShaderRD raygen_shader;
+	SceneRaytracingComputeShaderRD compute_shader;
 
 	struct TextureUniformInfo {
 		StringName name;
@@ -400,6 +491,8 @@ public:
 		RID pipeline; // RD::free_rid on swap (deferred internally).
 		RID hit_sbt; // RD::free_rid on swap.
 		RID base_shader; // Immutable for variant lifetime; uniform_set is bound to this.
+		bool owns_base_shader = false; // Generated Metal material variants are owned here.
+		uint64_t base_shader_cache_key = 0; // Nonzero: base_shader is a compute_variant_cache reference, not owned.
 
 		// Parallel to hit_group_slots.
 		LocalVector<RID> per_hg_shaders;
@@ -411,9 +504,20 @@ public:
 
 		bool dirty = false;
 		bool initial_pipeline_built = false;
+		uint32_t material_generation = 0;
 	};
 
 	HashMap<uint32_t, PipelineBundle> pipeline_bundles;
+	RID compute_shader_version;
+	bool compute_scene_lane = false;
+	bool scene_shader_ready = false;
+	uint32_t material_generation = 0;
+	uint32_t compute_variant_compile_count = 0;
+	uint32_t compute_variant_cache_hit_count = 0;
+	uint32_t compute_variant_failure_count = 0;
+	// One quiet finalize pass is required before a newly observed material
+	// generation is compiled, coalescing sequential arrivals into one burst.
+	ComputeCompileDebounce compute_compile_debounce;
 
 	// Single-lane async bundle rebuild (worker: SPIR-V + raytracing_pipeline_create; main: SBT + swap).
 	struct PipelineBuildTask;
@@ -452,7 +556,44 @@ private:
 	// Bundle build / rebuild.
 	void _bundle_resize_for_slots(PipelineBundle &r_bundle);
 	bool _build_initial_bundle(uint32_t p_rt_flags, PipelineBundle &r_bundle);
+	bool _build_compute_bundle(uint32_t p_rt_flags, PipelineBundle &r_bundle);
+	String _build_compute_material_function(uint32_t p_slot_index, const CustomShaderEntry &p_entry) const;
+	String _build_compute_procedural_function(uint32_t p_slot_index, const CustomShaderEntry &p_entry) const;
+	static void _replace_identifier(String &r_source, const String &p_identifier, const String &p_replacement);
 	void _kick_rebuild_if_idle();
+
+	// Compute-lane aggregate rebuild (AGGREGATE_COMPILATION): one batched compile per burst of
+	// newly ready material slots, run off-thread; the previous pipeline keeps
+	// serving frames until the generation-checked swap at the frame boundary.
+	struct ComputeBuildTask;
+	struct ComputeCompileLane {
+		Mutex mutex;
+		ComputeBuildTask *current = nullptr;
+	};
+	ComputeCompileLane compute_compile_lane;
+
+	// Compiled aggregate kernels keyed by (compute variant, active slot set).
+	// Shared across rt_flags bundles; refcount counts bundle + in-flight task
+	// references, and the entry is freed when it reaches zero.
+	struct ComputeVariantCacheEntry {
+		RID shader;
+		uint32_t refcount = 0;
+	};
+	HashMap<uint64_t, ComputeVariantCacheEntry> compute_variant_cache;
+
+	ComputeBuildTask *_make_compute_build_task(uint32_t p_rt_flags, PipelineBundle &p_bundle);
+	void _run_compute_build_worker(ComputeBuildTask *p_task);
+	static void _run_compute_build_worker_static(void *p_userdata);
+	void _finalize_compute_build(ComputeBuildTask *p_task);
+	void _drop_compute_build_outputs(ComputeBuildTask *p_task);
+	void _kick_compute_rebuild_if_idle();
+	void _drain_compute_lane_blocking();
+	String _build_compute_source_from_snapshot(const ComputeBuildTask &p_task, const LocalVector<uint8_t> &p_active) const;
+	bool _compile_compute_source(const String &p_source, Vector<uint8_t> &r_binary, String &r_error);
+	static uint64_t _compute_aggregate_key(int p_compute_variant, const ComputeBuildTask &p_task, const LocalVector<uint8_t> &p_active);
+	RID _compute_cache_acquire(uint64_t p_key);
+	bool _compute_cache_insert(uint64_t p_key, RID p_shader);
+	void _compute_cache_release(uint64_t p_key);
 
 	// Compile lane / worker.
 	void _enqueue_build(PipelineBuildTask *p_task);
@@ -483,6 +624,15 @@ private:
 
 public:
 	void invalidate_pipeline_bundles();
+	bool is_scene_shader_ready() const { return scene_shader_ready; }
+	bool uses_compute_scene_lane() const { return compute_scene_lane; }
+	uint32_t get_material_generation() const { return material_generation; }
+	uint32_t get_compute_variant_compile_count() const { return compute_variant_compile_count; }
+	uint32_t get_compute_variant_cache_hit_count() const { return compute_variant_cache_hit_count; }
+	uint32_t get_compute_variant_failure_count() const { return compute_variant_failure_count; }
+	uint32_t sanitize_rt_flags(uint32_t p_rt_flags) const {
+		return compute_scene_lane ? sanitize_compute_rt_flags(p_rt_flags) : p_rt_flags;
+	}
 
 	ShaderCompiler compiler;
 
