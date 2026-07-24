@@ -34,6 +34,7 @@
 #include "core/io/marshalls.h"
 #include "core/os/os.h"
 #include "core/templates/fixed_vector.h"
+#include "drivers/metal/metal_rt_shader_lowering.h"
 #include "drivers/metal/metal_utils.h"
 
 #include <thirdparty/spirv-reflect/spirv_reflect.h>
@@ -223,6 +224,26 @@ Error RenderingShaderContainerMetal::compile_metal_source(const char *p_source, 
 	return OK;
 }
 
+bool RenderingShaderContainerMetal::_use_rt_intersector() const {
+	const String intersector_env = OS::get_singleton()->get_environment("GODOT_MTL_RT_INTERSECTOR");
+	if (intersector_env == "1") {
+		return true;
+	}
+	if (intersector_env == "0") {
+		return false;
+	}
+	// Apple9+ (M3 and newer) have hardware ray tracing, where the intersector lane
+	// is the win. On macOS a profile below Apple7 means an Intel/AMD (mac2) GPU
+	// with no Apple family; the intersector lane measured ~18% faster there too
+	// (Intel Iris Plus 640), so use it for those as well. Apple7/Apple8 (M1/M2)
+	// keep the query lane.
+	if (device_profile->gpu >= MetalDeviceProfile::GPU::Apple9) {
+		return true;
+	}
+	return device_profile->platform == MetalDeviceProfile::Platform::macOS &&
+			device_profile->gpu < MetalDeviceProfile::GPU::Apple7;
+}
+
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunguarded-availability"
 
@@ -232,6 +253,14 @@ static spv::ExecutionModel SHADER_STAGE_REMAP[RDD::SHADER_STAGE_MAX] = {
 	spv::ExecutionModelTessellationControl, // RDD::SHADER_STAGE_TESSELATION_CONTROL
 	spv::ExecutionModelTessellationEvaluation, // RDD::SHADER_STAGE_TESSELATION_EVALUATION
 	spv::ExecutionModelGLCompute, // RDD::SHADER_STAGE_COMPUTE
+	// The MSL lane cannot lower the ray-tracing pipeline stages below; they are
+	// mapped so that stage bookkeeping never aliases them to
+	// ExecutionModelVertex (0).
+	spv::ExecutionModelRayGenerationKHR, // RDD::SHADER_STAGE_RAYGEN
+	spv::ExecutionModelAnyHitKHR, // RDD::SHADER_STAGE_ANY_HIT
+	spv::ExecutionModelClosestHitKHR, // RDD::SHADER_STAGE_CLOSEST_HIT
+	spv::ExecutionModelMissKHR, // RDD::SHADER_STAGE_MISS
+	spv::ExecutionModelIntersectionKHR, // RDD::SHADER_STAGE_INTERSECTION
 };
 
 spv::ExecutionModel get_stage(uint32_t p_stages_mask, RDD::ShaderStage p_stage) {
@@ -243,6 +272,68 @@ spv::ExecutionModel get_stage(uint32_t p_stages_mask, RDD::ShaderStage p_stage) 
 
 spv::ExecutionModel map_stage(RDD::ShaderStage p_stage) {
 	return SHADER_STAGE_REMAP[p_stage];
+}
+
+// --- Apple Metal front-end ray-query miscompile workaround --------------------
+//
+// Apple's Metal compiler mis-codegens the path-tracing kernel when a second
+// intersection_query traversal is inlined into it: scattered output pixels come
+// back with exactly one color channel forced to 0.0 (finite, never NaN, and
+// masked entirely by MTL_SHADER_VALIDATION=1 -- the classic signature of a
+// register-allocation bug). Reported to Apple; unfixed as of Xcode 26.6.
+// Blender's Cycles Metal backend carries the same class of workaround
+// (kernel/integrator/mnee.h and kernel/util/image_3d.h both hard-code
+// __attribute__((noinline)) under __KERNEL_METAL__ for front-end codegen
+// bugs), so a narrow, documented inlining boundary is the accepted fix rather
+// than a stopgap.
+//
+// The boundary can only be expressed here, on the generated MSL. glslang
+// translates *every* rayQueryEXT variable to SPIRV StorageClass::Private
+// regardless of its GLSL scope (GlslangToSpv.cpp, TranslateStorageClass), and
+// SPIRV-Cross then hoists every Private ray query into the entry point and
+// threads it through the call graph as a `thread ...&` parameter
+// (spirv_msl.cpp, "Ray query accesses memory directly"). Declaring the query at
+// function scope in the GLSL produces byte-identical MSL, so the shader source
+// has no say in this and should stay written the natural way.
+
+// Rewrites `p_function`'s hoisted by-reference `p_query` parameter into a
+// function-local query, so the traversal state is register-allocated in the
+// callee instead of aliasing the entry point's frame. Returns true if applied.
+static bool _msl_localize_hoisted_query(std::string &r_source, const char *p_function, const char *p_query) {
+	size_t decl_pos = r_source.find(p_function);
+	if (decl_pos == std::string::npos) {
+		return false;
+	}
+	size_t body_pos = r_source.find(")\n{", decl_pos);
+	if (body_pos == std::string::npos) {
+		return false;
+	}
+	// The query may be the last parameter or an interior one; rename it wherever
+	// it sits in the list, then declare the local at the top of the body.
+	const std::string query_param = std::string("& ") + p_query;
+	size_t param_pos = r_source.find(query_param, decl_pos);
+	if (param_pos == std::string::npos || param_pos > body_pos) {
+		return false;
+	}
+	const std::string query_local = std::string("\n    raytracing::intersection_query<raytracing::instancing, raytracing::triangle_data> ") + p_query + ";";
+	r_source.insert(body_pos + 3, query_local);
+	r_source.insert(param_pos + query_param.size(), "_hoisted_unused");
+	return true;
+}
+
+// Replaces the SPIRV-Cross always_inline attribute on `p_function` with
+// noinline. `p_function` is matched as a prefix of the return type + name, so
+// the first definition whose name starts with it wins.
+static bool _msl_force_noinline(std::string &r_source, const char *p_function) {
+	static constexpr char always_inline_attr[] = "static inline __attribute__((always_inline))\n";
+	static constexpr char noinline_attr[] = "static __attribute__((noinline))\n";
+	const std::string inline_decl = std::string(always_inline_attr) + p_function;
+	size_t position = r_source.find(inline_decl);
+	if (position == std::string::npos) {
+		return false;
+	}
+	r_source.replace(position, inline_decl.size(), std::string(noinline_attr) + p_function);
+	return true;
 }
 
 MetalDeviceProfile::MinimumRequirements RenderingShaderContainerMetal::inspect_spirv(const ReflectShader &p_shader) {
@@ -421,6 +512,9 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 	typedef std::pair<MSLResourceBinding, uint32_t> MSLBindingInfo;
 	LocalVector<MSLBindingInfo> spirv_bindings;
 	MSLResourceBinding push_constant_resource_binding;
+	// Sets that contain an unbounded (runtime-sized) array. SPIRV-Cross requires
+	// those argument buffers to live in the device address space.
+	uint32_t unbounded_arg_buffer_sets_mask = 0;
 	{
 		enum IndexType {
 			Texture,
@@ -446,6 +540,7 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 		UniformData::IndexType shader_index_type = msl_options.argument_buffers ? UniformData::IndexType::ARG : UniformData::IndexType::SLOT;
 
 		for (const ReflectDescriptorSet &dset : p_shader.uniform_sets) {
+			bool set_has_unbounded = false;
 			// Reset the index count for each descriptor set, as this is an index in to the argument table.
 			uint32_t next_arg_buffer_index = 0;
 			auto next_arg_index = [&next_arg_buffer_index](uint32_t p_stride) -> uint32_t {
@@ -459,9 +554,26 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 
 				found->active_stages = uniform.stages;
 
+				// Bindings are iterated in ascending binding order, so any binding
+				// after an unbounded one would sit past a runtime-sized region in
+				// the argument buffer with no fixed offset.
+				ERR_FAIL_COND_V_MSG(set_has_unbounded, false,
+						vformat("Metal: an unbounded (runtime-sized) array must be the last binding of its descriptor set (set %d, binding %d follows one).", idx_dset, uniform.binding));
+
 				RDC::UniformType type = RDC::UniformType(uniform.type);
 				uint32_t binding_stride = 1; // If this is an array, stride will be the length of the array.
-				if (uniform.length > 1) {
+				if (uniform.unbounded) {
+					// Runtime-sized (bindless) array: SPIRV-Cross lowers it as a
+					// spvDescriptorArray over the trailing argument-buffer region,
+					// which requires tier-2 argument buffers in the device address
+					// space. The descriptor count is only known per uniform set.
+					ERR_FAIL_COND_V_MSG(!msl_options.argument_buffers, false,
+							vformat("Metal: unbounded (runtime-sized) arrays require tier-2 argument buffers (set %d, binding %d).", idx_dset, uniform.binding));
+					ERR_FAIL_COND_V_MSG(type != RDC::UNIFORM_TYPE_TEXTURE, false,
+							vformat("Metal: unbounded (runtime-sized) arrays are only supported for texture bindings (set %d, binding %d).", idx_dset, uniform.binding));
+					set_has_unbounded = true;
+					found->array_length = UniformData::UNBOUNDED_ARRAY_LENGTH;
+				} else if (uniform.length > 1) {
 					switch (type) {
 						case RDC::UNIFORM_TYPE_UNIFORM_BUFFER_DYNAMIC:
 						case RDC::UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC:
@@ -517,7 +629,13 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 				MSLResourceBinding &rb = iter->first;
 				rb.desc_set = idx_dset;
 				rb.binding = uniform.binding;
-				rb.count = binding_stride;
+				// A count of 0 keeps SPIRV-Cross on the runtime-sized descriptor
+				// path (spvDescriptorArray) instead of a fixed-size array<T, N>.
+				rb.count = uniform.unbounded ? 0 : binding_stride;
+				if (uniform.unbounded) {
+					ERR_FAIL_COND_V_MSG(idx_dset >= 32, false, "Metal: unbounded arrays are limited to descriptor sets 0-31.");
+					unbounded_arg_buffer_sets_mask |= 1u << idx_dset;
+				}
 
 				switch (type) {
 					case RDC::UNIFORM_TYPE_SAMPLER: {
@@ -562,6 +680,12 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 						found->get_indexes(UniformData::IndexType::SLOT).texture = next_index(Texture, binding_stride);
 						found->get_indexes(UniformData::IndexType::ARG).texture = next_arg_index(binding_stride);
 						rb.basetype = SPIRType::BaseType::Image;
+					} break;
+					case RDC::UNIFORM_TYPE_ACCELERATION_STRUCTURE: {
+						found->data_type = MTL::DataTypeInstanceAccelerationStructure;
+						found->get_indexes(UniformData::IndexType::SLOT).buffer = next_index(Buffer, binding_stride);
+						found->get_indexes(UniformData::IndexType::ARG).buffer = next_arg_index(binding_stride);
+						rb.basetype = SPIRType::BaseType::AccelerationStructure;
 					} break;
 					case RDC::UNIFORM_TYPE_MAX:
 					default:
@@ -666,6 +790,14 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 		compiler.set_msl_options(msl_options);
 		compiler.set_common_options(options);
 
+		if (msl_options.argument_buffers && unbounded_arg_buffer_sets_mask != 0) {
+			for (uint32_t set_index = 0; set_index < 32; set_index++) {
+				if (unbounded_arg_buffer_sets_mask & (1u << set_index)) {
+					compiler.set_argument_buffer_device_address_space(set_index, true);
+				}
+			}
+		}
+
 		spv::ExecutionModel execution_model = map_stage(stage);
 		for (uint32_t jj = 0; jj < spirv_bindings.size(); jj++) {
 			MSLResourceBinding &rb = spirv_bindings.ptr()[jj].first;
@@ -686,6 +818,89 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
 			source = compiler.compile();
 		} catch (CompilerError &e) {
 			ERR_FAIL_V_MSG(false, "Failed to compile stage " + String(RDC::SHADER_STAGE_NAMES[stage]) + ": " + e.what());
+		}
+
+		// Apply the ray-query miscompile boundary documented above.
+		//
+		// The default is "none" -- no boundary at all. The current generated
+		// kernel does not trigger the miscompile: measured on the same M5 /
+		// macOS 26.5.2 / Xcode 26.6 that produced the bug report, the raw
+		// single-zero-channel metric is 0 across 24 configurations (1/2/4 spp,
+		// 2/3 bounces, opaque and mixed-alpha, both traversal lanes), and a
+		// static-camera capture is pixel-identical with and without the
+		// boundary. The boundary is not free: it costs ~33% of the frame in
+		// mixed-alpha scenes (12.9 vs 19.3 fps on an orbiting camera capture at
+		// 1080p/4spp/2bounce), because every shadow ray then pays a real call
+		// with SPIRV-Cross's full forwarded parameter list. All-opaque scenes on
+		// Apple9+ are unaffected either way; the query lane is dead-stripped
+		// there by the intersector specialization.
+		//
+		// The Apple bug is still unfixed, so this is a property of the current
+		// shader's register allocation rather than a resolution. If a shader
+		// edit re-triggers it, GODOT_MTL_RT_NOINLINE=shadow restores the
+		// narrowest boundary that measured clean (the shadow traversal
+		// trace_shadow_blocked_query becomes a real call, matched by prefix, and
+		// its query becomes a local of the trace_shadow_blocked wrapper).
+		// "lights" is the wider, slower boundary around all of direct lighting.
+		// GODOT_MTL_RT_SHADOW_REF=1 keeps the shadow query hoisted by reference,
+		// and GODOT_MTL_RT_PRIMARY=local|noinline extends the same treatment to
+		// the primary traversal; both exist for A/B runs only.
+		if (source.find("raytracing::intersection_query") != std::string::npos) {
+			const String noinline_mode = OS::get_singleton()->get_environment("GODOT_MTL_RT_NOINLINE");
+			if (noinline_mode == "lights") {
+				_msl_force_noinline(source, "float3 lights_evaluate_direct_lighting");
+			} else if (noinline_mode == "shadow") {
+				_msl_force_noinline(source, "bool trace_shadow_blocked");
+				if (OS::get_singleton()->get_environment("GODOT_MTL_RT_SHADOW_REF") != "1") {
+					_msl_localize_hoisted_query(source, "bool trace_shadow_blocked(", "shadow_query");
+				}
+			}
+
+			const String primary_mode = OS::get_singleton()->get_environment("GODOT_MTL_RT_PRIMARY");
+			if (primary_mode == "noinline") {
+				_msl_force_noinline(source, "bool trace_material_query");
+			}
+			if (primary_mode == "local" || primary_mode == "noinline") {
+				_msl_localize_hoisted_query(source, "bool trace_material_query(", "rt_query");
+			}
+
+			// Native-intersector lane, driven by the traversal-class registry in
+			// MetalRTShaderLowering: each declared class is applied
+			// transactionally and the per-stage metadata records what was
+			// injected and what was eligible. Default on for the Apple9+
+			// hardware-RT tier, where Apple recommends the intersector over
+			// intersection_query (measured 47.5 -> 64 fps at 1080p/4spp/2bounce
+			// on M5); pre-Apple9 tiers keep the query path until a benefit is
+			// measured there. GODOT_MTL_RT_INTERSECTOR=1 forces the lane on for
+			// A/B runs, =0 forces the query path. When the lane is off the
+			// source is only probed so cache validation still knows this MSL
+			// was compiled for the query path.
+			const bool use_intersector = _use_rt_intersector();
+			MetalRTShaderLowering::TraversalLoweringResult lowering =
+					MetalRTShaderLowering::apply_traversal_lowering(source, /*p_apply=*/use_intersector);
+			stage_data.rt_traversal_applied_mask = use_intersector ? lowering.applied_class_mask : 0;
+			stage_data.rt_traversal_eligible_mask = lowering.eligible_class_mask;
+			if (lowering.kernel_status == MetalRTShaderLowering::IntersectorPatchStatus::APPLIED) {
+				for (const MetalRTShaderLowering::TraversalClassOutcome &outcome : lowering.classes) {
+					print_verbose(vformat("Metal RT: traversal class %s -> %s for %s: %s",
+							MetalRTShaderLowering::traversal_class_name(outcome.class_bit),
+							MetalRTShaderLowering::traversal_class_status_name(outcome.status),
+							String(shader_name.get_data()), outcome.detail));
+				}
+			}
+			if (!use_intersector && OS::get_singleton()->get_environment("GODOT_MTL_RT_INTERSECTOR") == "0") {
+				print_verbose("Metal RT: intersector fast path disabled by GODOT_MTL_RT_INTERSECTOR=0 for " + String(shader_name.get_data()));
+			}
+		}
+
+		// Writes the generated MSL to GODOT_MTL_DUMP_MSL for offline inspection.
+		if (String dump_dir = OS::get_singleton()->get_environment("GODOT_MTL_DUMP_MSL"); !dump_dir.is_empty()) {
+			String name = String(shader_name.get_data()).validate_filename();
+			String path = dump_dir.path_join(vformat("%s.%s.%d.metal", name, RDC::SHADER_STAGE_NAMES[stage], i));
+			Ref<FileAccess> f = FileAccess::open(path, FileAccess::WRITE);
+			if (f.is_valid()) {
+				f->store_string(String::utf8(source.c_str()));
+			}
 		}
 
 		ERR_FAIL_COND_V_MSG(compiler.get_entry_points_and_stages().size() != 1, false, "Expected a single entry point and stage.");
@@ -824,12 +1039,46 @@ RenderingShaderContainerMetal::MetalShaderReflection RenderingShaderContainerMet
 	return res;
 }
 
+bool RenderingShaderContainerMetal::is_rt_intersector_lane_compatible() const {
+	const String name = String::utf8(shader_name.get_data());
+	if (!name.begins_with("SceneRaytracingComputeShaderRD:") && !name.begins_with("RT_Metal_material_variant")) {
+		return true;
+	}
+
+	const bool expected_intersector = _use_rt_intersector();
+	for (uint32_t shader_index = 0; shader_index < shaders.size(); shader_index++) {
+		const RenderingShaderContainer::Shader &shader = shaders[shader_index];
+		const StageData &shader_data = mtl_shaders[shader_index];
+		if (shader.shader_stage != RDD::ShaderStage::SHADER_STAGE_COMPUTE || shader_data.source_size == 0) {
+			continue;
+		}
+
+		// The compile-time traversal metadata replaces source re-parsing.
+		// A stage that was eligible for the opaque intersector class must have
+		// been compiled for the lane that is active now.
+		const bool compiled_intersector = (shader_data.rt_traversal_applied_mask & MetalRTShaderLowering::TRAVERSAL_CLASS_OPAQUE_TRIANGLES) != 0;
+		const bool eligible = (shader_data.rt_traversal_eligible_mask & MetalRTShaderLowering::TRAVERSAL_CLASS_OPAQUE_TRIANGLES) != 0;
+		if (eligible && compiled_intersector != expected_intersector) {
+			print_verbose(vformat("Metal RT: rejecting cached RT shader from the %s lane; the %s lane is active",
+					compiled_intersector ? "intersector" : "query", expected_intersector ? "intersector" : "query"));
+			return false;
+		}
+	}
+	return true;
+}
+
 uint32_t RenderingShaderContainerMetal::_format() const {
 	return 0x42424242;
 }
 
 uint32_t RenderingShaderContainerMetal::_format_version() const {
 	return FORMAT_VERSION;
+}
+
+bool RenderingShaderContainerMetal::_format_version_supported(uint32_t p_version) const {
+	// StageData grew in v3. Reading a v1/v2 payload using the current struct
+	// size would misalign every following stage before the cache is rejected.
+	return p_version == FORMAT_VERSION;
 }
 
 Ref<RenderingShaderContainer> RenderingShaderContainerFormatMetal::create_container() const {
