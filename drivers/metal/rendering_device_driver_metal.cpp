@@ -57,6 +57,7 @@
 #include "core/string/ustring.h"
 #include "core/templates/hash_map.h"
 #include "drivers/apple/foundation_helpers.h"
+#include "drivers/metal/metal_rt_geometry.h"
 #include "drivers/metal/pixel_formats.h"
 #include "drivers/metal/rendering_context_driver_metal.h"
 #include "drivers/metal/rendering_shader_container_metal.h"
@@ -90,6 +91,11 @@ static_assert(ENUM_MEMBERS_EQUAL(RDD::COMPARE_OP_GREATER, MTL::CompareFunctionGr
 static_assert(ENUM_MEMBERS_EQUAL(RDD::COMPARE_OP_NOT_EQUAL, MTL::CompareFunctionNotEqual));
 static_assert(ENUM_MEMBERS_EQUAL(RDD::COMPARE_OP_GREATER_OR_EQUAL, MTL::CompareFunctionGreaterEqual));
 static_assert(ENUM_MEMBERS_EQUAL(RDD::COMPARE_OP_ALWAYS, MTL::CompareFunctionAlways));
+
+static_assert(ENUM_MEMBERS_EQUAL(RDD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT, MTL::AccelerationStructureInstanceOptionDisableTriangleCulling));
+static_assert(ENUM_MEMBERS_EQUAL(RDD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT, MTL::AccelerationStructureInstanceOptionTriangleFrontFacingWindingCounterClockwise));
+static_assert(ENUM_MEMBERS_EQUAL(RDD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT, MTL::AccelerationStructureInstanceOptionOpaque));
+static_assert(ENUM_MEMBERS_EQUAL(RDD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_NO_OPAQUE_BIT, MTL::AccelerationStructureInstanceOptionNonOpaque));
 
 /*****************/
 /**** BUFFERS ****/
@@ -145,6 +151,7 @@ bool RenderingDeviceDriverMetal::buffer_set_texel_format(BufferID p_buffer, Data
 void RenderingDeviceDriverMetal::buffer_free(BufferID p_buffer) {
 	BufferInfo *buf_info = (BufferInfo *)p_buffer.id;
 
+	_bda_untrack_buffer(buf_info->metal_buffer.get());
 	_untrack_resource(buf_info->metal_buffer.get());
 
 	if (buf_info->is_dynamic()) {
@@ -199,12 +206,104 @@ uint64_t RenderingDeviceDriverMetal::buffer_get_dynamic_offsets(Span<BufferID> p
 uint64_t RenderingDeviceDriverMetal::buffer_get_device_address(BufferID p_buffer) {
 	if (__builtin_available(iOS 16.0, macOS 13.0, *)) {
 		const BufferInfo *buf_info = (const BufferInfo *)p_buffer.id;
+		_bda_track_buffer(buf_info->metal_buffer.get());
 		return buf_info->metal_buffer.get()->gpuAddress();
 	} else {
 #if DEV_ENABLED
 		WARN_PRINT_ONCE("buffer_get_device_address is not supported on this OS version.");
 #endif
 		return 0;
+	}
+}
+
+void RenderingDeviceDriverMetal::_bda_track_buffer(MTL::Buffer *p_buffer) {
+	if (use_barriers) {
+		// Every allocation is already in the main residency set.
+		return;
+	}
+
+	MutexLock lock(bda_residency_mutex);
+	if (bda_buffer_indices.has(p_buffer)) {
+		return;
+	}
+	bda_buffer_indices.insert(p_buffer, bda_buffers.size());
+	bda_buffers.push_back(p_buffer);
+
+	if (__builtin_available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 1.0, *)) {
+		if (device_properties->features.supports_residency_sets && !bda_residency_set_creation_failed) {
+			if (!bda_residency_set) {
+				MTL::ResidencySetDescriptor *rs_desc = MTL::ResidencySetDescriptor::alloc()->init();
+				rs_desc->setInitialCapacity(256);
+				rs_desc->setLabel(MTLSTR("Device Address Residency Set"));
+				NS::Error *error = nullptr;
+				bda_residency_set = NS::TransferPtr(device->newResidencySet(rs_desc, &error));
+				rs_desc->release();
+				if (bda_residency_set) {
+					add_residency_set_to_main_queue(bda_residency_set.get());
+				} else {
+					bda_residency_set_creation_failed = true;
+					WARN_PRINT_ONCE(vformat("Metal: failed to create the device-address residency set (%s); falling back to per-encoder residency.",
+							error ? String(error->localizedDescription()->utf8String()) : String("unknown error")));
+				}
+			}
+			if (bda_residency_set) {
+				bda_residency_set->addAllocation(p_buffer);
+				bda_residency_dirty = true;
+			}
+		}
+	}
+}
+
+void RenderingDeviceDriverMetal::_bda_untrack_buffer(MTL::Buffer *p_buffer) {
+	MutexLock lock(bda_residency_mutex);
+	HashMap<MTL::Buffer *, uint32_t>::Iterator it = bda_buffer_indices.find(p_buffer);
+	if (it == bda_buffer_indices.end()) {
+		return;
+	}
+	const uint32_t index = it->value;
+	bda_buffer_indices.remove(it);
+	const uint32_t last = bda_buffers.size() - 1;
+	if (index != last) {
+		bda_buffers[index] = bda_buffers[last];
+		bda_buffer_indices[static_cast<MTL::Buffer *>(bda_buffers[index])] = index;
+	}
+	bda_buffers.resize(last);
+
+	if (__builtin_available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 1.0, *)) {
+		if (bda_residency_set) {
+			bda_residency_set->removeAllocation(p_buffer);
+			bda_residency_dirty = true;
+		}
+	}
+}
+
+void RenderingDeviceDriverMetal::_bda_commit_residency() {
+	MutexLock lock(bda_residency_mutex);
+	if (!bda_residency_dirty) {
+		return;
+	}
+	bda_residency_dirty = false;
+	if (__builtin_available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 1.0, *)) {
+		if (bda_residency_set) {
+			bda_residency_set->commit();
+		}
+	}
+}
+
+void RenderingDeviceDriverMetal::encode_bda_residency(MTL::ComputeCommandEncoder *p_enc) {
+	if (use_barriers) {
+		return;
+	}
+	if (__builtin_available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 1.0, *)) {
+		if (bda_residency_set) {
+			// Queue-level residency already covers every address-taken buffer.
+			return;
+		}
+	}
+
+	MutexLock lock(bda_residency_mutex);
+	if (!bda_buffers.is_empty()) {
+		p_enc->useResources(bda_buffers.ptr(), bda_buffers.size(), MTL::ResourceUsageRead);
 	}
 }
 
@@ -1083,6 +1182,9 @@ RDD::ShaderID RenderingDeviceDriverMetal::shader_create_from_container(const Ref
 		WARN_PRINT("Metal shader container is invalid and will be recompiled.");
 		return RDD::ShaderID();
 	}
+	if (!shader_container->is_rt_intersector_lane_compatible()) {
+		return RDD::ShaderID();
+	}
 
 	CharString shader_name = shader_container->shader_name;
 	RSCM::HeaderData &mtl_reflection_data = shader_container->mtl_reflection_data;
@@ -1217,7 +1319,15 @@ RDD::ShaderID RenderingDeviceDriverMetal::shader_create_from_container(const Ref
 			}
 #define VAL(x) (x == UINT32_MAX ? 0 : x)
 			uint32_t max = std::max({ VAL(ui.arg_buffer.texture), VAL(ui.arg_buffer.buffer), VAL(ui.arg_buffer.sampler) });
-			max += ui.arrayLength > 0 ? ui.arrayLength - 1 : 0;
+			if (ui.arrayLength == RSCM::UniformData::UNBOUNDED_ARRAY_LENGTH) {
+				// Runtime-sized array: the trailing descriptor region is sized per
+				// uniform set from the actual descriptor count; reserve one entry.
+				ERR_FAIL_COND_V_MSG(!device_properties->features.argument_buffers_supported(), RDD::ShaderID(),
+						"Metal: shaders with unbounded (runtime-sized) arrays require tier-2 argument buffer support.");
+				set.has_unbounded_array = true;
+			} else {
+				max += ui.arrayLength > 0 ? ui.arrayLength - 1 : 0;
+			}
 			set.buffer_size = std::max(set.buffer_size, (max + 1) * (uint32_t)sizeof(uint64_t));
 #undef VAL
 		}
@@ -1283,7 +1393,17 @@ RDD::UniformSetID RenderingDeviceDriverMetal::uniform_set_create(VectorView<Boun
 	Vector<uint8_t> arg_buffer_data;
 
 	if (device_properties->features.argument_buffers_supported()) {
-		arg_buffer_data.resize(shader_set.buffer_size);
+		if (shader_set.has_unbounded_array) {
+			for (uint32_t i = 0; i < p_uniforms.size(); i += 1) {
+				const UniformInfo &ui = shader_set.uniforms[i];
+				if (ui.arrayLength != RenderingShaderContainerMetal::UniformData::UNBOUNDED_ARRAY_LENGTH) {
+					continue;
+				}
+				ERR_FAIL_COND_V_MSG(p_uniforms[i].type != UNIFORM_TYPE_TEXTURE, UniformSetID(),
+						"Metal: unbounded (runtime-sized) arrays are only supported for texture bindings.");
+			}
+		}
+		arg_buffer_data.resize(shader_set.argument_buffer_size(p_uniforms));
 
 		// If argument buffers are enabled, we have already verified availability, so we can skip the runtime check.
 		GODOT_CLANG_WARNING_PUSH_AND_IGNORE("-Wunguarded-availability-new")
@@ -1302,6 +1422,13 @@ RDD::UniformSetID RenderingDeviceDriverMetal::uniform_set_create(VectorView<Boun
 				*sru |= stage_resource_usage(RDD::SHADER_STAGE_FRAGMENT, usage);
 			}
 			if (stage.has_flag(RDD::SHADER_STAGE_COMPUTE_BIT)) {
+				*sru |= stage_resource_usage(RDD::SHADER_STAGE_COMPUTE, usage);
+			}
+			// Raytracing stages execute on Metal's compute lane, so their resources
+			// must be tracked as compute usage; otherwise they are never declared to
+			// the compute encoder and hazard tracking cannot order the trace dispatch
+			// against passes that consume its output.
+			if (stage & (RDD::SHADER_STAGE_RAYGEN_BIT | RDD::SHADER_STAGE_ANY_HIT_BIT | RDD::SHADER_STAGE_CLOSEST_HIT_BIT | RDD::SHADER_STAGE_MISS_BIT | RDD::SHADER_STAGE_INTERSECTION_BIT)) {
 				*sru |= stage_resource_usage(RDD::SHADER_STAGE_COMPUTE, usage);
 			}
 		};
@@ -1387,6 +1514,14 @@ RDD::UniformSetID RenderingDeviceDriverMetal::uniform_set_create(VectorView<Boun
 						ADD_USAGE(texture, ui.active_stages, ui.usage);
 					}
 				} break;
+				case UNIFORM_TYPE_ACCELERATION_STRUCTURE: {
+					const MDAccelerationStructure *acceleration_structure = (const MDAccelerationStructure *)uniform.ids[0].id;
+					ERR_FAIL_NULL_V(acceleration_structure, UniformSetID());
+					ERR_FAIL_COND_V(!acceleration_structure->accel, UniformSetID());
+					*(MTL::ResourceID *)(ptr + idx.buffer) = acceleration_structure->accel->gpuResourceID();
+
+					ADD_USAGE(acceleration_structure->accel.get(), ui.active_stages, MTL::ResourceUsageRead);
+				} break;
 				case UNIFORM_TYPE_UNIFORM_BUFFER_DYNAMIC:
 				case UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC: {
 					// Encode the base GPU address (frame 0); it will be updated at bind time.
@@ -1417,7 +1552,7 @@ RDD::UniformSetID RenderingDeviceDriverMetal::uniform_set_create(VectorView<Boun
 		}
 
 		if (!is_dynamic) {
-			set->arg_buffer = NS::TransferPtr(device->newBuffer(shader_set.buffer_size, base_hazard_tracking | MTL::ResourceStorageModePrivate));
+			set->arg_buffer = NS::TransferPtr(device->newBuffer(arg_buffer_data.size(), base_hazard_tracking | MTL::ResourceStorageModePrivate));
 #if DEV_ENABLED
 			char label[64];
 			snprintf(label, sizeof(label), "Uniform Set %u", p_set_index);
@@ -2272,64 +2407,417 @@ RDD::PipelineID RenderingDeviceDriverMetal::compute_pipeline_create(ShaderID p_s
 
 // ----- ACCELERATION STRUCTURE -----
 
+RDD::AccelerationStructureID RenderingDeviceDriverMetal::_acceleration_structure_create(MDAccelerationStructure::Type p_type, MTL::AccelerationStructureDescriptor *p_desc, BitField<AccelerationStructureFlagBits> p_flags, uint32_t p_max_instance_count, bool p_needs_extended_limits) {
+	// ALLOW_COMPACTION affects later command encoding. PREFER_FAST_TRACE maps
+	// to PreferFastIntersection for immutable structures on macOS 26+ (see
+	// usage_from_flags); LOW_MEMORY has no default mapping -- MinimizeMemory
+	// must stay an explicit quality/performance tradeoff, not a default.
+	MTL::AccelerationStructureUsage usage = MDAccelerationStructure::usage_from_flags(p_flags);
+	if (p_needs_extended_limits) {
+		// ExtendedLimits is enabled only when the structure actually
+		// exceeds a standard Metal limit; it trades intersection performance
+		// for the larger limits and obligates the extended_limits intersection
+		// tag on the trace side (see the prepare_tlas_build coherence gate).
+		if (__builtin_available(macOS 12.0, iOS 15.0, tvOS 15.0, *)) {
+			usage |= MTL::AccelerationStructureUsageExtendedLimits;
+			print_verbose(vformat("Metal RT: enabling ExtendedLimits for the %s; it exceeds a standard Metal limit.",
+					p_type == MDAccelerationStructure::Type::BLAS ? "BLAS" : "TLAS"));
+		} else {
+			ERR_FAIL_V_MSG(AccelerationStructureID(), "The scene exceeds Metal's standard acceleration-structure limits and this OS release has no ExtendedLimits support.");
+		}
+	}
+	p_desc->setUsage(usage);
+
+	MTL::AccelerationStructureSizes sizes = device->accelerationStructureSizes(p_desc);
+	uint64_t scratch_size = MDAccelerationStructure::required_scratch_size(sizes, p_flags);
+	ERR_FAIL_COND_V_MSG(scratch_size > UINT32_MAX, AccelerationStructureID(), "Acceleration structure scratch size exceeds the RenderingDevice limit.");
+
+	MDAccelerationStructure *accel_info = memnew(MDAccelerationStructure(p_type, NS::RetainPtr(p_desc), sizes, p_flags, p_max_instance_count));
+	accel_info->extended_limits = p_needs_extended_limits;
+	if (!accel_info->allocate(device)) {
+		memdelete(accel_info);
+		ERR_FAIL_V_MSG(AccelerationStructureID(), "Failed to allocate Metal acceleration structure resources.");
+	}
+	_track_resource(accel_info->accel.get());
+	if (accel_info->compacted_size_buffer) {
+		_track_resource(accel_info->compacted_size_buffer.get());
+	}
+
+	return AccelerationStructureID(accel_info);
+}
+
 RDD::AccelerationStructureID RenderingDeviceDriverMetal::blas_create(VectorView<AccelerationStructureGeometry> p_geometries, BitField<AccelerationStructureFlagBits> p_flags) {
-	ERR_FAIL_V_MSG(AccelerationStructureID(), "Ray tracing is not currently supported by the Metal driver.");
+	ERR_FAIL_COND_V_MSG(!device_properties->features.supports_raytracing, AccelerationStructureID(), "Acceleration structures are not supported by this device.");
+	ERR_FAIL_COND_V_MSG(p_geometries.size() == 0, AccelerationStructureID(), "A Metal BLAS requires at least one fully initialized geometry.");
+
+	bool extended_vertex_formats = false;
+	if (__builtin_available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
+		extended_vertex_formats = true;
+	}
+	LocalVector<MetalRTGeometryLayout> layouts;
+	layouts.resize(p_geometries.size());
+	uint64_t total_primitives = 0;
+	for (uint32_t i = 0; i < p_geometries.size(); i++) {
+		String validation_error;
+		ERR_FAIL_COND_V_MSG(!MetalRTGeometryLayout::validate(p_geometries[i], extended_vertex_formats, layouts[i], validation_error), AccelerationStructureID(), vformat("Metal BLAS geometry %d is unsupported: %s The geometry was omitted before descriptor creation.", i, validation_error));
+		total_primitives += layouts[i].primitive_count;
+	}
+
+	// ACCELERATION_LIMITS: explicit standard-limit checks. Exceeding a limit enables
+	// ExtendedLimits on this build; the trace side refuses such structures
+	// until the MSL declares the matching extended_limits intersection tag.
+	const bool needs_extended_limits =
+			total_primitives > MDAccelerationStructure::STANDARD_LIMIT_MAX_PRIMITIVES ||
+			(uint64_t)p_geometries.size() > MDAccelerationStructure::STANDARD_LIMIT_MAX_GEOMETRIES;
+	if (needs_extended_limits) {
+		WARN_PRINT(vformat("Metal BLAS exceeds standard limits (primitives=%d/%d geometries=%d/%d); building with ExtendedLimits.",
+				(int64_t)total_primitives, (int64_t)MDAccelerationStructure::STANDARD_LIMIT_MAX_PRIMITIVES,
+				(int64_t)p_geometries.size(), (int64_t)MDAccelerationStructure::STANDARD_LIMIT_MAX_GEOMETRIES));
+	}
+
+	LocalVector<NS::Object *> geometry_descriptors;
+	NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+
+	for (uint32_t i = 0; i < p_geometries.size(); i++) {
+		const AccelerationStructureGeometry &geometry = p_geometries[i];
+		const MetalRTGeometryLayout &layout = layouts[i];
+
+		MTL::AccelerationStructureGeometryDescriptor *geom_desc = nullptr;
+		switch (geometry.type) {
+			case AccelerationStructureGeometry::TYPE_TRIANGLES: {
+				const AccelerationStructureGeometry::Triangles &t = geometry.geometry.triangles;
+				MTL::AccelerationStructureTriangleGeometryDescriptor *tri_desc = MTL::AccelerationStructureTriangleGeometryDescriptor::descriptor();
+
+				const BufferInfo *vertex_buffer = (const BufferInfo *)t.vertex_buffer.id;
+				tri_desc->setVertexBuffer(vertex_buffer->metal_buffer.get());
+				tri_desc->setVertexBufferOffset(t.vertex_offset);
+				tri_desc->setVertexStride(t.vertex_stride);
+
+				if (layout.vertex_format != MTL::AttributeFormatFloat3) {
+					// Float3 is Metal's default. Selecting another format requires
+					// the vertexFormat property (macOS 13.0 / iOS 16.0).
+					tri_desc->setVertexFormat(layout.vertex_format);
+				}
+
+				if (layout.indexed) {
+					const BufferInfo *index_buffer = (const BufferInfo *)t.index_buffer.id;
+					tri_desc->setIndexBuffer(index_buffer->metal_buffer.get());
+					tri_desc->setIndexBufferOffset(t.index_offset);
+					tri_desc->setIndexType(layout.index_type);
+				}
+				tri_desc->setTriangleCount(layout.primitive_count);
+
+				geom_desc = tri_desc;
+			} break;
+
+			case AccelerationStructureGeometry::TYPE_AABBS: {
+				const AccelerationStructureGeometry::Aabbs &a = geometry.geometry.aabbs;
+				MTL::AccelerationStructureBoundingBoxGeometryDescriptor *aabb_desc = MTL::AccelerationStructureBoundingBoxGeometryDescriptor::descriptor();
+
+				const BufferInfo *aabb_buffer = (const BufferInfo *)a.buffer.id;
+				aabb_desc->setBoundingBoxBuffer(aabb_buffer->metal_buffer.get());
+				aabb_desc->setBoundingBoxBufferOffset(a.offset);
+				aabb_desc->setBoundingBoxStride(a.stride);
+				aabb_desc->setBoundingBoxCount(a.count);
+
+				geom_desc = aabb_desc;
+			} break;
+		}
+
+		// Preserve Godot's explicit geometry flags. Metal permits duplicate
+		// intersection-function invocations by default, so the no-duplicate bit
+		// must invert that property.
+		geom_desc->setOpaque(geometry.flags.has_flag(ACCELERATION_STRUCTURE_GEOMETRY_OPAQUE_BIT));
+		geom_desc->setAllowDuplicateIntersectionFunctionInvocation(!geometry.flags.has_flag(ACCELERATION_STRUCTURE_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT));
+
+		geometry_descriptors.push_back(geom_desc);
+	}
+
+	MTL::PrimitiveAccelerationStructureDescriptor *desc = MTL::PrimitiveAccelerationStructureDescriptor::descriptor();
+	NS::SharedPtr<NS::Array> geom_array = NS::TransferPtr(NS::Array::array(geometry_descriptors.ptr(), geometry_descriptors.size())->retain());
+	desc->setGeometryDescriptors(geom_array.get());
+
+	return _acceleration_structure_create(MDAccelerationStructure::Type::BLAS, desc, p_flags, 0, needs_extended_limits);
 }
 
 RDD::AccelerationStructureID RenderingDeviceDriverMetal::tlas_create(uint32_t p_max_instance_count, BitField<AccelerationStructureFlagBits> p_flags) {
-	ERR_FAIL_V_MSG(AccelerationStructureID(), "Ray tracing is not currently supported by the Metal driver.");
+	ERR_FAIL_COND_V_MSG(!device_properties->features.supports_raytracing, AccelerationStructureID(), "Acceleration structures are not supported by this device.");
+
+	NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+
+	// The instance descriptor buffer and the BLAS array are provided at build
+	// time; sizes depend only on the count and descriptor stride.
+	MTL::InstanceAccelerationStructureDescriptor *desc = MTL::InstanceAccelerationStructureDescriptor::descriptor();
+	desc->setInstanceCount(p_max_instance_count);
+	desc->setInstanceDescriptorStride(sizeof(MDAccelerationStructureInstance));
+	if (device_properties->features.supports_user_id_instances) {
+		// Godot's instance custom index rides in the UserID descriptor so the
+		// ray-query compute lane can read it as MSL user_instance_id. The
+		// record layout is identical either way; at the macOS 11 floor Metal
+		// simply reads the default 64-byte prefix and user IDs stay CPU-side.
+		desc->setInstanceDescriptorType(MTL::AccelerationStructureInstanceDescriptorTypeUserID);
+	}
+
+	// ACCELERATION_LIMITS: explicit standard-limit check for instance counts. RenderingDevice
+	// visibility masks are 8-bit, so the standard mask width always holds.
+	const bool needs_extended_limits = (uint64_t)p_max_instance_count > MDAccelerationStructure::STANDARD_LIMIT_MAX_INSTANCES;
+	if (needs_extended_limits) {
+		WARN_PRINT(vformat("Metal TLAS exceeds the standard instance limit (%d/%d); building with ExtendedLimits.",
+				(int64_t)p_max_instance_count, (int64_t)MDAccelerationStructure::STANDARD_LIMIT_MAX_INSTANCES));
+	}
+
+	return _acceleration_structure_create(MDAccelerationStructure::Type::TLAS, desc, p_flags, p_max_instance_count, needs_extended_limits);
+}
+
+bool RenderingDeviceDriverMetal::tlas_build_is_valid(AccelerationStructureID p_tlas, VectorView<AccelerationStructureInstance> p_instances) const {
+	const MDAccelerationStructure *tlas = (const MDAccelerationStructure *)p_tlas.id;
+	ERR_FAIL_NULL_V_MSG(tlas, false, "Metal TLAS input parameter is not valid.");
+	ERR_FAIL_COND_V_MSG(tlas->type != MDAccelerationStructure::Type::TLAS || p_instances.size() > tlas->max_instance_count, false, "Metal TLAS build exceeds its allocated instance capacity.");
+	if (tlas->extended_limits) {
+		WARN_PRINT_ONCE("Metal RT: the TLAS exceeds the standard instance limit (built with ExtendedLimits); tracing it requires extended_limits shader support that is not implemented yet, so the TLAS build is refused before enqueue.");
+		return false;
+	}
+	for (uint32_t i = 0; i < p_instances.size(); i++) {
+		const AccelerationStructureInstance &instance = p_instances[i];
+		if (!instance.blas) {
+			continue;
+		}
+		const MDAccelerationStructure *blas = (const MDAccelerationStructure *)instance.blas.id;
+		// The BLAS build may have been queued earlier in the same rendering graph.
+		// In that case build_encoded is still false until graph execution reaches
+		// the BLAS command, so only validate properties known before enqueue here.
+		ERR_FAIL_COND_V_MSG(blas->type != MDAccelerationStructure::Type::BLAS || !blas->accel, false, "Metal TLAS references an invalid BLAS.");
+		if (blas->extended_limits) {
+			WARN_PRINT_ONCE("Metal RT: a BLAS exceeds the standard acceleration-structure limits (built with ExtendedLimits); tracing it requires extended_limits shader support that is not implemented yet, so the TLAS build is refused before enqueue.");
+			return false;
+		}
+	}
+	return true;
 }
 
 void RenderingDeviceDriverMetal::acceleration_structure_instance_write(uint8_t *r_driver_instance, const AccelerationStructureInstance &p_instance) {
-	ERR_FAIL_MSG("Ray tracing is not currently supported by the Metal driver.");
+	ERR_FAIL_NULL_MSG(r_driver_instance, "Metal acceleration structure instance output parameter is not valid.");
+	MDAccelerationStructureInstance driver_instance;
+	ERR_FAIL_COND_MSG(!driver_instance.write(p_instance), "Metal acceleration structure instance has a non-finite transform, invalid flags, or a non-BLAS acceleration structure handle.");
+	memcpy(r_driver_instance, &driver_instance, sizeof(driver_instance));
 }
 
 void RenderingDeviceDriverMetal::acceleration_structure_free(RDD::AccelerationStructureID p_acceleration_structure) {
-	ERR_FAIL_MSG("Ray tracing is not currently supported by the Metal driver.");
+	MDAccelerationStructure *accel_info = (MDAccelerationStructure *)p_acceleration_structure.id;
+	ERR_FAIL_NULL_MSG(accel_info, "Metal acceleration structure input parameter is not valid.");
+	if (accel_info->accel) {
+		_untrack_resource(accel_info->accel.get());
+	}
+	if (accel_info->compacted_size_buffer) {
+		_untrack_resource(accel_info->compacted_size_buffer.get());
+	}
+	memdelete(accel_info);
 }
 
 uint32_t RenderingDeviceDriverMetal::acceleration_structure_get_scratch_size_bytes(AccelerationStructureID p_acceleration_structure) {
-	ERR_FAIL_V_MSG(0, "Ray tracing is not currently supported by the Metal driver.");
+	const MDAccelerationStructure *accel_info = (const MDAccelerationStructure *)p_acceleration_structure.id;
+	ERR_FAIL_NULL_V_MSG(accel_info, 0, "Metal acceleration structure input parameter is not valid.");
+	ERR_FAIL_COND_V_MSG(accel_info->scratch_size > UINT32_MAX, 0, "Acceleration structure scratch size exceeds the RenderingDevice limit.");
+	return (uint32_t)accel_info->scratch_size;
+}
+
+uint64_t RenderingDeviceDriverMetal::acceleration_structure_get_compacted_size(AccelerationStructureID p_acceleration_structure) {
+	const MDAccelerationStructure *accel_info = (const MDAccelerationStructure *)p_acceleration_structure.id;
+	ERR_FAIL_NULL_V_MSG(accel_info, 0, "Metal acceleration structure input parameter is not valid.");
+	// Zero until the size-writing build has completed on the GPU; the shared
+	// buffer becomes coherent when its command buffer finishes.
+	return accel_info->get_compacted_size();
+}
+
+uint64_t RenderingDeviceDriverMetal::acceleration_structure_get_allocated_size(AccelerationStructureID p_acceleration_structure) {
+	const MDAccelerationStructure *accel_info = (const MDAccelerationStructure *)p_acceleration_structure.id;
+	ERR_FAIL_NULL_V_MSG(accel_info, 0, "Metal acceleration structure input parameter is not valid.");
+	return accel_info->acceleration_structure_size;
+}
+
+bool RenderingDeviceDriverMetal::acceleration_structure_is_compaction_complete(AccelerationStructureID p_acceleration_structure) {
+	const MDAccelerationStructure *accel_info = (const MDAccelerationStructure *)p_acceleration_structure.id;
+	ERR_FAIL_NULL_V_MSG(accel_info, false, "Metal acceleration structure input parameter is not valid.");
+	return accel_info->is_compaction_complete();
+}
+
+RDD::AccelerationStructureID RenderingDeviceDriverMetal::blas_create_compacted_target(AccelerationStructureID p_source, uint64_t p_size) {
+	ERR_FAIL_COND_V_MSG(!device_properties->features.supports_raytracing, AccelerationStructureID(), "Acceleration structures are not supported by this device.");
+	ERR_FAIL_COND_V_MSG(p_size == 0, AccelerationStructureID(), "A compacted Metal BLAS target requires a nonzero size.");
+	const MDAccelerationStructure *source = (const MDAccelerationStructure *)p_source.id;
+	ERR_FAIL_NULL_V_MSG(source, AccelerationStructureID(), "A compacted Metal BLAS target requires a source BLAS.");
+	ERR_FAIL_COND_V_MSG(source->type != MDAccelerationStructure::Type::BLAS, AccelerationStructureID(), "Only a BLAS can be the source of a compacted Metal target.");
+
+	MDAccelerationStructure *accel_info = memnew(MDAccelerationStructure(MDAccelerationStructure::Type::BLAS, p_size));
+	accel_info->inherit_compaction_metadata_from(*source);
+	if (!accel_info->allocate(device)) {
+		memdelete(accel_info);
+		ERR_FAIL_V_MSG(AccelerationStructureID(), "Failed to allocate the compacted Metal BLAS target.");
+	}
+	_track_resource(accel_info->accel.get());
+	return AccelerationStructureID(accel_info);
 }
 
 // ----- PIPELINE -----
 
 RDD::RaytracingPipelineID RenderingDeviceDriverMetal::raytracing_pipeline_create(VectorView<PipelineShader> p_shaders, VectorView<uint32_t> p_raygen_shader_indices, VectorView<uint32_t> p_miss_shader_indices, VectorView<HitGroup> p_hit_groups, uint32_t p_max_trace_recursion_depth, ShaderID p_layout_defining_shader) {
-	ERR_FAIL_V_MSG(RaytracingPipelineID(), "Ray tracing is not currently supported by the Metal driver.");
+	ERR_FAIL_COND_V_MSG(!device_properties->features.supports_raytracing, RaytracingPipelineID(), "Ray tracing pipelines are not supported by this device.");
+	ERR_FAIL_COND_V_MSG(!p_layout_defining_shader, RaytracingPipelineID(), "Metal raytracing pipeline layout shader is not valid.");
+
+	MDRaytracingPipeline *pipeline = new MDRaytracingPipeline;
+	String error;
+	if (!pipeline->configure_shader_groups(p_shaders, p_raygen_shader_indices, p_miss_shader_indices, p_hit_groups, p_max_trace_recursion_depth, &error)) {
+		delete pipeline;
+		ERR_FAIL_V_MSG(RaytracingPipelineID(), error);
+	}
+	pipeline->shader = (MDShader *)p_layout_defining_shader.id;
+
+	if (pipeline->uses_compute_lane) {
+		// The ray-generation group is the engine's re-expressed ray-query
+		// compute kernel, compiled through the regular shader container. Build
+		// its pipeline state exactly like a compute pipeline, including
+		// specialization constants (RT_FLAGS et al.).
+		const RDD::PipelineShader &raygen = p_shaders[p_raygen_shader_indices[0]];
+		MDComputeShader *compute_shader = (MDComputeShader *)raygen.shader.id;
+		VectorView<PipelineSpecializationConstant> specialization_constants = raygen.specialization_constants;
+		Result<NS::SharedPtr<MTL::Function>> function_or_err = _create_function(compute_shader->kernel.get(), MTLSTR("main0"), specialization_constants);
+		if (std::holds_alternative<Error>(function_or_err)) {
+			delete pipeline;
+			ERR_FAIL_V_MSG(RaytracingPipelineID(), "Failed to specialize the Metal compute-lane raytracing kernel.");
+		}
+		NS::SharedPtr<MTL::Function> function = std::get<NS::SharedPtr<MTL::Function>>(function_or_err);
+		if (!pipeline->create_compute_lane(device, function.get(), compute_shader->local, &error)) {
+			delete pipeline;
+			ERR_FAIL_V_MSG(RaytracingPipelineID(), vformat("Failed to create the Metal compute-lane raytracing pipeline: %s", error));
+		}
+		return RaytracingPipelineID(pipeline);
+	}
+
+	if (!pipeline->create_trace_one_ray(device, &error)) {
+		delete pipeline;
+		ERR_FAIL_V_MSG(RaytracingPipelineID(), vformat("Failed to create the Metal raytracing control pipeline: %s", error));
+	}
+	return RaytracingPipelineID(pipeline);
 }
 
 void RenderingDeviceDriverMetal::raytracing_pipeline_free(RDD::RaytracingPipelineID p_pipeline) {
-	ERR_FAIL_MSG("Ray tracing is not currently supported by the Metal driver.");
+	MDRaytracingPipeline *pipeline = (MDRaytracingPipeline *)p_pipeline.id;
+	ERR_FAIL_NULL_MSG(pipeline, "Metal raytracing pipeline input parameter is not valid.");
+	delete pipeline;
 }
 
 bool RenderingDeviceDriverMetal::raytracing_pipeline_get_shader_group_handles(RaytracingPipelineID p_pipeline, uint32_t p_group_index_offset, VectorView<uint32_t> p_group_indices, uint8_t *r_data, uint32_t p_data_stride_bytes) {
-	ERR_FAIL_V_MSG(false, "Ray tracing is not currently supported by the Metal driver.");
+	const MDRaytracingPipeline *pipeline = (const MDRaytracingPipeline *)p_pipeline.id;
+	ERR_FAIL_NULL_V_MSG(pipeline, false, "Metal raytracing pipeline input parameter is not valid.");
+	String error;
+	ERR_FAIL_COND_V_MSG(!pipeline->get_shader_group_handles(p_group_index_offset, p_group_indices, r_data, p_data_stride_bytes, &error), false, error);
+	return true;
 }
 
 // ----- COMMANDS -----
 
 void RenderingDeviceDriverMetal::command_build_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer) {
-	ERR_FAIL_MSG("Ray tracing is not currently supported by the Metal driver.");
+	MDCommandBufferBase *cmd_buffer = (MDCommandBufferBase *)p_cmd_buffer.id;
+	MDAccelerationStructure *accel_info = (MDAccelerationStructure *)p_acceleration_structure.id;
+	const BufferInfo *scratch_buffer = (const BufferInfo *)p_scratch_buffer.id;
+	ERR_FAIL_NULL_MSG(cmd_buffer, "Metal command buffer input parameter is not valid.");
+	ERR_FAIL_NULL_MSG(accel_info, "Metal acceleration structure input parameter is not valid.");
+	ERR_FAIL_COND_MSG(accel_info->type != MDAccelerationStructure::Type::BLAS, "Only BLAS resources can be passed to command_build_blas().");
+	ERR_FAIL_NULL_MSG(accel_info->accel.get(), "Metal BLAS resource has not been allocated.");
+	ERR_FAIL_NULL_MSG(scratch_buffer, "Metal BLAS scratch buffer input parameter is not valid.");
+	ERR_FAIL_COND_MSG(scratch_buffer->metal_buffer->length() < accel_info->build_scratch_size, "Metal BLAS scratch buffer is too small for a build.");
+
+	cmd_buffer->acceleration_structure_build(accel_info, scratch_buffer->metal_buffer.get());
 }
 
 void RenderingDeviceDriverMetal::command_update_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer) {
-	ERR_FAIL_MSG("Ray tracing is not currently supported by the Metal driver.");
+	MDCommandBufferBase *cmd_buffer = (MDCommandBufferBase *)p_cmd_buffer.id;
+	MDAccelerationStructure *accel_info = (MDAccelerationStructure *)p_acceleration_structure.id;
+	const BufferInfo *scratch_buffer = (const BufferInfo *)p_scratch_buffer.id;
+	ERR_FAIL_NULL_MSG(cmd_buffer, "Metal command buffer input parameter is not valid.");
+	ERR_FAIL_NULL_MSG(accel_info, "Metal acceleration structure input parameter is not valid.");
+	ERR_FAIL_COND_MSG(accel_info->type != MDAccelerationStructure::Type::BLAS, "Only BLAS resources can be passed to command_update_blas().");
+	ERR_FAIL_COND_MSG(!accel_info->flags.has_flag(ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT), "Metal BLAS was not created with ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT.");
+	ERR_FAIL_COND_MSG(!accel_info->build_encoded, "Metal BLAS must be built before it can be refit.");
+	ERR_FAIL_NULL_MSG(scratch_buffer, "Metal BLAS scratch buffer input parameter is not valid.");
+
+#ifdef MACOS_ENABLED
+	// macOS 15.2-15.3 can drop geometry from refit acceleration structures;
+	// Blender's Apple-maintained Cycles backend carries the same substitution
+	// of a full rebuild. Scratch allocations already cover both paths because
+	// required_scratch_size() takes the build/refit maximum for updatable AS.
+	const uint32_t os = device_properties->os_version;
+	if (os >= 15'02'00 && os < 15'04'00) {
+		ERR_FAIL_COND_MSG(scratch_buffer->metal_buffer->length() < accel_info->build_scratch_size, "Metal BLAS scratch buffer is too small for the macOS 15.2-15.3 refit-as-build workaround.");
+		cmd_buffer->acceleration_structure_build(accel_info, scratch_buffer->metal_buffer.get());
+		return;
+	}
+#endif
+
+	ERR_FAIL_COND_MSG(scratch_buffer->metal_buffer->length() < accel_info->refit_scratch_size, "Metal BLAS scratch buffer is too small for a refit.");
+
+	cmd_buffer->acceleration_structure_refit(accel_info, scratch_buffer->metal_buffer.get());
 }
 
 void RenderingDeviceDriverMetal::command_build_tlas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, BufferID p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count) {
-	ERR_FAIL_MSG("Ray tracing is not currently supported by the Metal driver.");
+	MDCommandBufferBase *cmd_buffer = (MDCommandBufferBase *)p_cmd_buffer.id;
+	MDAccelerationStructure *accel_info = (MDAccelerationStructure *)p_acceleration_structure.id;
+	const BufferInfo *scratch_buffer = (const BufferInfo *)p_scratch_buffer.id;
+	const BufferInfo *instance_buffer = (const BufferInfo *)p_instance_buffer.id;
+	ERR_FAIL_NULL_MSG(cmd_buffer, "Metal command buffer input parameter is not valid.");
+	ERR_FAIL_NULL_MSG(accel_info, "Metal acceleration structure input parameter is not valid.");
+	ERR_FAIL_COND_MSG(accel_info->type != MDAccelerationStructure::Type::TLAS, "Only TLAS resources can be passed to command_build_tlas().");
+	ERR_FAIL_NULL_MSG(accel_info->accel.get(), "Metal TLAS resource has not been allocated.");
+	ERR_FAIL_NULL_MSG(scratch_buffer, "Metal TLAS scratch buffer input parameter is not valid.");
+	ERR_FAIL_COND_MSG(scratch_buffer->metal_buffer->length() < accel_info->build_scratch_size, "Metal TLAS scratch buffer is too small for a build.");
+	ERR_FAIL_NULL_MSG(instance_buffer, "Metal TLAS instance buffer input parameter is not valid.");
+	ERR_FAIL_COND_MSG(!accel_info->prepare_tlas_build(instance_buffer->metal_buffer.get(), p_instance_offset, p_instance_count), "Metal TLAS instance records, range, or referenced BLAS are invalid.");
+
+	cmd_buffer->acceleration_structure_build(accel_info, scratch_buffer->metal_buffer.get());
+}
+
+void RenderingDeviceDriverMetal::command_compact_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_source, AccelerationStructureID p_destination) {
+	MDCommandBufferBase *cmd_buffer = (MDCommandBufferBase *)p_cmd_buffer.id;
+	MDAccelerationStructure *source = (MDAccelerationStructure *)p_source.id;
+	MDAccelerationStructure *destination = (MDAccelerationStructure *)p_destination.id;
+	ERR_FAIL_NULL_MSG(cmd_buffer, "Metal command buffer input parameter is not valid.");
+	ERR_FAIL_NULL_MSG(source, "Metal source acceleration structure input parameter is not valid.");
+	ERR_FAIL_NULL_MSG(destination, "Metal destination acceleration structure input parameter is not valid.");
+	ERR_FAIL_COND_MSG(source->type != MDAccelerationStructure::Type::BLAS || destination->type != MDAccelerationStructure::Type::BLAS, "Only BLAS resources can be passed to command_compact_blas().");
+	ERR_FAIL_COND_MSG(!source->build_encoded, "Metal BLAS must be built before it can be compacted.");
+	ERR_FAIL_NULL_MSG(destination->accel.get(), "Compacted Metal BLAS target has not been allocated.");
+	const uint64_t compacted_size = source->get_compacted_size();
+	ERR_FAIL_COND_MSG(compacted_size == 0, "Metal BLAS compacted size has not been written; the size-recording build has not completed.");
+	ERR_FAIL_COND_MSG(destination->acceleration_structure_size < compacted_size, "Compacted Metal BLAS target is smaller than the recorded compacted size.");
+
+	cmd_buffer->acceleration_structure_compact(source, destination);
 }
 
 void RenderingDeviceDriverMetal::command_bind_raytracing_pipeline(CommandBufferID p_cmd_buffer, RaytracingPipelineID p_pipeline) {
-	ERR_FAIL_MSG("Ray tracing is not currently supported by the Metal driver.");
+	MDCommandBufferBase *cmd_buffer = (MDCommandBufferBase *)p_cmd_buffer.id;
+	MDRaytracingPipeline *pipeline = (MDRaytracingPipeline *)p_pipeline.id;
+	ERR_FAIL_NULL_MSG(cmd_buffer, "Metal command buffer input parameter is not valid.");
+	ERR_FAIL_NULL_MSG(pipeline, "Metal raytracing pipeline input parameter is not valid.");
+	ERR_FAIL_COND_MSG(!pipeline->is_valid(), "Metal raytracing pipeline is not ready for binding.");
+	cmd_buffer->bind_pipeline(PipelineID(p_pipeline.id));
 }
 
 void RenderingDeviceDriverMetal::command_bind_raytracing_uniform_set(CommandBufferID p_cmd_buffer, UniformSetID p_uniform_set, ShaderID p_shader, uint32_t p_set_index) {
-	ERR_FAIL_MSG("Ray tracing is not currently supported by the Metal driver.");
+	MDCommandBufferBase *cmd_buffer = (MDCommandBufferBase *)p_cmd_buffer.id;
+	ERR_FAIL_NULL_MSG(cmd_buffer, "Metal command buffer input parameter is not valid.");
+	ERR_FAIL_COND_MSG(!p_uniform_set, "Metal raytracing uniform set input parameter is not valid.");
+	ERR_FAIL_COND_MSG(!p_shader, "Metal raytracing uniform-set shader input parameter is not valid.");
+	cmd_buffer->compute_bind_uniform_sets(VectorView<UniformSetID>(p_uniform_set), p_shader, p_set_index, 1, 0);
 }
 
 void RenderingDeviceDriverMetal::command_trace_rays(CommandBufferID p_cmd_buffer, const ShaderBindingTable &p_raygen_sbt, const ShaderBindingTable &p_miss_sbt, const ShaderBindingTable &p_hit_sbt, uint32_t p_width, uint32_t p_height, uint32_t p_depth) {
-	ERR_FAIL_MSG("Ray tracing is not currently supported by the Metal driver.");
+	// The compute-lane kernel inlines raygen/miss/hit logic, so the
+	// compatibility SBT buffers are not consumed here; instances resolve their
+	// hit-group records engine-side. Pipeline and uniform sets were bound
+	// through the raytracing bind hooks onto the shared compute state.
+	MDCommandBufferBase *cmd_buffer = (MDCommandBufferBase *)p_cmd_buffer.id;
+	ERR_FAIL_NULL_MSG(cmd_buffer, "Metal command buffer input parameter is not valid.");
+	cmd_buffer->trace_rays(p_width, p_height, p_depth);
 }
 
 #pragma mark - Queries
@@ -2337,25 +2825,144 @@ void RenderingDeviceDriverMetal::command_trace_rays(CommandBufferID p_cmd_buffer
 // ----- TIMESTAMP -----
 
 RDD::QueryPoolID RenderingDeviceDriverMetal::timestamp_query_pool_create(uint32_t p_query_count) {
-	return QueryPoolID(1);
+	TimestampQueryPool *pool = memnew(TimestampQueryPool);
+	pool->count = p_query_count;
+
+	if (!device_properties->features.supports_timestamp_sampling || p_query_count == 0) {
+		return QueryPoolID(pool);
+	}
+
+	NS::Array *counter_sets = device->counterSets();
+	if (counter_sets == nullptr) {
+		return QueryPoolID(pool);
+	}
+
+	MTL::CounterSet *timestamp_set = nullptr;
+	for (NS::UInteger i = 0; i < counter_sets->count(); i++) {
+		MTL::CounterSet *set = counter_sets->object<MTL::CounterSet>(i);
+		if (set->name()->isEqualToString(MTL::CommonCounterSetTimestamp)) {
+			timestamp_set = set;
+			break;
+		}
+	}
+	if (timestamp_set == nullptr) {
+		return QueryPoolID(pool);
+	}
+
+	NS::SharedPtr<MTL::CounterSampleBufferDescriptor> desc = NS::TransferPtr(MTL::CounterSampleBufferDescriptor::alloc()->init());
+	desc->setCounterSet(timestamp_set);
+	desc->setSampleCount(p_query_count);
+	desc->setStorageMode(MTL::StorageModeShared);
+
+	NS::Error *error = nullptr;
+	pool->sample_buffer = NS::TransferPtr(device->newCounterSampleBuffer(desc.get(), &error));
+	if (!pool->sample_buffer) {
+		ERR_PRINT(vformat("Unable to create GPU timestamp sample buffer: %s", error != nullptr ? String(error->localizedDescription()->utf8String()) : String("unknown error")));
+	}
+
+	return QueryPoolID(pool);
 }
 
 void RenderingDeviceDriverMetal::timestamp_query_pool_free(QueryPoolID p_pool_id) {
+	TimestampQueryPool *pool = (TimestampQueryPool *)(p_pool_id.id);
+	ERR_FAIL_NULL(pool);
+	memdelete(pool);
 }
 
 void RenderingDeviceDriverMetal::timestamp_query_pool_get_results(QueryPoolID p_pool_id, uint32_t p_query_count, uint64_t *r_results) {
-	// Metal doesn't support timestamp queries, so we just clear the buffer.
-	bzero(r_results, p_query_count * sizeof(uint64_t));
+	TimestampQueryPool *pool = (TimestampQueryPool *)(p_pool_id.id);
+	if (pool == nullptr || !pool->sample_buffer || p_query_count == 0) {
+		bzero(r_results, p_query_count * sizeof(uint64_t));
+		return;
+	}
+
+	uint32_t count = MIN(p_query_count, pool->count);
+	// Autoreleased; taking ownership of it here would over-release at pool drain.
+	NS::Data *data = pool->sample_buffer->resolveCounterRange(NS::Range(0, count));
+	if (data == nullptr || data->length() < count * sizeof(MTL::CounterResultTimestamp)) {
+		bzero(r_results, p_query_count * sizeof(uint64_t));
+		return;
+	}
+
+	const MTL::CounterResultTimestamp *samples = static_cast<const MTL::CounterResultTimestamp *>(data->bytes());
+	for (uint32_t i = 0; i < count; i++) {
+		// A sample that never executed resolves to MTLCounterErrorValue. Reporting
+		// it verbatim would produce a nonsense delta, so it reads as zero instead.
+		r_results[i] = samples[i].timestamp == MTL::CounterErrorValue ? 0 : samples[i].timestamp;
+	}
+	for (uint32_t i = count; i < p_query_count; i++) {
+		r_results[i] = 0;
+	}
+}
+
+void RenderingDeviceDriverMetal::_timestamp_resolve_period() {
+	if (timestamp_period_resolved || !device_properties->features.supports_timestamp_sampling) {
+		return;
+	}
+
+	MTL::Timestamp cpu_now = 0;
+	MTL::Timestamp gpu_now = 0;
+	device->sampleTimestamps(&cpu_now, &gpu_now);
+
+	if (timestamp_correlation_cpu == 0) {
+		timestamp_correlation_cpu = cpu_now;
+		timestamp_correlation_gpu = gpu_now;
+		return;
+	}
+
+	// Wait for a baseline wide enough that clock granularity does not dominate
+	// the ratio; until then callers keep the 1.0 default.
+	const uint64_t cpu_delta = cpu_now - timestamp_correlation_cpu;
+	const uint64_t gpu_delta = gpu_now - timestamp_correlation_gpu;
+	if (cpu_delta < 100000000 || gpu_delta == 0) { // 100ms in nanoseconds.
+		return;
+	}
+
+	timestamp_period = double(cpu_delta) / double(gpu_delta);
+	timestamp_period_resolved = true;
 }
 
 uint64_t RenderingDeviceDriverMetal::timestamp_query_result_to_time(uint64_t p_result) {
-	return p_result;
+	_timestamp_resolve_period();
+	return uint64_t(double(p_result) * timestamp_period);
 }
 
 void RenderingDeviceDriverMetal::command_timestamp_query_pool_reset(CommandBufferID p_cmd_buffer, QueryPoolID p_pool_id, uint32_t p_query_count) {
 }
 
 void RenderingDeviceDriverMetal::command_timestamp_write(CommandBufferID p_cmd_buffer, QueryPoolID p_pool_id, uint32_t p_index) {
+	TimestampQueryPool *pool = (TimestampQueryPool *)(p_pool_id.id);
+	if (pool == nullptr || !pool->sample_buffer || p_index >= pool->count) {
+		return;
+	}
+
+	MDCommandBufferBase *cb = (MDCommandBufferBase *)(p_cmd_buffer.id);
+	MTL::CommandBuffer *command_buffer = cb->get_command_buffer();
+	if (command_buffer == nullptr) {
+		return;
+	}
+
+	if (!timestamp_keepalive_buffer) {
+		timestamp_keepalive_buffer = NS::TransferPtr(device->newBuffer(4, MTL::ResourceStorageModePrivate));
+		ERR_FAIL_COND(!timestamp_keepalive_buffer);
+	}
+
+	// Apple GPUs sample only at stage boundaries, so a blit encoder is opened
+	// purely to create a boundary to sample at. Closing the in-flight encoder
+	// first is what places that boundary at the requested point.
+	cb->end();
+
+	NS::SharedPtr<MTL::BlitPassDescriptor> desc = NS::TransferPtr(MTL::BlitPassDescriptor::alloc()->init());
+	MTL::BlitPassSampleBufferAttachmentDescriptor *attachment = desc->sampleBufferAttachments()->object(0);
+	attachment->setSampleBuffer(pool->sample_buffer.get());
+	attachment->setStartOfEncoderSampleIndex(p_index);
+	attachment->setEndOfEncoderSampleIndex(MTL::CounterDontSample);
+
+	MTL::BlitCommandEncoder *enc = command_buffer->blitCommandEncoder(desc.get());
+	if (enc != nullptr) {
+		enc->fillBuffer(timestamp_keepalive_buffer.get(), NS::Range(0, 4), 0);
+		enc->endEncoding();
+	}
 }
 
 #pragma mark - Labels
@@ -2422,6 +3029,15 @@ void RenderingDeviceDriverMetal::set_object_name(ObjectType p_type, ID p_driver_
 		} break;
 		case OBJECT_TYPE_PIPELINE: {
 			// Can't set label after creation.
+		} break;
+		case OBJECT_TYPE_ACCELERATION_STRUCTURE: {
+			const MDAccelerationStructure *accel_info = (const MDAccelerationStructure *)p_driver_id.id;
+			if (accel_info->accel) {
+				accel_info->accel->setLabel(label);
+			}
+		} break;
+		case OBJECT_TYPE_RAYTRACING_PIPELINE: {
+			// Compute pipeline labels are fixed when their descriptors are created.
 		} break;
 		default: {
 			DEV_ASSERT(false);
@@ -2636,6 +3252,8 @@ uint64_t RenderingDeviceDriverMetal::limit_get(Limit p_limit) {
 			return limits.maxViewportDimensionX;
 		case LIMIT_MAX_VIEWPORT_DIMENSIONS_Y:
 			return limits.maxViewportDimensionY;
+		case LIMIT_MAX_ACCELERATION_STRUCTURE_INSTANCES:
+			return MDAccelerationStructure::STANDARD_LIMIT_MAX_INSTANCES;
 		case LIMIT_SUBGROUP_SIZE:
 			// MoltenVK sets the subgroupSize to the same as the maxSubgroupSize.
 			return limits.maxSubgroupSize;
@@ -2670,6 +3288,14 @@ uint64_t RenderingDeviceDriverMetal::api_trait_get(ApiTrait p_trait) {
 			return use_barriers;
 		case API_TRAIT_CLEARS_WITH_COPY_ENGINE:
 			return false;
+		case API_TRAIT_ACCELERATION_STRUCTURE_INSTANCE_SIZE:
+			return sizeof(MDAccelerationStructureInstance);
+		case API_TRAIT_SHADER_GROUP_HANDLE_SIZE:
+			return MDRaytracingPipeline::SHADER_GROUP_HANDLE_SIZE;
+		case API_TRAIT_SHADER_GROUP_HANDLE_ALIGNMENT:
+			return MDRaytracingPipeline::SHADER_GROUP_HANDLE_ALIGNMENT;
+		case API_TRAIT_SHADER_GROUP_BASE_ALIGNMENT:
+			return MDRaytracingPipeline::SHADER_GROUP_BASE_ALIGNMENT;
 		default:
 			return RenderingDeviceDriver::api_trait_get(p_trait);
 	}
@@ -2687,6 +3313,8 @@ bool RenderingDeviceDriverMetal::has_feature(Features p_feature) {
 			return device_properties->features.metal_fx_spatial;
 		case SUPPORTS_METALFX_TEMPORAL:
 			return device_properties->features.metal_fx_temporal;
+		case SUPPORTS_METALFX_DENOISED:
+			return device_properties->features.metal_fx_denoised;
 		case SUPPORTS_HDR_OUTPUT:
 			return true;
 		case SUPPORTS_IMAGE_ATOMIC_32_BIT:
@@ -2695,9 +3323,53 @@ bool RenderingDeviceDriverMetal::has_feature(Features p_feature) {
 			return true;
 		case SUPPORTS_POINT_SIZE:
 			return true;
+		case SUPPORTS_RAY_QUERY: {
+			return _is_metal_rt_enabled();
+		}
+		case SUPPORTS_BLAS_COMPACTION: {
+			return _is_metal_rt_enabled();
+		}
 		default:
 			return false;
 	}
+}
+
+bool RenderingDeviceDriverMetal::_is_metal_rt_enabled() {
+	if (metal_rt_gate_evaluated) {
+		return metal_rt_gate.is_enabled();
+	}
+	metal_rt_gate_evaluated = true;
+
+	bool project_enabled = true;
+	ProjectSettings *project_settings = ProjectSettings::get_singleton();
+	if (project_settings != nullptr && project_settings->has_setting("rendering/pathtracer/metal_ray_query_backend")) {
+		project_enabled = GLOBAL_GET("rendering/pathtracer/metal_ray_query_backend");
+	}
+
+	const MetalFeatures &features = device_properties->features;
+	MetalRTGateInputs inputs;
+#if TARGET_OS_OSX && (defined(__aarch64__) || defined(__x86_64__))
+	inputs.supported_platform = true;
+#else
+	inputs.supported_platform = false;
+#endif
+	inputs.project_enabled = project_enabled;
+	inputs.force_disabled = OS::get_singleton()->get_environment("GODOT_MTL_DISABLE_RAYTRACING") == "1";
+	inputs.supports_raytracing = features.supports_raytracing;
+	inputs.supports_function_pointers = features.supports_function_pointers;
+	inputs.supports_user_id_instances = features.supports_user_id_instances;
+	inputs.supports_gpu_address = features.supports_gpu_address;
+	inputs.argument_buffers_enabled = features.argument_buffers_enabled();
+	inputs.supports_msl_2_3 = features.msl_target_version >= MSL_VERSION_23;
+	metal_rt_gate = metal_rt_evaluate_gate(inputs);
+
+	if (metal_rt_gate.is_enabled()) {
+		print_line("Metal ray tracing: enabled (compute ray-query backend; fallback renderer remains available).");
+	} else {
+		WARN_PRINT(vformat("Metal ray tracing: disabled (%s); using non-RT rendering fallback. capability_gate=disabled:%s", metal_rt_gate.get_description(), metal_rt_gate.get_reason_codes()));
+	}
+
+	return metal_rt_gate.is_enabled();
 }
 
 const RDD::MultiviewCapabilities &RenderingDeviceDriverMetal::get_multiview_capabilities() {
@@ -2896,8 +3568,13 @@ Error RenderingDeviceDriverMetal::_initialize(uint32_t p_device_index, uint32_t 
 		print_verbose("- Metal multiview not supported");
 	}
 
-	// The Metal renderer requires Apple4 family. This is 2017 era A11 chips and newer.
-	if (device_properties->features.highestFamily < MTL::GPUFamilyApple4) {
+	// The Metal renderer requires Apple4 family (2017-era A11 and newer) or, on
+	// Intel/AMD Macs, the mac2 feature set — both provide the required baseline
+	// (image cube arrays, etc.). mac2 devices report no Apple family, so gate on
+	// the actual required feature rather than the Apple-family proxy alone.
+	const bool meets_feature_floor = device_properties->features.highestFamily >= MTL::GPUFamilyApple4 ||
+			device->supportsFamily(MTL::GPUFamilyMac2);
+	if (!meets_feature_floor || !device_properties->features.imageCubeArray) {
 		String error_string = vformat("Your Apple GPU does not support the following features, which are required to use Metal-based renderers in Godot:\n\n");
 		if (!device_properties->features.imageCubeArray) {
 			error_string += "- No support for image cube arrays.\n";

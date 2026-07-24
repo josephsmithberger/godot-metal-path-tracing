@@ -32,6 +32,7 @@
 
 #include "drivers/metal/metal_device_profile.h"
 #include "drivers/metal/metal_objects_shared.h"
+#include "drivers/metal/metal_rt_availability.h"
 #include "servers/rendering/rendering_device_driver.h"
 
 #include <Metal/Metal.hpp>
@@ -160,10 +161,39 @@ protected:
 
 	bool use_barriers = false;
 	MTL::ResourceOptions base_hazard_tracking = MTL::ResourceHazardTrackingModeTracked;
+	bool metal_rt_gate_evaluated = false;
+	MetalRTGateResult metal_rt_gate;
 
+#pragma mark - Buffer device-address residency
+
+	/// Buffers whose GPU address has been queried are read through raw device
+	/// pointers, so no encoder bind ever marks them resident. Metal requires
+	/// explicit residency for such indirect access: on OS versions with
+	/// residency sets they join a queue-level set once; otherwise they are
+	/// marked with useResources on compute encoders that bind an acceleration
+	/// structure (the only pass that dereferences these addresses today).
+	Mutex bda_residency_mutex;
+	GODOT_CLANG_WARNING_PUSH_AND_IGNORE("-Wunguarded-availability")
+	NS::SharedPtr<MTL::ResidencySet> bda_residency_set;
+	GODOT_CLANG_WARNING_POP
+	bool bda_residency_set_creation_failed = false;
+	bool bda_residency_dirty = false;
+	HashMap<MTL::Buffer *, uint32_t> bda_buffer_indices;
+	LocalVector<MTL::Resource *> bda_buffers;
+	void _bda_track_buffer(MTL::Buffer *p_buffer);
+	void _bda_untrack_buffer(MTL::Buffer *p_buffer);
+	void _bda_commit_residency();
+
+public:
+	/// Fallback residency for device-address reads when residency sets are
+	/// unavailable; called when a compute encoder binds an acceleration structure.
+	void encode_bda_residency(MTL::ComputeCommandEncoder *p_enc);
+
+protected:
 	virtual Error _create_device();
 	virtual void _track_resource(MTL::Resource *p_resource);
 	virtual void _untrack_resource(MTL::Resource *p_resource);
+	bool _is_metal_rt_enabled();
 	void _check_capabilities();
 	Error _initialize(uint32_t p_device_index, uint32_t p_frame_count);
 
@@ -462,11 +492,20 @@ public:
 
 	// ----- ACCELERATION STRUCTURE -----
 
+private:
+	AccelerationStructureID _acceleration_structure_create(MDAccelerationStructure::Type p_type, MTL::AccelerationStructureDescriptor *p_desc, BitField<AccelerationStructureFlagBits> p_flags, uint32_t p_max_instance_count = 0, bool p_needs_extended_limits = false);
+
+public:
 	virtual AccelerationStructureID blas_create(VectorView<AccelerationStructureGeometry> p_geometries, BitField<AccelerationStructureFlagBits> p_flags) override final;
 	virtual AccelerationStructureID tlas_create(uint32_t p_max_instance_count, BitField<AccelerationStructureFlagBits> p_flags) override final;
+	virtual bool tlas_build_is_valid(AccelerationStructureID p_tlas, VectorView<AccelerationStructureInstance> p_instances) const override final;
 	virtual void acceleration_structure_instance_write(uint8_t *r_driver_instance, const AccelerationStructureInstance &p_instance) override final;
 	virtual void acceleration_structure_free(AccelerationStructureID p_acceleration_structure) override final;
 	virtual uint32_t acceleration_structure_get_scratch_size_bytes(AccelerationStructureID p_acceleration_structure) override final;
+	virtual uint64_t acceleration_structure_get_compacted_size(AccelerationStructureID p_acceleration_structure) override final;
+	virtual uint64_t acceleration_structure_get_allocated_size(AccelerationStructureID p_acceleration_structure) override final;
+	virtual bool acceleration_structure_is_compaction_complete(AccelerationStructureID p_acceleration_structure) override final;
+	virtual AccelerationStructureID blas_create_compacted_target(AccelerationStructureID p_source, uint64_t p_size) override final;
 
 	// ----- PIPELINE -----
 
@@ -480,6 +519,7 @@ public:
 	virtual void command_build_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer) override final;
 	virtual void command_update_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer) override final;
 	virtual void command_build_tlas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, BufferID p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count) override final;
+	virtual void command_compact_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_source, AccelerationStructureID p_destination) override final;
 	virtual void command_bind_raytracing_pipeline(CommandBufferID p_cmd_buffer, RaytracingPipelineID p_pipeline) override final;
 	virtual void command_bind_raytracing_uniform_set(CommandBufferID p_cmd_buffer, UniformSetID p_uniform_set, ShaderID p_shader, uint32_t p_set_index) override final;
 	virtual void command_trace_rays(CommandBufferID p_cmd_buffer, const ShaderBindingTable &p_raygen_sbt, const ShaderBindingTable &p_miss_sbt, const ShaderBindingTable &p_hit_sbt, uint32_t p_width, uint32_t p_height, uint32_t p_depth) override final;
@@ -487,6 +527,29 @@ public:
 #pragma mark - Queries
 
 	// ----- TIMESTAMP -----
+
+	/// Backing store for a Godot timestamp query pool.
+	///
+	/// `sample_buffer` is null when the device cannot sample counters, in which
+	/// case results resolve to zero and the pool behaves as an inert stub.
+	struct TimestampQueryPool {
+		NS::SharedPtr<MTL::CounterSampleBuffer> sample_buffer;
+		uint32_t count = 0;
+	};
+
+	/// GPU ticks are converted to nanoseconds with a scale derived from a pair of
+	/// CPU/GPU correlation samples taken far enough apart to be meaningful. On
+	/// Apple Silicon both clocks share a timebase and the scale settles at 1.0.
+	double timestamp_period = 1.0;
+	bool timestamp_period_resolved = false;
+	MTL::Timestamp timestamp_correlation_cpu = 0;
+	MTL::Timestamp timestamp_correlation_gpu = 0;
+	void _timestamp_resolve_period();
+
+	/// A blit encoder that carries no commands is dropped before it executes, and
+	/// its stage-boundary sample never lands. Each sampling encoder writes to this
+	/// scratch buffer purely so it survives to produce a timestamp.
+	NS::SharedPtr<MTL::Buffer> timestamp_keepalive_buffer;
 
 	// Basic.
 	virtual QueryPoolID timestamp_query_pool_create(uint32_t p_query_count) override final;
