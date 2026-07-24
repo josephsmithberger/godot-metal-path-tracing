@@ -344,12 +344,17 @@ bool ray_query_candidate_accepts(rayQueryEXT query, vec3 origin, vec3 direction)
 // RT_RAY_FLAGS keeps back-face culling aligned with the Vulkan lanes;
 // double-sided materials override it per instance via
 // ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT.
-// Primary traversal owns this query; shadow visibility uses its own local one.
-// Sharing a single query between them made SPIRV-Cross pass it by reference into
-// the shadow path, which forces the object into addressable thread memory and
-// costs ~20% of the pass -- the primary traversal then pays memory traffic per
-// step. Keep the two queries separate.
-rayQueryEXT rt_query;
+//
+// Both traversals declare their own query at function scope. Sharing one query
+// between them was an early attempt to dodge the Apple Metal front-end
+// miscompile (see the ray-query workaround block in
+// rendering_shader_container_metal.cpp); it did not fix the miscompile and cost
+// ~20% of the pass, because SPIRV-Cross then passed the shared query by
+// reference into the shadow path and the primary traversal paid addressable
+// thread-memory traffic per step. Note that scope is cosmetic on the Metal
+// lane: glslang translates every rayQueryEXT to Private storage regardless, so
+// the generated MSL hoists both queries into the entry point either way. Write
+// them the natural way and let the Metal lane make its own choices.
 
 // With an all-opaque table, also traverse with the opaque ray flag so no
 // triangle candidate ever surfaces to the proceed loop. Spec-constant fold.
@@ -359,6 +364,7 @@ bool trace_material_query(vec3 origin, vec3 direction, float max_distance, out C
 	ComputeProceduralHit procedural_hit;
 	procedural_hit.t = max_distance;
 	procedural_hit.valid = false;
+	rayQueryEXT rt_query;
 	rayQueryInitializeEXT(rt_query, tlas, RT_TRAVERSAL_FLAGS,
 			instance_mask, origin, 0.001, direction, max_distance);
 	while (rayQueryProceedEXT(rt_query)) {

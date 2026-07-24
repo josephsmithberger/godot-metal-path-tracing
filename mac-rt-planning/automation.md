@@ -131,6 +131,17 @@ dispatch compared with a CPU reference. C11 adds the capability-gated launch
 and forced non-RT fallback checks. C12 adds the reviewed L5 golden image,
 manifest validation, diff artifact, and numeric comparison metrics.
 
+The `raw-corruption` stage is the one exception to the shader-validation rule
+above. Every other RT stage runs with `MTL_SHADER_VALIDATION=1`, which is
+correct for catching unowned device accesses but *masks* the Apple ray-query
+miscompile (validation instrumentation perturbs register allocation). This
+stage therefore strips the validation variables, runs the `benchmark/` orbit
+with the raw `RGBA16Float` readback metric (`GODOT_DBG_DUMP_RT=1`) across the
+sample/bounce/alpha/traversal-lane matrix, and fails if any frame reports more
+than 1000 pixels with exactly one color channel forced to zero. A passing run
+here is what licenses shipping without a `noinline` boundary; see
+`metal_rt_corruption_handoff.md`.
+
 The `image` stage is therefore Available for L5-C only. It does not launch an
 editor fixture and must not be used as editor-integration evidence. When the
 C13-C18 runtime fixtures land, extend this runner with `editor-scene`, `export`,
