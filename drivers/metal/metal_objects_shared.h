@@ -547,9 +547,13 @@ _FORCE_INLINE_ static MTL::Stages convert_src_pipeline_stages_to_metal(BitField<
 	}
 
 	// Compute stage.
+	// DRAW_INDIRECT is shared by graphics draws and compute dispatches in
+	// RenderingDevice, so map it to the dispatch stage as well as the vertex
+	// stage above. Without the dispatch mapping, a compute shader that produces
+	// dispatchThreadgroups() arguments can race their consumption.
 	// Raytracing executes through a compute encoder on Metal, so it maps to the
 	// dispatch stage as well.
-	if (p_stages & (RDD::PIPELINE_STAGE_COMPUTE_SHADER_BIT | RDD::PIPELINE_STAGE_RAY_TRACING_SHADER_BIT)) {
+	if (p_stages & (RDD::PIPELINE_STAGE_DRAW_INDIRECT_BIT | RDD::PIPELINE_STAGE_COMPUTE_SHADER_BIT | RDD::PIPELINE_STAGE_RAY_TRACING_SHADER_BIT)) {
 		mtlStages |= MTL::StageDispatch;
 	}
 
@@ -593,9 +597,13 @@ _FORCE_INLINE_ static MTL::Stages convert_dst_pipeline_stages_to_metal(BitField<
 	}
 
 	// Compute stage.
+	// DRAW_INDIRECT is shared by graphics draws and compute dispatches in
+	// RenderingDevice, so map it to the dispatch stage as well as the vertex
+	// stage above. Without the dispatch mapping, a compute shader that produces
+	// dispatchThreadgroups() arguments can race their consumption.
 	// Raytracing executes through a compute encoder on Metal, so it maps to the
 	// dispatch stage as well.
-	if (p_stages & (RDD::PIPELINE_STAGE_COMPUTE_SHADER_BIT | RDD::PIPELINE_STAGE_RAY_TRACING_SHADER_BIT)) {
+	if (p_stages & (RDD::PIPELINE_STAGE_DRAW_INDIRECT_BIT | RDD::PIPELINE_STAGE_COMPUTE_SHADER_BIT | RDD::PIPELINE_STAGE_RAY_TRACING_SHADER_BIT)) {
 		mtlStages |= MTL::StageDispatch;
 	}
 
