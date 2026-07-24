@@ -3245,11 +3245,30 @@
 			[b]Note:[/b] Enabling occlusion culling has a cost on the CPU. Only enable occlusion culling if you actually plan to use it. Large open scenes with few or no objects blocking the view will generally not benefit much from occlusion culling. Large open scenes generally benefit more from mesh LOD and visibility ranges ([member GeometryInstance3D.visibility_range_begin] and [member GeometryInstance3D.visibility_range_end]) compared to occlusion culling.
 			[b]Note:[/b] Due to memory constraints, occlusion culling is not supported by default in Web export templates. It can be enabled by compiling custom Web export templates with [code]module_raycast_enabled=yes[/code].
 		</member>
+		<member name="rendering/pathtracer/alpha_tested_shadows" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], alpha-scissored geometry such as foliage casts perforated shadows, because its alpha test runs for every shadow ray cast by next-event estimation. In foliage-heavy scenes lit by many lights this is often the single largest path-tracing cost. Set this to [code]false[/code] to trace shadow rays against opaque geometry only, which makes alpha-scissored geometry cast solid silhouette shadows in exchange for a large speedup.
+		</member>
 		<member name="rendering/pathtracer/async_shader_compilation" type="bool" setter="" getter="" default="true">
 			If [code]true[/code], path tracing ray hit shaders are compiled asynchronously in the background. This avoids frame stalls when new shader variants are first encountered during rendering. While a shader is compiling, a fallback shader may be used, which can cause temporary visual artifacts. Disable this if you require fully deterministic rendering from the first frame at the cost of potential stalls on shader warm-up.
 		</member>
 		<member name="rendering/pathtracer/deformed_mesh_cache_ttl_frames" type="int" setter="" getter="" default="60">
 			Number of frames a skinned or vertex-displaced deformed-mesh BLAS is kept alive in the path tracer cache after its last visible frame. Once this threshold is exceeded the BLAS and its associated buffers are freed. Increase this value if deformed meshes flicker back into view after brief occlusion; decrease it to reclaim GPU memory sooner.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
+		<member name="rendering/pathtracer/editor_interactive_max_bounces" type="int" setter="" getter="" default="2">
+			Maximum number of path-tracing bounces used while an editor viewport camera is moving. Full quality is restored once the camera settles. Has no effect on a running game.
+		</member>
+		<member name="rendering/pathtracer/editor_interactive_samples" type="int" setter="" getter="" default="1">
+			Number of path-tracing samples per pixel used while an editor viewport camera is moving. Extra samples are spent on frames that are about to be discarded anyway, so lowering this keeps navigation responsive; full quality is restored once the camera settles. Set to [code]0[/code] to disable the behavior and always render at full quality. Has no effect on a running game.
+		</member>
+		<member name="rendering/pathtracer/editor_interactive_settle_msec" type="int" setter="" getter="" default="200">
+			Time in milliseconds an editor viewport camera must be still before full path-tracing quality is restored. Has no effect on a running game.
+		</member>
+		<member name="rendering/pathtracer/editor_interactive_use_temporal_upscaler" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], the temporal upscaler stays enabled while an editor viewport camera is moving, which hides much of the noise from the reduced interactive sample count. Has no effect on a running game.
+		</member>
+		<member name="rendering/pathtracer/metal_ray_query_backend" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], the Metal rendering driver exposes its native ray-query compute backend when all required device and operating-system capabilities are available. Unsupported configurations automatically continue with the non-ray-traced renderer and report the missing capabilities in the startup log. Set this to [code]false[/code] to force the non-ray-traced fallback.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
 		<member name="rendering/pathtracer/multimesh_blas_cache_ttl_frames" type="int" setter="" getter="" default="3600">
@@ -3267,7 +3286,7 @@
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
 		<member name="rendering/pathtracer/use_shader_execution_reordering" type="bool" setter="" getter="" default="true">
-			If [code]true[/code], enables NVIDIA Shader Execution Reordering in the path tracer. SET reorders ray tracing shader invocations at runtime to improve GPU occupancy and reduce divergence between threads executing different materials. This can significantly improve path tracing performance on NVIDIA Ada Lovelace and later GPUs. Has no effect on hardware that does not support SET.
+			If [code]true[/code], enables NVIDIA Shader Execution Reordering in the path tracer. SET reorders ray tracing shader invocations at runtime to improve GPU occupancy and reduce divergence between threads executing different materials. This can significantly improve path tracing performance on NVIDIA Ada Lovelace and later GPUs. Has no effect on unsupported hardware and is always disabled by the Metal compute path.
 		</member>
 		<member name="rendering/reflections/reflection_atlas/reflection_count" type="int" setter="" getter="" default="64">
 			Number of cubemaps to store in the reflection atlas. The number of [ReflectionProbe]s in a scene will be limited by this amount. A higher number requires more VRAM.

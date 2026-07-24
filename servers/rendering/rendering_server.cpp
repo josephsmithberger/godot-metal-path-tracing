@@ -36,6 +36,7 @@
 #include "core/object/class_db.h"
 #include "core/os/os.h"
 #include "core/variant/typed_array.h"
+#include "drivers/streamline/streamline.h"
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/rendering_server_types.h"
 #include "servers/rendering/shader_language.h"
@@ -2092,6 +2093,22 @@ String RenderingServer::get_current_rendering_method() const {
 	return ::OS::get_singleton()->get_current_rendering_method();
 }
 
+bool RenderingServer::is_pathtracing_denoiser_supported(RSE::PathtracingDenoiser p_denoiser) const {
+	switch (p_denoiser) {
+		case RSE::PT_DENOISER_NONE:
+			return true;
+		case RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION: {
+			Streamline *streamline = Streamline::get_singleton();
+			return streamline && streamline->get_capability(STREAMLINE_CAPABILITY_DLSS_RR);
+		}
+		case RSE::PT_DENOISER_METALFX: {
+			RenderingDevice *rendering_device = RenderingDevice::get_singleton();
+			return rendering_device && rendering_device->has_feature(RenderingDevice::SUPPORTS_METALFX_DENOISED);
+		}
+	}
+	return false;
+}
+
 Vector<uint8_t> _convert_surface_version_1_to_surface_version_2(uint64_t p_format, Vector<uint8_t> p_vertex_data, uint32_t p_vertex_count, uint32_t p_old_stride, uint32_t p_vertex_size, uint32_t p_normal_size, uint32_t p_position_stride, uint32_t p_normal_tangent_stride) {
 	Vector<uint8_t> new_vertex_data;
 	new_vertex_data.resize(p_vertex_data.size());
@@ -3188,6 +3205,7 @@ void RenderingServer::_bind_methods() {
 
 	BIND_ENUM_CONSTANT(RSE::PT_DENOISER_NONE);
 	BIND_ENUM_CONSTANT(RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION);
+	BIND_ENUM_CONSTANT(RSE::PT_DENOISER_METALFX);
 
 	BIND_ENUM_CONSTANT(RSE::SUB_SURFACE_SCATTERING_QUALITY_DISABLED);
 	BIND_ENUM_CONSTANT(RSE::SUB_SURFACE_SCATTERING_QUALITY_LOW);
@@ -3534,6 +3552,7 @@ void RenderingServer::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("get_current_rendering_driver_name"), &RenderingServer::get_current_rendering_driver_name);
 	ClassDB::bind_method(D_METHOD("get_current_rendering_method"), &RenderingServer::get_current_rendering_method);
+	ClassDB::bind_method(D_METHOD("is_pathtracing_denoiser_supported", "denoiser"), &RenderingServer::is_pathtracing_denoiser_supported);
 
 	ClassDB::bind_method(D_METHOD("make_sphere_mesh", "latitudes", "longitudes", "radius"), &RenderingServer::make_sphere_mesh);
 	ClassDB::bind_method(D_METHOD("get_test_cube"), &RenderingServer::get_test_cube);
@@ -3820,10 +3839,32 @@ void RenderingServer::init() {
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/limits/cluster_builder/max_clustered_elements", PROPERTY_HINT_RANGE, "32,8192,1"), 512);
 	GLOBAL_DEF("rendering/pathtracer/use_shader_execution_reordering", true);
 	GLOBAL_DEF("rendering/pathtracer/async_shader_compilation", true);
+	// When true, alpha-scissored geometry (e.g. foliage) casts perforated
+	// shadows by running its alpha test on every NEE shadow ray. That per-
+	// candidate test executes on the divergent ray-query lane with the hardware
+	// reorder stage disabled, so in foliage-heavy scenes under many lights it is
+	// the single largest path-tracing cost. Set false to trace shadow rays with
+	// the opaque hardware intersector instead: alpha geometry then casts solid
+	// silhouette shadows, trading shadow fidelity for a large speedup.
+	GLOBAL_DEF("rendering/pathtracer/alpha_tested_shadows", true);
+	// The Metal driver applies its capability gate before exposing its
+	// compute ray-query lane. Disabling this setting forces the regular non-RT
+	// renderer without attempting to create acceleration structures.
+	GLOBAL_DEF_RST("rendering/pathtracer/metal_ray_query_backend", true);
 	GLOBAL_DEF_RST("rendering/pathtracer/multimesh_cache_cpu_transforms", false);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracer/deformed_mesh_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,3600,1"), 60);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracer/multimesh_blas_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,18000,1"), 3600);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracer/multimesh_merged_blas_max_triangles", PROPERTY_HINT_RANGE, "256,1048576,1"), 65536);
+
+	// While an editor viewport camera is moving, the extra samples per pixel are
+	// spent on frames that are about to be discarded anyway. Dropping to a low
+	// sample count keeps navigation responsive and full quality is restored once
+	// the camera settles. Set the sample count to 0 to disable the behavior.
+	// This never applies to a running game, only to editor viewports.
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracer/editor_interactive_samples", PROPERTY_HINT_RANGE, "0,8,1"), 1);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracer/editor_interactive_max_bounces", PROPERTY_HINT_RANGE, "1,8,1"), 2);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracer/editor_interactive_settle_msec", PROPERTY_HINT_RANGE, "0,2000,1"), 200);
+	GLOBAL_DEF("rendering/pathtracer/editor_interactive_use_temporal_upscaler", true);
 
 	// OpenGL limits
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/limits/opengl/max_renderable_elements", PROPERTY_HINT_RANGE, "1024,65536,1"), 65536);

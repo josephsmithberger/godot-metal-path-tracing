@@ -2134,6 +2134,13 @@
 				Returns [code]true[/code] if our code is currently executing on the rendering thread.
 			</description>
 		</method>
+		<method name="is_pathtracing_denoiser_supported" qualifiers="const">
+			<return type="bool" />
+			<param index="0" name="denoiser" type="int" enum="RenderingServer.PathtracingDenoiser" />
+			<description>
+				Returns [code]true[/code] if the path-tracing [param denoiser] is available with the current rendering driver, device, and runtime libraries. [constant PT_DENOISER_NONE] is always supported. DLSS Ray Reconstruction requires a supported NVIDIA device and a working Streamline runtime. MetalFX denoised upscaling requires a compatible Apple GPU and operating system.
+			</description>
+		</method>
 		<method name="light_area_set_normalize_energy">
 			<return type="void" />
 			<param index="0" name="light" type="RID" />
@@ -5946,6 +5953,9 @@
 		</constant>
 		<constant name="PT_DENOISER_DLSS_RAY_RECONSTRUCTION" value="1" enum="PathtracingDenoiser">
 			Uses NVIDIA DLSS Ray Reconstruction to denoise the path-traced image. DLSS Ray Reconstruction is a neural temporal denoiser that accumulates information across frames to produce a clean, high-quality result at low sample counts. Requires an NVIDIA RTX GPU and the Streamline plugin to be active.
+		</constant>
+		<constant name="PT_DENOISER_METALFX" value="2" enum="PathtracingDenoiser">
+			Uses MetalFX temporal denoised upscaling to denoise and scale the path-traced image in one pass. It consumes motion, depth, signed world-space normal, roughness, diffuse albedo, specular albedo, and specular hit-distance guides. Requires MetalFX denoised upscaling support on the current Apple device and operating system.
 		</constant>
 		<constant name="SUB_SURFACE_SCATTERING_QUALITY_DISABLED" value="0" enum="SubSurfaceScatteringQuality">
 			Disables subsurface scattering entirely, even on materials that have [member BaseMaterial3D.subsurf_scatter_enabled] set to [code]true[/code]. This has the lowest GPU requirements.

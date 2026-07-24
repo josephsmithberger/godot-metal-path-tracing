@@ -286,6 +286,12 @@ void RenderingServerDefault::init() {
 		server_thread = Thread::MAIN_ID;
 		_init();
 	}
+
+	// Opt-in per-pass GPU timing dump; the profiler is otherwise only reachable
+	// through the remote debugger, which is not available in these capture runs.
+	if (OS::get_singleton()->get_environment("GODOT_GPU_PROFILE") == "1") {
+		set_print_gpu_profile(true);
+	}
 }
 
 void RenderingServerDefault::finish() {
