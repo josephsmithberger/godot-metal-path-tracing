@@ -50,6 +50,7 @@
 
 #include "metal3_objects.h"
 
+#include "core/os/os.h"
 #include "drivers/metal/metal_utils.h"
 #include "drivers/metal/pixel_formats.h"
 #include "drivers/metal/rendering_device_driver_metal3.h"
@@ -259,7 +260,7 @@ void MDCommandBuffer::bind_pipeline(RDD::PipelineID p_pipeline) {
 			}
 			render.pipeline = rp;
 		}
-	} else if (p->type == MDPipelineType::Compute) {
+	} else if (p->type == MDPipelineType::Compute || p->type == MDPipelineType::Raytracing) {
 		DEV_ASSERT(type == MDCommandBufferStateType::None);
 		type = MDCommandBufferStateType::Compute;
 
@@ -267,7 +268,7 @@ void MDCommandBuffer::bind_pipeline(RDD::PipelineID p_pipeline) {
 			compute.dirty.set_flag(ComputeState::DIRTY_PIPELINE);
 			binding_cache.clear();
 			compute.mark_uniforms_dirty();
-			compute.pipeline = (MDComputePipeline *)p;
+			compute.pipeline = p;
 		}
 	}
 }
@@ -1379,7 +1380,9 @@ void MDCommandBuffer::_compute_set_dirty_state() {
 	if (compute.dirty.has_flag(ComputeState::DIRTY_PIPELINE)) {
 		compute.encoder = NS::RetainPtr(command_buffer()->computeCommandEncoder(MTL::DispatchTypeConcurrent));
 		_encode_barrier(compute.encoder.get());
-		compute.encoder->setComputePipelineState(compute.pipeline->state.get());
+		MTL::ComputePipelineState *pipeline_state = compute.pipeline->get_compute_pipeline_state();
+		DEV_ASSERT(pipeline_state != nullptr);
+		compute.encoder->setComputePipelineState(pipeline_state);
 	}
 
 	_compute_bind_uniform_sets();
@@ -1407,7 +1410,8 @@ void MDCommandBuffer::_compute_bind_uniform_sets() {
 	uint64_t set_uniforms = compute.uniform_set_mask;
 	compute.uniform_set_mask = 0;
 
-	MDComputeShader *shader = compute.pipeline->shader;
+	MDShader *shader = compute.pipeline->get_compute_shader();
+	DEV_ASSERT(shader != nullptr);
 	const uint32_t dynamic_offsets = compute.dynamic_offsets;
 
 	while (set_uniforms != 0) {
@@ -1483,7 +1487,42 @@ void MDCommandBuffer::compute_dispatch(uint32_t p_x_groups, uint32_t p_y_groups,
 	MTL::Size size = MTL::Size(p_x_groups, p_y_groups, p_z_groups);
 
 	MTL::ComputeCommandEncoder *enc = compute.encoder.get();
-	enc->dispatchThreadgroups(size, compute.pipeline->compute_state.local);
+	enc->dispatchThreadgroups(size, compute.pipeline->get_threads_per_threadgroup());
+}
+
+void MDCommandBuffer::trace_rays(uint32_t p_width, uint32_t p_height, uint32_t p_depth) {
+	DEV_ASSERT(type == MDCommandBufferStateType::Compute);
+	ERR_FAIL_NULL_MSG(compute.pipeline, "No pipeline is bound for the Metal trace-rays dispatch.");
+	ERR_FAIL_COND_MSG(compute.pipeline->type != MDPipelineType::Raytracing, "The bound Metal pipeline is not a raytracing pipeline.");
+	MDRaytracingPipeline *pipeline = static_cast<MDRaytracingPipeline *>(compute.pipeline);
+	ERR_FAIL_COND_MSG(!pipeline->uses_compute_lane, "The bound Metal raytracing pipeline carries no re-expressed compute kernel; only compute-lane pipelines can be dispatched.");
+	ERR_FAIL_COND_MSG(p_width == 0 || p_height == 0 || p_depth == 0, "The Metal trace-rays dimensions must be non-zero.");
+
+	_compute_set_dirty_state();
+
+	// GODOT_MTL_RT_TG=WxH overrides the reflected threadgroup shape for
+	// dispatch-shape experiments. The kernel derives its work solely from
+	// thread_position_in_grid and bounds-checks against the image size, so any
+	// covering shape is correct.
+	static const MTL::Size tg_override = []() {
+		Vector<String> parts = OS::get_singleton()->get_environment("GODOT_MTL_RT_TG").split("x");
+		if (parts.size() == 2) {
+			int64_t w = parts[0].to_int();
+			int64_t h = parts[1].to_int();
+			if (w > 0 && h > 0 && w * h <= 1024) {
+				return MTL::Size(w, h, 1);
+			}
+		}
+		return MTL::Size(0, 0, 0);
+	}();
+
+	// Threadgroups round up to cover the pixel grid; the kernel bounds-checks.
+	const MTL::Size local = tg_override.width != 0 ? tg_override : pipeline->get_threads_per_threadgroup();
+	MTL::Size groups = MTL::Size(
+			(p_width + local.width - 1) / local.width,
+			(p_height + local.height - 1) / local.height,
+			(p_depth + local.depth - 1) / local.depth);
+	compute.encoder->dispatchThreadgroups(groups, local);
 }
 
 void MDCommandBuffer::compute_dispatch_indirect(RDD::BufferID p_indirect_buffer, uint64_t p_offset) {
@@ -1494,7 +1533,64 @@ void MDCommandBuffer::compute_dispatch_indirect(RDD::BufferID p_indirect_buffer,
 	const RenderingDeviceDriverMetal::BufferInfo *indirectBuffer = (const RenderingDeviceDriverMetal::BufferInfo *)p_indirect_buffer.id;
 
 	MTL::ComputeCommandEncoder *enc = compute.encoder.get();
-	enc->dispatchThreadgroups(indirectBuffer->metal_buffer.get(), p_offset, compute.pipeline->compute_state.local);
+	enc->dispatchThreadgroups(indirectBuffer->metal_buffer.get(), p_offset, compute.pipeline->get_threads_per_threadgroup());
+}
+
+#pragma mark - Acceleration Structure Commands
+
+void MDCommandBuffer::acceleration_structure_build(MDAccelerationStructure *p_acceleration_structure, MTL::Buffer *p_scratch_buffer) {
+	DEV_ASSERT(command_buffer() != nullptr);
+	end();
+
+	MTL::CommandBuffer *metal_command_buffer = command_buffer();
+	NS::SharedPtr<MTL::AccelerationStructureCommandEncoder> encoder = NS::RetainPtr(metal_command_buffer->accelerationStructureCommandEncoder());
+	const uint64_t generation = p_acceleration_structure->encode_build(encoder.get(), p_scratch_buffer);
+	encoder->endEncoding();
+	auto completion_state = p_acceleration_structure->completion_state;
+	metal_command_buffer->addCompletedHandler([completion_state, generation](MTL::CommandBuffer *p_command_buffer) {
+		if (p_command_buffer->status() == MTL::CommandBufferStatusCompleted) {
+			completion_state->completed_build.store(generation, std::memory_order_release);
+		}
+	});
+
+	retain_resource(reinterpret_cast<CFTypeRef>(p_acceleration_structure->descriptor.get()));
+	retain_resource(reinterpret_cast<CFTypeRef>(p_acceleration_structure->accel.get()));
+	retain_resource(reinterpret_cast<CFTypeRef>(p_scratch_buffer));
+	if (p_acceleration_structure->compacted_size_buffer) {
+		retain_resource(reinterpret_cast<CFTypeRef>(p_acceleration_structure->compacted_size_buffer.get()));
+	}
+}
+
+void MDCommandBuffer::acceleration_structure_refit(MDAccelerationStructure *p_acceleration_structure, MTL::Buffer *p_scratch_buffer) {
+	DEV_ASSERT(command_buffer() != nullptr);
+	end();
+
+	NS::SharedPtr<MTL::AccelerationStructureCommandEncoder> encoder = NS::RetainPtr(command_buffer()->accelerationStructureCommandEncoder());
+	p_acceleration_structure->encode_refit(encoder.get(), p_scratch_buffer);
+	encoder->endEncoding();
+
+	retain_resource(reinterpret_cast<CFTypeRef>(p_acceleration_structure->descriptor.get()));
+	retain_resource(reinterpret_cast<CFTypeRef>(p_acceleration_structure->accel.get()));
+	retain_resource(reinterpret_cast<CFTypeRef>(p_scratch_buffer));
+}
+
+void MDCommandBuffer::acceleration_structure_compact(MDAccelerationStructure *p_source, MDAccelerationStructure *p_destination) {
+	DEV_ASSERT(command_buffer() != nullptr);
+	end();
+
+	MTL::CommandBuffer *metal_command_buffer = command_buffer();
+	NS::SharedPtr<MTL::AccelerationStructureCommandEncoder> encoder = NS::RetainPtr(metal_command_buffer->accelerationStructureCommandEncoder());
+	const uint64_t generation = p_source->encode_compact_into(encoder.get(), p_destination);
+	encoder->endEncoding();
+	auto completion_state = p_destination->completion_state;
+	metal_command_buffer->addCompletedHandler([completion_state, generation](MTL::CommandBuffer *p_command_buffer) {
+		if (p_command_buffer->status() == MTL::CommandBufferStatusCompleted) {
+			completion_state->completed_compaction.store(generation, std::memory_order_release);
+		}
+	});
+
+	retain_resource(reinterpret_cast<CFTypeRef>(p_source->accel.get()));
+	retain_resource(reinterpret_cast<CFTypeRef>(p_destination->accel.get()));
 }
 
 void MDCommandBuffer::reset() {
@@ -1599,6 +1695,14 @@ void DirectEncoder::set(MTL::SamplerState **p_samplers, NS::Range p_range) {
 				enc->setSamplerStates(p_samplers, p_range);
 			} break;
 		}
+	}
+}
+
+void DirectEncoder::set(MTL::AccelerationStructure *p_acceleration_structure, uint32_t p_index) {
+	DEV_ASSERT(mode == COMPUTE);
+	if (cache.update(p_acceleration_structure, p_index)) {
+		MTL::ComputeCommandEncoder *enc = static_cast<MTL::ComputeCommandEncoder *>(encoder);
+		enc->setAccelerationStructure(p_acceleration_structure, p_index);
 	}
 }
 
@@ -1753,6 +1857,23 @@ void MDCommandBuffer::_bind_uniforms_direct(MDUniformSet *p_set, MDShader *p_sha
 				NS::Range texture_range = { indexes.texture, count };
 				p_enc.set(objects, texture_range);
 			} break;
+			case RDD::UNIFORM_TYPE_ACCELERATION_STRUCTURE: {
+				const MDAccelerationStructure *acceleration_structure = (const MDAccelerationStructure *)uniform.ids[0].id;
+				DEV_ASSERT(acceleration_structure != nullptr && acceleration_structure->accel);
+				p_enc.set(acceleration_structure->accel.get(), indexes.buffer);
+				// The direct bind makes only the TLAS itself resident; Metal
+				// requires the primitive structures it references to be marked
+				// explicitly before they can be intersected.
+				if (p_enc.mode == DirectEncoder::COMPUTE) {
+					MTL::ComputeCommandEncoder *enc = static_cast<MTL::ComputeCommandEncoder *>(p_enc.encoder);
+					if (!acceleration_structure->resident_blases.is_empty()) {
+						enc->useResources(reinterpret_cast<const MTL::Resource *const *>(acceleration_structure->resident_blases.ptr()), acceleration_structure->resident_blases.size(), MTL::ResourceUsageRead);
+					}
+					// Tracing dereferences raw device addresses (geometry,
+					// material data); those buffers need residency too.
+					device_driver->encode_bda_residency(enc);
+				}
+			} break;
 			default: {
 				DEV_ASSERT(false);
 			}
@@ -1766,6 +1887,26 @@ void MDCommandBuffer::_bind_uniforms_argument_buffers_compute(MDUniformSet *p_se
 
 	MTL::ComputeCommandEncoder *enc = compute.encoder.get();
 	compute.resource_tracker.merge_from(p_set->usage_to_resources);
+
+	// TLAS uniforms: the argument buffer carries only the TLAS resource ID and
+	// the set's usage map covers the TLAS itself; the primitive structures it
+	// references change per build and must be made resident here. When
+	// barriers/residency sets are enabled, every acceleration structure is
+	// already tracked in the main residency set.
+	if (!use_barriers) {
+		for (const RDD::BoundUniform &uniform : p_set->uniforms) {
+			if (uniform.type != RDD::UNIFORM_TYPE_ACCELERATION_STRUCTURE) {
+				continue;
+			}
+			const MDAccelerationStructure *acceleration_structure = (const MDAccelerationStructure *)uniform.ids[0].id;
+			if (acceleration_structure != nullptr && !acceleration_structure->resident_blases.is_empty()) {
+				enc->useResources(reinterpret_cast<const MTL::Resource *const *>(acceleration_structure->resident_blases.ptr()), acceleration_structure->resident_blases.size(), MTL::ResourceUsageRead);
+			}
+			// Tracing dereferences raw device addresses (geometry, material
+			// data); those buffers need residency too.
+			device_driver->encode_bda_residency(enc);
+		}
+	}
 
 	const UniformSet &shader_set = p_shader->sets[p_set_index];
 

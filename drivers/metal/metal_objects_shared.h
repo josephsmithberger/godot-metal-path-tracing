@@ -37,10 +37,13 @@
 
 #include <CoreFoundation/CoreFoundation.h>
 
+#include <atomic>
 #include <memory>
 #include <optional>
 
 class RenderingDeviceDriverMetal;
+class MDAccelerationStructure;
+struct MDAccelerationStructureInstance;
 
 using RDC = RenderingDeviceCommons;
 
@@ -544,8 +547,19 @@ _FORCE_INLINE_ static MTL::Stages convert_src_pipeline_stages_to_metal(BitField<
 	}
 
 	// Compute stage.
-	if (p_stages & RDD::PIPELINE_STAGE_COMPUTE_SHADER_BIT) {
+	// DRAW_INDIRECT is shared by graphics draws and compute dispatches in
+	// RenderingDevice, so map it to the dispatch stage as well as the vertex
+	// stage above. Without the dispatch mapping, a compute shader that produces
+	// dispatchThreadgroups() arguments can race their consumption.
+	// Raytracing executes through a compute encoder on Metal, so it maps to the
+	// dispatch stage as well.
+	if (p_stages & (RDD::PIPELINE_STAGE_DRAW_INDIRECT_BIT | RDD::PIPELINE_STAGE_COMPUTE_SHADER_BIT | RDD::PIPELINE_STAGE_RAY_TRACING_SHADER_BIT)) {
 		mtlStages |= MTL::StageDispatch;
+	}
+
+	// Acceleration structure builds use a dedicated encoder and stage.
+	if (p_stages & RDD::PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT) {
+		mtlStages |= MTL::StageAccelerationStructure;
 	}
 
 	// Blit stage (transfer operations).
@@ -583,8 +597,19 @@ _FORCE_INLINE_ static MTL::Stages convert_dst_pipeline_stages_to_metal(BitField<
 	}
 
 	// Compute stage.
-	if (p_stages & RDD::PIPELINE_STAGE_COMPUTE_SHADER_BIT) {
+	// DRAW_INDIRECT is shared by graphics draws and compute dispatches in
+	// RenderingDevice, so map it to the dispatch stage as well as the vertex
+	// stage above. Without the dispatch mapping, a compute shader that produces
+	// dispatchThreadgroups() arguments can race their consumption.
+	// Raytracing executes through a compute encoder on Metal, so it maps to the
+	// dispatch stage as well.
+	if (p_stages & (RDD::PIPELINE_STAGE_DRAW_INDIRECT_BIT | RDD::PIPELINE_STAGE_COMPUTE_SHADER_BIT | RDD::PIPELINE_STAGE_RAY_TRACING_SHADER_BIT)) {
 		mtlStages |= MTL::StageDispatch;
+	}
+
+	// Acceleration structure builds use a dedicated encoder and stage.
+	if (p_stages & RDD::PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT) {
+		mtlStages |= MTL::StageAccelerationStructure;
 	}
 
 	// Blit stage (transfer operations).
@@ -682,6 +707,10 @@ public:
 	virtual void commit() = 0;
 	virtual void end() = 0;
 
+	/// The underlying Metal command buffer, for effects and queries that encode
+	/// directly. Creates it if this is the first use in the frame.
+	virtual MTL::CommandBuffer *get_command_buffer() = 0;
+
 	virtual void bind_pipeline(RDD::PipelineID p_pipeline) = 0;
 	void encode_push_constant_data(RDD::ShaderID p_shader, VectorView<uint32_t> p_data);
 
@@ -725,6 +754,19 @@ public:
 	virtual void compute_bind_uniform_sets(VectorView<RDD::UniformSetID> p_uniform_sets, RDD::ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count, uint32_t p_dynamic_offsets) = 0;
 	virtual void compute_dispatch(uint32_t p_x_groups, uint32_t p_y_groups, uint32_t p_z_groups) = 0;
 	virtual void compute_dispatch_indirect(RDD::BufferID p_indirect_buffer, uint64_t p_offset) = 0;
+
+#pragma mark - Acceleration Structure Commands
+
+	virtual void acceleration_structure_build(MDAccelerationStructure *p_acceleration_structure, MTL::Buffer *p_scratch_buffer) = 0;
+	virtual void acceleration_structure_refit(MDAccelerationStructure *p_acceleration_structure, MTL::Buffer *p_scratch_buffer) = 0;
+	virtual void acceleration_structure_compact(MDAccelerationStructure *p_source, MDAccelerationStructure *p_destination) = 0;
+
+#pragma mark - Raytracing Commands
+
+	/// Dispatches the bound compute-lane raytracing pipeline over a
+	/// `p_width` x `p_height` x `p_depth` pixel grid. The kernel is
+	/// responsible for bounds-checking because threadgroups round up.
+	virtual void trace_rays(uint32_t p_width, uint32_t p_height, uint32_t p_depth) = 0;
 
 #pragma mark - Transfer
 
@@ -792,6 +834,28 @@ struct API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0), visionos(2.0)) UniformS
 	LocalVector<UniformInfo> uniforms;
 	LocalVector<uint32_t> dynamic_uniforms;
 	uint32_t buffer_size = 0;
+	/// True when the set's trailing binding is an unbounded (runtime-sized)
+	/// array; the argument buffer is then sized per uniform set, from the
+	/// actual descriptor count, instead of `buffer_size` alone.
+	bool has_unbounded_array = false;
+
+	_FORCE_INLINE_ uint32_t argument_buffer_size(VectorView<RDD::BoundUniform> p_uniforms) const {
+		if (!has_unbounded_array) {
+			return buffer_size;
+		}
+
+		DEV_ASSERT(uniforms.size() == p_uniforms.size());
+		uint32_t size = buffer_size;
+		for (uint32_t i = 0; i < p_uniforms.size(); i++) {
+			const UniformInfo &uniform = uniforms[i];
+			if (uniform.arrayLength != UINT32_MAX) {
+				continue;
+			}
+			uint32_t descriptor_count = MAX(p_uniforms[i].ids.size(), 1u);
+			size = MAX(size, (uniform.arg_buffer.texture + descriptor_count) * (uint32_t)sizeof(uint64_t));
+		}
+		return size;
+	}
 };
 
 class API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0), visionos(2.0)) DynamicOffsetLayout {
@@ -983,11 +1047,16 @@ enum class MDPipelineType {
 	None,
 	Render,
 	Compute,
+	Raytracing,
 };
 
 class API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0), visionos(2.0)) MDPipeline {
 public:
 	MDPipelineType type;
+
+	virtual MTL::ComputePipelineState *get_compute_pipeline_state() const { return nullptr; }
+	virtual MDShader *get_compute_shader() const { return nullptr; }
+	virtual MTL::Size get_threads_per_threadgroup() const { return {}; }
 
 	explicit MDPipeline(MDPipelineType p_type) :
 			type(p_type) {}
@@ -1086,5 +1155,478 @@ public:
 
 	explicit MDComputePipeline(NS::SharedPtr<MTL::ComputePipelineState> p_state) :
 			MDPipeline(MDPipelineType::Compute), state(std::move(p_state)) {}
+
+	MTL::ComputePipelineState *get_compute_pipeline_state() const final { return state.get(); }
+	MDShader *get_compute_shader() const final { return shader; }
+	MTL::Size get_threads_per_threadgroup() const final { return compute_state.local; }
 	~MDComputePipeline() final = default;
 };
+
+/*! A compute-backed ray-tracing pipeline and Godot shader-group translation.
+ *
+ * Metal has no dedicated ray-tracing pipeline object; tracing runs as a compute
+ * dispatch whose kernel uses a ray query or the MSL intersector. Godot's Vulkan-
+ * shaped shader groups are retained as small, deterministic records. Triangle
+ * groups share Metal's system opaque-triangle intersection function; procedural
+ * groups reserve stable table slots for the compute lowering supplied by the engine.
+ */
+class API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0), visionos(2.0)) MDRaytracingPipeline final : public MDPipeline {
+public:
+	enum class ShaderGroupType : uint32_t {
+		RAYGEN,
+		MISS,
+		TRIANGLE_HIT,
+		PROCEDURAL_HIT,
+		EMPTY_HIT,
+	};
+
+	enum class IntersectionFunctionType : uint32_t {
+		OPAQUE_TRIANGLE,
+		PROCEDURAL,
+	};
+
+	struct ShaderGroup {
+		ShaderGroupType type = ShaderGroupType::EMPTY_HIT;
+		uint32_t general_shader_index = UINT32_MAX;
+		uint32_t closest_hit_shader_index = UINT32_MAX;
+		uint32_t any_hit_shader_index = UINT32_MAX;
+		uint32_t intersection_shader_index = UINT32_MAX;
+		uint32_t intersection_function_table_index = UINT32_MAX;
+	};
+
+	struct IntersectionFunction {
+		IntersectionFunctionType type = IntersectionFunctionType::OPAQUE_TRIANGLE;
+		uint32_t shader_index = UINT32_MAX;
+	};
+
+	// Metal has no opaque Vulkan-style shader-group handle. These records are
+	// copied into Godot's compatibility SBT buffers and consumed as stable table
+	// indices by the compute lowering.
+	struct ShaderGroupHandle {
+		static constexpr uint32_t MAGIC = 0x4d525447; // "MRTG".
+		uint32_t magic = MAGIC;
+		uint32_t group_index = UINT32_MAX;
+		uint32_t intersection_function_table_index = UINT32_MAX;
+		ShaderGroupType type = ShaderGroupType::EMPTY_HIT;
+	};
+
+	static constexpr uint32_t SHADER_GROUP_HANDLE_SIZE = sizeof(ShaderGroupHandle);
+	static constexpr uint32_t SHADER_GROUP_HANDLE_ALIGNMENT = alignof(ShaderGroupHandle);
+	static constexpr uint32_t SHADER_GROUP_BASE_ALIGNMENT = 16;
+
+	static constexpr uint32_t TRACE_PIXEL_SIZE_BYTES = 4;
+	static constexpr uint32_t TRACE_TLAS_BUFFER_INDEX = 0;
+	static constexpr uint32_t TRACE_OUTPUT_BUFFER_INDEX = 1;
+	static constexpr uint32_t TRACE_CONSTANTS_BUFFER_INDEX = 2;
+	static constexpr uint32_t TRACE_INTERSECTION_TABLE_BUFFER_INDEX = 3;
+
+	/// Compute pipeline that hosts the trace kernel (raygen equivalent).
+	NS::SharedPtr<MTL::ComputePipelineState> state;
+	/// Pipeline-specific table. The backend installs Metal's opaque-triangle function at
+	/// index zero; custom procedural intersection functions remain a later step.
+	NS::SharedPtr<MTL::IntersectionFunctionTable> intersection_function_table;
+	uint32_t intersection_function_count = 0;
+
+	Vector<ShaderGroup> shader_groups;
+	Vector<IntersectionFunction> intersection_functions;
+	uint32_t raygen_group_count = 0;
+	uint32_t miss_group_count = 0;
+	uint32_t hit_group_count = 0;
+	// Metal has no pipeline recursion limit. This is the software recursion
+	// budget which the compute-lane kernel must enforce explicitly.
+	uint32_t max_trace_recursion_depth = 0;
+	// True when the ray-generation group is a re-expressed ray-query compute
+	// kernel supplied by the engine rather than an RT-pipeline stage.
+	bool uses_compute_lane = false;
+	MDShader *shader = nullptr;
+	MTL::Size threads_per_threadgroup = MTL::Size(8, 8, 1);
+
+	bool configure_shader_groups(VectorView<RDD::PipelineShader> p_shaders, VectorView<uint32_t> p_raygen_shader_indices, VectorView<uint32_t> p_miss_shader_indices, VectorView<RDD::HitGroup> p_hit_groups, uint32_t p_max_trace_recursion_depth, String *r_error = nullptr);
+	bool get_shader_group_handles(uint32_t p_group_index_offset, VectorView<uint32_t> p_group_indices, uint8_t *r_data, uint32_t p_data_stride_bytes, String *r_error = nullptr) const;
+
+	/// Creates the backend-owned trace kernel and its intersection-function table.
+	bool create_trace_one_ray(MTL::Device *p_device, String *r_error = nullptr);
+	/// Encodes a 2D image dispatch. Each output pixel is four bytes (RGBA8).
+	bool encode_trace_one_ray(MTL::ComputeCommandEncoder *p_encoder, MTL::AccelerationStructure *p_tlas, MTL::Buffer *p_output_buffer, uint32_t p_width, uint32_t p_height) const;
+
+	/// Creates the compute pipeline state for a compute-lane kernel. The
+	/// function is the engine's re-expressed ray-query compute entry point and
+	/// `p_local` its reflected workgroup size. Ray-query kernels use no
+	/// intersection-function table.
+	bool create_compute_lane(MTL::Device *p_device, MTL::Function *p_function, MTL::Size p_local, String *r_error = nullptr);
+
+	bool is_valid() const {
+		if (uses_compute_lane) {
+			return state.get() != nullptr;
+		}
+		return state && intersection_function_table && intersection_function_count > 0;
+	}
+
+	MTL::ComputePipelineState *get_compute_pipeline_state() const final { return state.get(); }
+	MDShader *get_compute_shader() const final { return shader; }
+	MTL::Size get_threads_per_threadgroup() const final { return threads_per_threadgroup; }
+
+	MDRaytracingPipeline() :
+			MDPipeline(MDPipelineType::Raytracing) {}
+	~MDRaytracingPipeline() final = default;
+};
+
+static_assert(sizeof(MDRaytracingPipeline::ShaderGroupHandle) == 16, "Metal RT shader-group handles must remain stable 16-byte records.");
+
+#pragma mark - Acceleration Structures
+
+/*! Backend state for one Godot acceleration structure (BLAS or TLAS). */
+class API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0), visionos(2.0)) MDAccelerationStructure {
+public:
+	enum class Type : uint8_t {
+		BLAS,
+		TLAS,
+	};
+
+	Type type;
+	/// A `PrimitiveAccelerationStructureDescriptor` for a BLAS or an
+	/// `InstanceAccelerationStructureDescriptor` for a TLAS. Retains any geometry
+	/// buffers it references.
+	NS::SharedPtr<MTL::AccelerationStructureDescriptor> descriptor;
+	/// Native acceleration structure.
+	NS::SharedPtr<MTL::AccelerationStructure> accel;
+	/// Bytes required for the native acceleration-structure allocation.
+	uint64_t acceleration_structure_size = 0;
+	/// Scratch bytes required for a clean build.
+	uint64_t build_scratch_size = 0;
+	/// Scratch bytes required for an in-place refit.
+	uint64_t refit_scratch_size = 0;
+	/// Scratch bytes required to build (and refit, when allowed) this structure.
+	uint64_t scratch_size = 0;
+	/// Shared result buffer populated after builds that request compaction.
+	NS::SharedPtr<MTL::Buffer> compacted_size_buffer;
+	struct CompletionState {
+		std::atomic<uint64_t> requested_build{ 0 };
+		std::atomic<uint64_t> completed_build{ 0 };
+		std::atomic<uint64_t> requested_compaction{ 0 };
+		std::atomic<uint64_t> completed_compaction{ 0 };
+	};
+	std::shared_ptr<CompletionState> completion_state = std::make_shared<CompletionState>();
+	BitField<RDD::AccelerationStructureFlagBits> flags = {};
+	/// True after a build has been encoded, allowing a later in-place refit.
+	bool build_encoded = false;
+	/// True when the structure exceeds Metal's standard limits and was built
+	/// with MTLAccelerationStructureUsageExtendedLimits. Tracing such a
+	/// hierarchy requires the `extended_limits` intersection tag in every MSL
+	/// intersector / intersection_query; see the coherence gate in
+	/// prepare_tlas_build().
+	bool extended_limits = false;
+
+	// Standard (non-extended) Metal acceleration-structure limits. Exceeding
+	// any of them requires ExtendedLimits usage on the build and the matching
+	// `extended_limits` intersection tag on the trace side.
+	static constexpr uint64_t STANDARD_LIMIT_MAX_PRIMITIVES = 1ull << 28;
+	static constexpr uint64_t STANDARD_LIMIT_MAX_GEOMETRIES = 1ull << 24;
+	static constexpr uint64_t STANDARD_LIMIT_MAX_INSTANCES = 1ull << 24;
+	static constexpr uint32_t STANDARD_LIMIT_VISIBILITY_MASK_BITS = 8;
+
+	// TLAS only.
+	uint32_t max_instance_count = 0;
+	/// TLAS only: unique primitive structures referenced by the last prepared
+	/// build. Metal requires them to be made resident (useResource) on any
+	/// encoder that intersects this TLAS; the descriptor's BLAS array retains
+	/// the objects these raw pointers reference.
+	LocalVector<MTL::AccelerationStructure *> resident_blases;
+
+	static MTL::AccelerationStructureUsage usage_from_flags(BitField<RDD::AccelerationStructureFlagBits> p_flags) {
+		MTL::AccelerationStructureUsage usage = MTL::AccelerationStructureUsageNone;
+		if (p_flags.has_flag(RDD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT)) {
+			usage |= MTL::AccelerationStructureUsageRefit;
+		}
+		if (p_flags.has_flag(RDD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT)) {
+			usage |= MTL::AccelerationStructureUsagePreferFastBuild;
+		}
+		// Static-AS fast-trace policy (mirrors Blender's Apple-maintained
+		// backend): only an immutable AS that doesn't prefer fast build maps
+		// PREFER_FAST_TRACE to PreferFastIntersection. The usage exists from
+		// macOS 26 / iOS 26; older OS releases keep the previous behavior.
+		if (usage == MTL::AccelerationStructureUsageNone && p_flags.has_flag(RDD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT)) {
+			if (__builtin_available(macOS 26.0, iOS 26.0, tvOS 26.0, *)) {
+				usage |= MTL::AccelerationStructureUsagePreferFastIntersection;
+			}
+		}
+		return usage;
+	}
+
+	static uint64_t required_scratch_size(const MTL::AccelerationStructureSizes &p_sizes, BitField<RDD::AccelerationStructureFlagBits> p_flags) {
+		uint64_t size = p_sizes.buildScratchBufferSize;
+		if (p_flags.has_flag(RDD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT)) {
+			size = MAX(size, p_sizes.refitScratchBufferSize);
+		}
+		return size;
+	}
+
+	bool allocate(MTL::Device *p_device) {
+		accel = NS::TransferPtr(p_device->newAccelerationStructure(acceleration_structure_size));
+		if (!accel) {
+			return false;
+		}
+
+		if (flags.has_flag(RDD::ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT)) {
+			compacted_size_buffer = NS::TransferPtr(p_device->newBuffer(sizeof(uint64_t), MTL::ResourceStorageModeShared));
+			if (!compacted_size_buffer) {
+				accel.reset();
+				return false;
+			}
+			*static_cast<uint64_t *>(compacted_size_buffer->contents()) = 0;
+		}
+
+		return true;
+	}
+
+	uint64_t encode_build(MTL::AccelerationStructureCommandEncoder *p_encoder, MTL::Buffer *p_scratch_buffer) {
+		const uint64_t generation = completion_state->requested_build.fetch_add(1, std::memory_order_relaxed) + 1;
+		p_encoder->buildAccelerationStructure(accel.get(), descriptor.get(), p_scratch_buffer, 0);
+		if (compacted_size_buffer) {
+			if (__builtin_available(macOS 12.0, iOS 15.0, tvOS 15.0, *)) {
+				// Explicit 64-bit result. The legacy selector writes 32 bits; the
+				// buffer is a zero-initialized 8-byte allocation, so the 64-bit
+				// read in get_compacted_size() is correct for both variants on
+				// this little-endian platform.
+				p_encoder->writeCompactedAccelerationStructureSize(accel.get(), compacted_size_buffer.get(), 0, MTL::DataTypeULong);
+			} else {
+				p_encoder->writeCompactedAccelerationStructureSize(accel.get(), compacted_size_buffer.get(), 0);
+			}
+		}
+		build_encoded = true;
+		return generation;
+	}
+
+	uint64_t encode_compact_into(MTL::AccelerationStructureCommandEncoder *p_encoder, MDAccelerationStructure *p_destination) const {
+		const uint64_t generation = p_destination->completion_state->requested_compaction.fetch_add(1, std::memory_order_relaxed) + 1;
+		p_encoder->copyAndCompactAccelerationStructure(accel.get(), p_destination->accel.get());
+		p_destination->build_encoded = true;
+		p_destination->inherit_compaction_metadata_from(*this);
+		return generation;
+	}
+
+	void encode_refit(MTL::AccelerationStructureCommandEncoder *p_encoder, MTL::Buffer *p_scratch_buffer) {
+		p_encoder->refitAccelerationStructure(accel.get(), descriptor.get(), accel.get(), p_scratch_buffer, 0);
+	}
+
+	/// Configures a TLAS descriptor from Godot's persistently mapped instance
+	/// records. The first 64 bytes of each record are consumed directly by Metal;
+	/// the remaining metadata resolves Godot BLAS handles to descriptor-array
+	/// indices. Returns false when the record range or a referenced BLAS is invalid.
+	bool prepare_tlas_build(MTL::Buffer *p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count);
+
+	/// Returns zero until a compaction-size-enabled build has completed.
+	uint64_t get_compacted_size() const {
+		if (!compacted_size_buffer || !compacted_size_buffer->contents()) {
+			return 0;
+		}
+		const uint64_t requested = completion_state->requested_build.load(std::memory_order_acquire);
+		if (requested == 0 || completion_state->completed_build.load(std::memory_order_acquire) < requested) {
+			return 0;
+		}
+		return *static_cast<const uint64_t *>(compacted_size_buffer->contents());
+	}
+
+	bool is_compaction_complete() const {
+		const uint64_t requested = completion_state->requested_compaction.load(std::memory_order_acquire);
+		return requested != 0 && completion_state->completed_compaction.load(std::memory_order_acquire) >= requested;
+	}
+
+	void inherit_compaction_metadata_from(const MDAccelerationStructure &p_source) {
+		flags = p_source.flags;
+		extended_limits = p_source.extended_limits;
+	}
+
+	MDAccelerationStructure(Type p_type, NS::SharedPtr<MTL::AccelerationStructureDescriptor> p_descriptor, const MTL::AccelerationStructureSizes &p_sizes, BitField<RDD::AccelerationStructureFlagBits> p_flags, uint32_t p_max_instance_count = 0) :
+			type(p_type),
+			descriptor(std::move(p_descriptor)),
+			acceleration_structure_size(p_sizes.accelerationStructureSize),
+			build_scratch_size(p_sizes.buildScratchBufferSize),
+			refit_scratch_size(p_sizes.refitScratchBufferSize),
+			scratch_size(required_scratch_size(p_sizes, p_flags)),
+			flags(p_flags),
+			max_instance_count(p_max_instance_count) {}
+
+	/// Compacted-copy destination: a bare allocation with no descriptor. It is
+	/// populated by copyAndCompact and must never be built or refit directly.
+	MDAccelerationStructure(Type p_type, uint64_t p_size) :
+			type(p_type),
+			acceleration_structure_size(p_size) {}
+};
+
+/*! CPU-written instance record used by the Metal TLAS build path.
+ *
+ * Metal's macOS 11 instance descriptor identifies a BLAS by an index into an
+ * NSArray supplied on the TLAS descriptor. Godot instead gives the instance
+ * writer a backend BLAS handle before a particular TLAS is known. The native
+ * descriptor occupies the leading bytes and backend-only metadata follows it.
+ * A 128-byte stride keeps every RenderingDevice suballocation aligned to
+ * Metal's required 64-byte instanceDescriptorBufferOffset.
+ *
+ * The record's native prefix is the 68-byte UserID descriptor
+ * (`MTL::AccelerationStructureUserIDInstanceDescriptor`), whose first 64 bytes
+ * are identical to the default descriptor. `user_id` carries Godot's instance
+ * custom index so the ray-query compute lane can read it through
+ * `rayQueryGetIntersectionInstanceCustomIndexEXT` (SPIRV-Cross lowers it to
+ * MSL `user_instance_id`). Consuming the field requires the TLAS descriptor
+ * type to be UserID, which `tlas_create()` selects on macOS 12+; at the
+ * macOS 11 floor Metal reads only the default 64-byte prefix and the field
+ * stays inert metadata.
+ */
+struct MDAccelerationStructureInstance {
+	// Binary-compatible prefix with MTL::AccelerationStructureUserIDInstanceDescriptor
+	// (and, for the first 64 bytes, MTL::AccelerationStructureInstanceDescriptor).
+	float transformation_matrix[12] = {};
+	uint32_t options = 0;
+	uint32_t mask = 0;
+	uint32_t intersection_function_table_offset = 0;
+	uint32_t acceleration_structure_index = 0;
+	uint32_t user_id = 0;
+
+	// Godot-to-Metal build metadata, ignored by Metal because of the stride.
+	uint32_t requested_mask = 0;
+	MDAccelerationStructure *blas = nullptr;
+	uint32_t reserved[12] = {};
+
+	bool write(const RDD::AccelerationStructureInstance &p_instance) {
+		constexpr uint32_t valid_options =
+				RDD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT |
+				RDD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT |
+				RDD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT |
+				RDD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_NO_OPAQUE_BIT;
+
+		const uint32_t instance_options = static_cast<uint32_t>(p_instance.flags);
+		if (!p_instance.transform.is_finite() || (instance_options & ~valid_options) != 0) {
+			return false;
+		}
+		if ((instance_options & RDD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT) != 0 &&
+				(instance_options & RDD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_NO_OPAQUE_BIT) != 0) {
+			return false;
+		}
+
+		MDAccelerationStructure *blas_info = reinterpret_cast<MDAccelerationStructure *>(p_instance.blas.id);
+		if (blas_info != nullptr && blas_info->type != MDAccelerationStructure::Type::BLAS) {
+			return false;
+		}
+
+		float packed_transform[12] = {};
+		for (uint32_t column = 0; column < 3; column++) {
+			for (uint32_t row = 0; row < 3; row++) {
+				const float component = p_instance.transform.basis.rows[row][column];
+				if (!Math::is_finite(component)) {
+					return false;
+				}
+				packed_transform[column * 3 + row] = component;
+			}
+		}
+		for (uint32_t row = 0; row < 3; row++) {
+			const float component = p_instance.transform.origin[row];
+			if (!Math::is_finite(component)) {
+				return false;
+			}
+			packed_transform[9 + row] = component;
+		}
+
+		*this = MDAccelerationStructureInstance();
+		memcpy(transformation_matrix, packed_transform, sizeof(packed_transform));
+		options = instance_options;
+		mask = blas_info != nullptr ? p_instance.mask : 0;
+		intersection_function_table_offset = p_instance.hit_sbt_offset;
+		user_id = p_instance.id;
+		blas = blas_info;
+		requested_mask = p_instance.mask;
+		return true;
+	}
+};
+
+static_assert(sizeof(MTL::AccelerationStructureInstanceDescriptor) == 64, "Unexpected native Metal instance descriptor size.");
+static_assert(sizeof(MTL::AccelerationStructureUserIDInstanceDescriptor) == 68, "Unexpected native Metal user-ID instance descriptor size.");
+static_assert(offsetof(MDAccelerationStructureInstance, options) == offsetof(MTL::AccelerationStructureUserIDInstanceDescriptor, options));
+static_assert(offsetof(MDAccelerationStructureInstance, mask) == offsetof(MTL::AccelerationStructureUserIDInstanceDescriptor, mask));
+static_assert(offsetof(MDAccelerationStructureInstance, intersection_function_table_offset) == offsetof(MTL::AccelerationStructureUserIDInstanceDescriptor, intersectionFunctionTableOffset));
+static_assert(offsetof(MDAccelerationStructureInstance, acceleration_structure_index) == offsetof(MTL::AccelerationStructureUserIDInstanceDescriptor, accelerationStructureIndex));
+static_assert(offsetof(MDAccelerationStructureInstance, user_id) == offsetof(MTL::AccelerationStructureUserIDInstanceDescriptor, userID));
+static_assert(sizeof(MDAccelerationStructureInstance) == 128, "Metal TLAS instance records must preserve 64-byte suballocation alignment.");
+
+inline bool MDAccelerationStructure::prepare_tlas_build(MTL::Buffer *p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count) {
+	if (type != Type::TLAS || p_instance_buffer == nullptr || p_instance_buffer->contents() == nullptr || p_instance_count > max_instance_count) {
+		return false;
+	}
+	if ((p_instance_offset % 64) != 0) {
+		return false;
+	}
+
+	const uint64_t records_size = uint64_t(p_instance_count) * sizeof(MDAccelerationStructureInstance);
+	if (p_instance_offset > p_instance_buffer->length() || records_size > p_instance_buffer->length() - p_instance_offset) {
+		return false;
+	}
+
+	LocalVector<MDAccelerationStructureInstance> instances;
+	instances.resize(p_instance_count);
+	const uint8_t *instance_bytes = static_cast<const uint8_t *>(p_instance_buffer->contents()) + p_instance_offset;
+	for (uint32_t i = 0; i < p_instance_count; i++) {
+		memcpy(&instances[i], instance_bytes + (i * sizeof(MDAccelerationStructureInstance)), sizeof(MDAccelerationStructureInstance));
+		MDAccelerationStructure *blas_info = instances[i].blas;
+		// Visibility masks stay within the standard 8-bit limit; RenderingDevice
+		// carries them as uint8, so extended 16-bit masks are never produced.
+		if (instances[i].requested_mask > UINT8_MAX ||
+				(blas_info != nullptr && (blas_info->type != Type::BLAS || !blas_info->accel || !blas_info->build_encoded))) {
+			return false;
+		}
+		// Coherence gate (ACCELERATION_LIMITS): the compiled MSL (SPIRV-Cross ray query and the
+		// intersector lowering) does not declare the `extended_limits`
+		// intersection tag, so tracing an extended-limits structure would be
+		// undefined. Oversized structures build correctly but are refused here
+		// with an explicit reason instead of corrupting traversal.
+		if (blas_info != nullptr && blas_info->extended_limits) {
+			WARN_PRINT_ONCE("Metal RT: a BLAS exceeds the standard acceleration-structure limits (built with ExtendedLimits); tracing it requires extended_limits shader support that is not implemented yet, so the TLAS build is refused.");
+			return false;
+		}
+	}
+	if (extended_limits) {
+		WARN_PRINT_ONCE("Metal RT: the TLAS exceeds the standard instance limit (built with ExtendedLimits); tracing it requires extended_limits shader support that is not implemented yet, so the TLAS build is refused.");
+		return false;
+	}
+
+	MDAccelerationStructure *fallback_blas = nullptr;
+	for (const MDAccelerationStructureInstance &instance : instances) {
+		if (instance.blas != nullptr) {
+			fallback_blas = instance.blas;
+			break;
+		}
+	}
+
+	MTL::InstanceAccelerationStructureDescriptor *tlas_descriptor = static_cast<MTL::InstanceAccelerationStructureDescriptor *>(descriptor.get());
+	tlas_descriptor->setInstanceDescriptorBuffer(p_instance_buffer);
+	tlas_descriptor->setInstanceDescriptorBufferOffset(p_instance_offset);
+	tlas_descriptor->setInstanceDescriptorStride(sizeof(MDAccelerationStructureInstance));
+
+	resident_blases.clear();
+
+	if (fallback_blas == nullptr) {
+		// A collection of null Godot instances is semantically an empty TLAS.
+		tlas_descriptor->setInstanceCount(0);
+		tlas_descriptor->setInstancedAccelerationStructures(NS::Array::array());
+		return true;
+	}
+
+	LocalVector<NS::Object *> instanced_acceleration_structures;
+	instanced_acceleration_structures.resize(p_instance_count);
+	uint8_t *writable_instance_bytes = static_cast<uint8_t *>(p_instance_buffer->contents()) + p_instance_offset;
+	for (uint32_t i = 0; i < p_instance_count; i++) {
+		MDAccelerationStructureInstance &instance = instances[i];
+		MDAccelerationStructure *blas_info = instance.blas != nullptr ? instance.blas : fallback_blas;
+		instance.acceleration_structure_index = i;
+		instance.mask = instance.blas != nullptr ? instance.requested_mask : 0;
+		instanced_acceleration_structures[i] = blas_info->accel.get();
+		if (!resident_blases.has(blas_info->accel.get())) {
+			resident_blases.push_back(blas_info->accel.get());
+		}
+		memcpy(writable_instance_bytes + (i * sizeof(MDAccelerationStructureInstance)), &instance, sizeof(MDAccelerationStructureInstance));
+	}
+
+	NS::Array *blas_array = NS::Array::array(instanced_acceleration_structures.ptr(), instanced_acceleration_structures.size());
+	tlas_descriptor->setInstanceCount(p_instance_count);
+	tlas_descriptor->setInstancedAccelerationStructures(blas_array);
+	return true;
+}
