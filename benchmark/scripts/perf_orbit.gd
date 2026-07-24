@@ -20,6 +20,7 @@ var _cpu_times: Array[float] = []
 var _wall_frame_times: Array[float] = []
 var _measure_start_usec := 0
 var _orbit_enabled := true
+var _mixed_alpha_enabled := false
 
 
 func _ready() -> void:
@@ -118,6 +119,43 @@ func _build_scene() -> void:
 		instance.position = Vector3(cos(ring_angle) * ring_radius, 0.7 + 0.5 * float(i % 2), sin(ring_angle) * ring_radius)
 		add_child(instance)
 
+	if OS.get_environment("GODOT_PERF_MIXED_ALPHA") == "1":
+		_mixed_alpha_enabled = true
+		_build_mixed_alpha_cards()
+
+
+func _build_mixed_alpha_cards() -> void:
+	# Dense checker-cut cards force rays to reject several alpha candidates
+	# before reaching opaque geometry. This intentionally stresses candidate
+	# evaluation rather than merely adding one decorative transparent surface.
+	var alpha_image := Image.create(64, 64, false, Image.FORMAT_RGBA8)
+	for y in range(64):
+		for x in range(64):
+			var cell_x := x >> 2
+			var cell_y := y >> 2
+			var alpha := 1.0 if (cell_x + cell_y) % 2 == 0 else 0.0
+			alpha_image.set_pixel(x, y, Color(0.55, 0.8, 0.35, alpha))
+	var alpha_texture := ImageTexture.create_from_image(alpha_image)
+
+	for i in range(48):
+		var card_mesh := QuadMesh.new()
+		card_mesh.size = Vector2(2.2, 2.0)
+		var card := MeshInstance3D.new()
+		card.mesh = card_mesh
+		var material := StandardMaterial3D.new()
+		material.albedo_texture = alpha_texture
+		material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR
+		material.alpha_scissor_threshold = 0.5
+		material.cull_mode = BaseMaterial3D.CULL_DISABLED
+		material.roughness = 0.8
+		card.material_override = material
+
+		var ring_angle := TAU * float(i) / 48.0
+		var ring_radius := 1.4 + 0.65 * float(i % 5)
+		card.position = Vector3(cos(ring_angle) * ring_radius, 1.0 + 0.3 * float(i % 3), sin(ring_angle) * ring_radius)
+		card.rotation.y = -ring_angle + PI * 0.5
+		add_child(card)
+
 
 func _place_camera() -> void:
 	var origin := Vector3(cos(_angle) * ORBIT_RADIUS, ORBIT_HEIGHT, sin(_angle) * ORBIT_RADIUS)
@@ -171,6 +209,7 @@ func _report() -> void:
 	print("PERF_ORBIT_RENDERING_DRIVER=%s" % RenderingServer.get_current_rendering_driver_name())
 	print("PERF_ORBIT_RENDERING_METHOD=%s" % RenderingServer.get_current_rendering_method())
 	print("PERF_ORBIT_ORBIT_ENABLED=%s" % str(_orbit_enabled))
+	print("PERF_ORBIT_MIXED_ALPHA=%s" % str(_mixed_alpha_enabled))
 
 
 func _average(values: Array[float]) -> float:

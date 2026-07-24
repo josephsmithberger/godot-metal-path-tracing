@@ -1,8 +1,15 @@
 # Metal RT path-tracing corruption: investigation handoff
 
-Investigation status: **RESOLVED 2026-07-16 (workaround shipped; Apple compiler
-bug still unreported upstream).** The corruption trigger was confirmed to be
-the shadow-ray `intersection_query` traversal being inlined into the
+Investigation status: **WORKAROUND RETIRED 2026-07-24 (latent; gated).** The
+corruption no longer reproduces on the current generated kernel, so the
+`noinline` boundary was removed from the default path and replaced with an
+automated non-instrumented gate. See "2026-07-24 re-measurement" below. The
+2026-07-16 workaround analysis that follows is retained because it is what the
+gate restores if the defect returns.
+
+Investigation status (2026-07-16): **RESOLVED (workaround shipped; Apple
+compiler bug still unreported upstream).** The corruption trigger was confirmed
+to be the shadow-ray `intersection_query` traversal being inlined into the
 path-tracing mega-kernel. The fix keeps *only* `trace_shadow_blocked` behind a
 `noinline` boundary in the generated MSL and re-declares its query object as a
 function-local (instead of the SPIRV-Cross-hoisted by-reference parameter that
@@ -21,6 +28,53 @@ cooldowns between runs (see "thermal contamination" below). Escape hatches:
 `GODOT_MTL_RT_NOINLINE=lights|shadow|none` selects the boundary;
 `GODOT_MTL_RT_SHADOW_REF=1` keeps the hoisted by-reference query in shadow
 mode.
+
+## 2026-07-24 re-measurement
+
+Re-run on the *same* machine and toolchain as the Apple report (M5 Mac17,2,
+macOS 26.5.2 build 25F84, Xcode 26.6 build 17F113), against the current
+`metal-rt-alpha-candidate` shader:
+
+- **The miscompile does not reproduce.** Raw single-zero-channel metric is `0`
+  with the boundary removed (`GODOT_MTL_RT_NOINLINE=none`) across 24
+  configurations -- 1/2/4 spp x 2/3 bounces x opaque/mixed-alpha x
+  intersector/query lane, 24 readback samples each, validation off.
+- **Output is pixel-identical with and without the boundary.** Static-camera
+  1080p capture on the mixed-alpha workload at 4 spp: 0 of 518,400 sampled
+  pixels differ, max channel delta 0.
+- **The boundary is expensive now.** Benchmark orbit, 1080p, 4 spp / 2 bounce,
+  median of 3 alternating runs:
+
+| workload | `none` | `shadow` (old default) | `lights` |
+|---|---|---|---|
+| mixed alpha (`GODOT_PERF_MIXED_ALPHA=1`) | **19.30 fps** | 12.93 fps | 11.01 fps |
+| all-opaque (intersector lane) | 74.68 fps | 75.00 fps | - |
+
+  The all-opaque row is flat because the Apple9+ intersector specialization
+  dead-strips the query path entirely; the cost is paid only where the query
+  lane actually runs, which is exactly the alpha/procedural case.
+
+The July numbers (5.8 vs 5.9 ms, "~2%") were taken at 1 spp / 2 bounce before
+the alpha workload existed. The call boundary is charged per shadow ray with
+SPIRV-Cross's full forwarded parameter list, so its cost scales with ray count
+and only became visible under a dense alpha-candidate workload.
+
+Conclusion: the defect is **latent, not fixed** -- Apple shipped no compiler
+change, so what moved is the current kernel's register allocation. The default
+is now `none`; `GODOT_MTL_RT_NOINLINE=shadow|lights` still selects a boundary.
+`tests/metal_rt/run_mac_rt_tests.py --stage raw-corruption` runs the raw
+readback metric with shader validation explicitly off (every other RT stage
+runs with validation on, which masks this defect) and fails if the count
+exceeds 1000 pixels.
+
+Also settled while investigating: **the GLSL cannot express this boundary.**
+glslang's `TranslateStorageClass` maps every `rayQueryEXT` to
+`StorageClass::Private` regardless of declaration scope, and SPIRV-Cross then
+hoists every Private query into the entry point and threads it through the call
+graph by reference. Moving `rt_query` from file scope into
+`trace_material_query` produced byte-identical MSL for both compute variants, so
+the file-scope declaration was a no-op dodge; it has been reverted to ordinary
+function scope.
 
 Perf-measurement trap found while validating: back-to-back GPU-saturated runs
 thermally contaminate each other (an 11 ms config degraded to 18 ms over one
